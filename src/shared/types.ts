@@ -1,0 +1,207 @@
+// Shared types for the overgit IPC contract and on-disk store.
+//
+// Overgit is workspace-overlay: each `Repo` is a real, standalone git
+// repository on disk that overgit does NOT own. A `Workspace` is just a
+// named collection of repo IDs — opening a workspace doesn't move files
+// or rewrite metadata; it only tells the UI which repos to show together.
+// Anything overgit does (checkout, fetch, status) it does by shelling out
+// to `git` in each repo's existing directory.
+
+export type UUID = string;
+
+export interface Repo {
+  id: UUID;
+  /// Display name. Defaults to basename(path) at add time, but the user
+  /// can rename without affecting the on-disk repo.
+  name: string;
+  /// Absolute path to the working tree root (the directory containing .git).
+  path: string;
+  /// When the user last opened this repo in overgit. ISO-8601.
+  lastOpenedAt?: string;
+}
+
+export interface Workspace {
+  id: UUID;
+  name: string;
+  /// Ordered list of repo IDs. A repo can belong to many workspaces.
+  repoIds: UUID[];
+  /// Optional: the branch the user wants the workspace pinned to. Used
+  /// by the "checkout everywhere" action as a default.
+  preferredBranch?: string;
+}
+
+export interface RepoStatus {
+  repoId: UUID;
+  /// Current branch name, or null in detached-HEAD state.
+  branch: string | null;
+  /// Number of files with unstaged changes (modified, deleted, untracked).
+  dirtyCount: number;
+  /// Commits ahead/behind upstream. null if no upstream is configured.
+  ahead: number | null;
+  behind: number | null;
+  /// Most recent error from git on this repo, if any.
+  error?: string;
+}
+
+/// Result of a workspace-wide branch checkout. We attempt every repo and
+/// report each outcome rather than aborting on the first failure — the
+/// user wants to know which ones landed and which need attention.
+export interface CheckoutOutcome {
+  repoId: UUID;
+  /// What happened: switched cleanly, branch didn't exist, dirty tree
+  /// blocked the switch, or git returned an unexpected error.
+  result: 'switched' | 'already-on-branch' | 'missing-branch' | 'dirty' | 'error';
+  branch: string;
+  message?: string;
+}
+
+/// Detected installed CLIs we can shell out to for review/comment flows.
+/// Discovered once at startup; the renderer uses presence to gate UI.
+export interface CliPresence {
+  gh: boolean;
+  glab: boolean;
+  jj: boolean;
+}
+
+export interface Commit {
+  sha: string;
+  shortSha: string;
+  parents: string[];
+  subject: string;
+  author: string;
+  authorEmail: string;
+  /// ISO-8601 author date.
+  date: string;
+}
+
+export interface FileDiff {
+  /// Path as it appears in the diff header (post-rename "b" path for
+  /// renames; for adds it's the new file; for deletes it's the deleted
+  /// file). Good enough for a file list.
+  path: string;
+  /// Single-letter status code from git: A/M/D/R/C, or '?' if unparsed.
+  status: 'A' | 'M' | 'D' | 'R' | 'C' | '?';
+  /// Raw unified-diff body for this file (no diff header), suitable for
+  /// rendering as a single <pre>. Renames with no content change can have
+  /// an empty body; the file still appears in the list.
+  body: string;
+}
+
+/// One row of `git status --porcelain=v1`, split into the index side (X)
+/// and the worktree side (Y). A file with `indexStatus !== ' '` is in
+/// the staged list; a file with `worktreeStatus !== ' '` (or `?`, which
+/// is git's untracked marker) is in the unstaged list. Renames carry
+/// `origPath` so the UI can show "old → new".
+export interface ChangedFile {
+  path: string;
+  indexStatus: string;
+  worktreeStatus: string;
+  origPath?: string;
+}
+
+export interface RepoChanges {
+  staged: ChangedFile[];
+  unstaged: ChangedFile[];
+}
+
+export interface PullRequest {
+  number: number;
+  title: string;
+  url: string;
+  headBranch: string;
+  baseBranch: string;
+  isDraft: boolean;
+  author: string;
+  /// ISO-8601 timestamp from gh.
+  updatedAt: string;
+  state: 'OPEN' | 'CLOSED' | 'MERGED';
+}
+
+/// Result of asking gh for PRs in a single repo. Repos without a GitHub
+/// remote (or without gh auth) come back with `prs: null` and a reason.
+export interface RepoPRs {
+  repoId: UUID;
+  prs: PullRequest[] | null;
+  error?: string;
+}
+
+export interface AppSettings {
+  theme: 'light' | 'dark' | 'system';
+}
+
+export const DEFAULT_SETTINGS: AppSettings = {
+  theme: 'system',
+};
+
+/// Typed contract for ipcRenderer.invoke channels. Each entry is the
+/// signature the main-process handler implements; the preload exposes
+/// a generic `invoke(channel, ...args)` that respects this map.
+export interface IPCInvokeMap {
+  'store:load': () => StoreSnapshot;
+  'store:saveRepos': (repos: Repo[]) => void;
+  'store:saveWorkspaces': (workspaces: Workspace[]) => void;
+  'store:saveSettings': (settings: AppSettings) => void;
+
+  'repo:add': (path: string) => { ok: true; repo: Repo } | { ok: false; error: string };
+  'repo:pickAndAdd': () => { ok: true; repo: Repo } | { ok: false; error: string } | { ok: false; cancelled: true };
+  'repo:status': (repoId: UUID) => RepoStatus;
+  'repo:listBranches': (repoId: UUID) => { local: string[]; remote: string[] };
+  'repo:log': (args: { repoId: UUID; limit?: number }) => Commit[];
+  /// Diff for a specific commit (parent..sha) when `sha` is set, otherwise
+  /// the working tree vs HEAD (staged + unstaged combined).
+  'repo:diff': (args: { repoId: UUID; sha?: string }) => FileDiff[];
+  'repo:stash': (args: { repoId: UUID; message?: string }) => { ok: boolean; error?: string };
+  'repo:commitAll': (args: { repoId: UUID; message: string }) => { ok: boolean; error?: string };
+  'repo:retryCheckout': (args: {
+    repoId: UUID;
+    branch: string;
+    createIfMissing: boolean;
+  }) => CheckoutOutcome;
+
+  'repo:checkout': (args: {
+    repoId: UUID;
+    branch: string;
+    createIfMissing: boolean;
+  }) => CheckoutOutcome;
+  'repo:changes': (repoId: UUID) => RepoChanges;
+  'repo:stageFiles': (args: { repoId: UUID; paths: string[] }) => { ok: boolean; error?: string };
+  'repo:unstageFiles': (args: { repoId: UUID; paths: string[] }) => { ok: boolean; error?: string };
+  'repo:discardFiles': (args: { repoId: UUID; paths: string[] }) => { ok: boolean; error?: string };
+  'repo:commit': (args: { repoId: UUID; message: string }) => { ok: boolean; error?: string };
+  'repo:push': (repoId: UUID) => { ok: boolean; error?: string };
+  'repo:pull': (repoId: UUID) => { ok: boolean; error?: string };
+  'repo:fetch': (repoId: UUID) => { ok: boolean; error?: string };
+  'repo:createBranch': (args: { repoId: UUID; name: string; checkout: boolean }) => { ok: boolean; error?: string };
+  'repo:deleteBranch': (args: { repoId: UUID; name: string; force: boolean }) => { ok: boolean; error?: string };
+  /// Diff for a single path, scoped to either the index (staged vs HEAD)
+  /// or the working tree (unstaged vs index). Used by the Changes pane
+  /// when a single file is selected.
+  'repo:diffFile': (args: {
+    repoId: UUID;
+    path: string;
+    side: 'staged' | 'unstaged';
+  }) => FileDiff[];
+
+  'workspace:status': (workspaceId: UUID) => RepoStatus[];
+  'workspace:checkoutBranch': (args: {
+    workspaceId: UUID;
+    branch: string;
+    createIfMissing: boolean;
+  }) => CheckoutOutcome[];
+  'workspace:fetchAll': (workspaceId: UUID) => { repoId: UUID; ok: boolean; error?: string }[];
+  'workspace:listPRs': (workspaceId: UUID) => RepoPRs[];
+
+  'cli:detect': () => CliPresence;
+}
+
+export interface StoreSnapshot {
+  repos: Repo[];
+  workspaces: Workspace[];
+  settings: AppSettings;
+}
+
+/// Push channel from main → renderer. Reserved for future streaming
+/// status updates (e.g. progress during a workspace fetch).
+export type MainToRendererEvent =
+  | { kind: 'repo:statusUpdated'; status: RepoStatus }
+  | { kind: 'workspace:checkoutProgress'; workspaceId: UUID; outcome: CheckoutOutcome };
