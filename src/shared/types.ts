@@ -18,6 +18,11 @@ export interface Repo {
   path: string;
   /// When the user last opened this repo in overgit. ISO-8601.
   lastOpenedAt?: string;
+  /// "Trunk" branch of this repo: the one overgit treats as the base
+  /// for compare/PR-base flows and as the recovery target if the user
+  /// abandons a feature branch. Auto-detected from `origin/HEAD` at add
+  /// time; user-overridable in settings.
+  defaultBranch?: string;
 }
 
 export interface Workspace {
@@ -55,12 +60,31 @@ export interface CheckoutOutcome {
   message?: string;
 }
 
-/// Detected installed CLIs we can shell out to for review/comment flows.
-/// Discovered once at startup; the renderer uses presence to gate UI.
+/// Detected installed CLIs we can shell out to. The first three are
+/// review-host CLIs (PR/MR data). The rest are LLM CLIs that can review
+/// or comment on a diff in non-interactive mode. Discovered once at
+/// startup; the renderer uses presence to gate UI.
 export interface CliPresence {
   gh: boolean;
   glab: boolean;
   jj: boolean;
+  claude: boolean;
+  codex: boolean;
+  gemini: boolean;
+}
+
+export type LlmTool = 'claude' | 'codex' | 'gemini';
+
+export interface ReviewResult {
+  ok: boolean;
+  /// Plain-text response from the LLM. For codex this is the post-extraction
+  /// "final assistant message", trimmed of timestamps and metadata.
+  output: string;
+  /// stderr / non-zero-exit message when `ok: false`. Otherwise undefined.
+  error?: string;
+  /// Which CLI produced this response. Pinned so the renderer can label
+  /// the result without re-deriving it from the request.
+  tool: LlmTool;
 }
 
 export interface Commit {
@@ -104,6 +128,37 @@ export interface RepoChanges {
   unstaged: ChangedFile[];
 }
 
+/// One branch in the picker. Carries enough metadata for the row UI
+/// (last-commit subject, date, upstream tag) to render without any
+/// follow-up IPC calls. Sorted by committer date, newest first.
+export interface BranchSummary {
+  name: string;
+  shortName: string;
+  kind: 'local' | 'remote';
+  isCurrent: boolean;
+  sha: string;
+  shortSha: string;
+  subject: string;
+  author: string;
+  date: string;
+  upstream: string | null;
+}
+
+/// One commit row in the project's branch visualization. `lane` and
+/// `parentLanes` come from a greedy stripe layout in main, so the
+/// renderer just draws lines between (lane, row) pairs.
+export interface GraphCommit {
+  sha: string;
+  shortSha: string;
+  parents: string[];
+  subject: string;
+  author: string;
+  date: string;
+  refs: string[];
+  lane: number;
+  parentLanes: number[];
+}
+
 export interface PullRequest {
   number: number;
   title: string;
@@ -127,10 +182,14 @@ export interface RepoPRs {
 
 export interface AppSettings {
   theme: 'light' | 'dark' | 'system';
+  /// User-controlled visibility of the left sidebar. Persisted so the
+  /// title-bar toggle survives relaunch.
+  sidebarVisible: boolean;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
   theme: 'system',
+  sidebarVisible: true,
 };
 
 /// Typed contract for ipcRenderer.invoke channels. Each entry is the
@@ -181,6 +240,23 @@ export interface IPCInvokeMap {
     path: string;
     side: 'staged' | 'unstaged';
   }) => FileDiff[];
+  'repo:graph': (args: { repoId: UUID; limit?: number }) => GraphCommit[];
+  'repo:branchSummaries': (repoId: UUID) => BranchSummary[];
+  'repo:branchCommits': (args: { repoId: UUID; ref: string; limit?: number }) => Commit[];
+  'repo:cherryPick': (args: { repoId: UUID; shas: string[] }) => { ok: boolean; error?: string };
+  'repo:detectDefaultBranch': (repoId: UUID) => string | null;
+  'repo:setDefaultBranch': (args: { repoId: UUID; branch: string | null }) => void;
+
+  'fs:listFiles': (repoId: UUID) => string[];
+  'fs:readFile': (args: {
+    repoId: UUID;
+    path: string;
+  }) => { ok: true; content: string; resolvedPath: string } | { ok: false; error: string };
+  'fs:writeFile': (args: {
+    repoId: UUID;
+    path: string;
+    content: string;
+  }) => { ok: boolean; error?: string };
 
   'workspace:status': (workspaceId: UUID) => RepoStatus[];
   'workspace:checkoutBranch': (args: {
@@ -192,6 +268,11 @@ export interface IPCInvokeMap {
   'workspace:listPRs': (workspaceId: UUID) => RepoPRs[];
 
   'cli:detect': () => CliPresence;
+  'cli:reviewChanges': (args: {
+    repoId: UUID;
+    scope: 'staged' | 'working';
+    tool: LlmTool;
+  }) => ReviewResult;
 }
 
 export interface StoreSnapshot {

@@ -7,33 +7,40 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Store } from './store';
 import {
+  branchSummaries,
   changes as gitChanges,
   checkoutBranch,
+  cherryPick,
   commitAll,
+  commitGraph,
   commitStaged,
   createBranch,
   deleteBranch,
+  detectDefaultBranch,
   diff as gitDiff,
   diffFile,
   discardFiles,
   fetch as gitFetch,
   listBranches,
+  listBranchCommits,
   log as gitLog,
   looksLikeRepo,
   pull as gitPull,
   push as gitPush,
+  rawDiff,
   stageFiles,
   stash as gitStash,
   status as gitStatus,
   unstageFiles,
 } from './git';
+import { listFilesUnder, readFileUnderRoot, writeFileUnderRoot } from './fs';
 import {
   workspaceCheckout,
   workspaceFetch,
   workspaceListPRs,
   workspaceStatus,
 } from './workspace';
-import { detectCliPresence } from './cli';
+import { detectCliPresence, reviewDiffWithLlm } from './cli';
 import { Repo } from '../shared/types';
 
 // Dev vs prod: hit the Vite dev server only when VITE_DEV_SERVER_URL is
@@ -121,17 +128,25 @@ function registerIpc(): void {
   ipcMain.handle('store:saveWorkspaces', (_e, workspaces) => Store.saveWorkspaces(workspaces));
   ipcMain.handle('store:saveSettings', (_e, settings) => Store.saveSettings(settings));
 
-  ipcMain.handle('repo:add', (_e, repoPath: string) => {
+  // Async helper: add a repo and seed its `defaultBranch` from
+  // `origin/HEAD` if available. Detection is best-effort — a fresh
+  // local repo with no remote returns null and the user can pick one
+  // in Settings.
+  const addRepoFromPath = async (chosen: string): Promise<Repo> => {
+    const state = Store.load();
+    const existing = state.repos.find((r) => r.path === chosen);
+    if (existing) return existing;
+    const repo = makeRepoFromPath(chosen);
+    repo.defaultBranch = (await detectDefaultBranch(chosen)) ?? undefined;
+    Store.saveRepos([...state.repos, repo]);
+    return repo;
+  };
+
+  ipcMain.handle('repo:add', async (_e, repoPath: string) => {
     if (!looksLikeRepo(repoPath)) {
       return { ok: false, error: 'No .git found at that path' };
     }
-    // Dedupe by absolute path. If the user re-adds an existing repo we
-    // surface the existing record rather than creating a duplicate ID.
-    const state = Store.load();
-    const existing = state.repos.find((r) => r.path === repoPath);
-    if (existing) return { ok: true, repo: existing };
-    const repo = makeRepoFromPath(repoPath);
-    Store.saveRepos([...state.repos, repo]);
+    const repo = await addRepoFromPath(repoPath);
     return { ok: true, repo };
   });
 
@@ -148,11 +163,7 @@ function registerIpc(): void {
     if (!looksLikeRepo(chosen)) {
       return { ok: false, error: 'No .git found at that path' };
     }
-    const state = Store.load();
-    const existing = state.repos.find((r) => r.path === chosen);
-    if (existing) return { ok: true, repo: existing };
-    const repo = makeRepoFromPath(chosen);
-    Store.saveRepos([...state.repos, repo]);
+    const repo = await addRepoFromPath(chosen);
     return { ok: true, repo };
   });
 
@@ -299,6 +310,74 @@ function registerIpc(): void {
     },
   );
 
+  ipcMain.handle('repo:graph', async (_e, args: { repoId: string; limit?: number }) => {
+    const repo = repoFromArg(args);
+    if (!repo) return [];
+    return commitGraph(repo.path, args.limit ?? 200);
+  });
+
+  ipcMain.handle('repo:branchSummaries', async (_e, repoId: string) => {
+    const repo = repoFromArg(repoId);
+    if (!repo) return [];
+    return branchSummaries(repo.path);
+  });
+
+  ipcMain.handle(
+    'repo:branchCommits',
+    async (_e, args: { repoId: string; ref: string; limit?: number }) => {
+      const repo = repoFromArg(args);
+      if (!repo) return [];
+      return listBranchCommits(repo.path, args.ref, args.limit ?? 50);
+    },
+  );
+
+  ipcMain.handle(
+    'repo:cherryPick',
+    async (_e, args: { repoId: string; shas: string[] }) => {
+      const repo = repoFromArg(args);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return cherryPick(repo.path, args.shas);
+    },
+  );
+
+  ipcMain.handle('repo:detectDefaultBranch', async (_e, repoId: string) => {
+    const repo = repoFromArg(repoId);
+    if (!repo) return null;
+    return detectDefaultBranch(repo.path);
+  });
+
+  ipcMain.handle(
+    'repo:setDefaultBranch',
+    (_e, args: { repoId: string; branch: string | null }) => {
+      const state = Store.load();
+      const updated = state.repos.map((r) =>
+        r.id === args.repoId ? { ...r, defaultBranch: args.branch ?? undefined } : r,
+      );
+      Store.saveRepos(updated);
+    },
+  );
+
+  ipcMain.handle('fs:listFiles', (_e, repoId: string) => {
+    const repo = repoFromArg(repoId);
+    if (!repo) return [];
+    return listFilesUnder(repo.path);
+  });
+
+  ipcMain.handle('fs:readFile', (_e, args: { repoId: string; path: string }) => {
+    const repo = repoFromArg(args);
+    if (!repo) return { ok: false, error: 'Unknown repo' };
+    return readFileUnderRoot(repo.path, args.path);
+  });
+
+  ipcMain.handle(
+    'fs:writeFile',
+    (_e, args: { repoId: string; path: string; content: string }) => {
+      const repo = repoFromArg(args);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return writeFileUnderRoot(repo.path, args.path, args.content);
+    },
+  );
+
   ipcMain.handle('workspace:status', async (_e, workspaceId: string) => {
     const { workspaces, repos } = Store.load();
     return workspaceStatus(workspaceId, workspaces, repos);
@@ -326,6 +405,24 @@ function registerIpc(): void {
   });
 
   ipcMain.handle('cli:detect', () => detectCliPresence());
+
+  ipcMain.handle(
+    'cli:reviewChanges',
+    async (
+      _e,
+      args: { repoId: string; scope: 'staged' | 'working'; tool: 'claude' | 'codex' | 'gemini' },
+    ) => {
+      const repo = repoFromArg(args);
+      if (!repo) {
+        return { ok: false, output: '', error: 'Unknown repo', tool: args.tool };
+      }
+      const diff = await rawDiff(repo.path, args.scope);
+      if (!diff.ok) {
+        return { ok: false, output: '', error: diff.error ?? 'Could not read diff', tool: args.tool };
+      }
+      return reviewDiffWithLlm(args.tool, diff.text);
+    },
+  );
 }
 
 app.whenReady().then(() => {
