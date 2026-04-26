@@ -199,6 +199,26 @@ function classifyFailure(repoId: UUID, branch: string, r: RunResult): CheckoutOu
   return { repoId, result: 'error', branch, message: r.stderr.trim() || `git exited ${r.code}` };
 }
 
+/// Fetch the raw unified-diff text for either the working tree
+/// (`scope: 'working'`, equivalent to `git diff HEAD`) or the staged
+/// changes (`scope: 'staged'`, equivalent to `git diff --cached`).
+/// Used by the LLM review flow, which needs the diff as a single string
+/// to pipe into a reviewer CLI's stdin.
+export async function rawDiff(
+  repoPath: string,
+  scope: 'staged' | 'working',
+): Promise<{ ok: boolean; text: string; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, text: '', error: 'Not a git repo' };
+  const args = scope === 'staged'
+    ? ['diff', '--cached', '--no-color']
+    : ['diff', '--no-color', 'HEAD'];
+  const res = await run(repoPath, args);
+  if (!res.ok) {
+    return { ok: false, text: '', error: res.stderr.trim() || `git exited ${res.code}` };
+  }
+  return { ok: true, text: res.stdout };
+}
+
 export async function fetch(repoPath: string): Promise<{ ok: boolean; error?: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
   const res = await run(repoPath, ['fetch', '--all', '--prune']);
@@ -512,6 +532,185 @@ export async function createBranch(
   return { ok: false, error: res.stderr.trim() || `git exited ${res.code}` };
 }
 
+/// Detect the repo's default branch — the line `origin/main` is on, the
+/// branch overgit treats as the "trunk" for compare/PR-base actions.
+/// Falls back through three sources: the symbolic HEAD ref of origin
+/// (the canonical answer), then a heuristic over `main`/`master`/`develop`.
+/// Returns null only when the repo has none of those — at which point
+/// the user can pick one in settings.
+export async function detectDefaultBranch(repoPath: string): Promise<string | null> {
+  if (!looksLikeRepo(repoPath)) return null;
+  // 1. `origin/HEAD` — set during `clone`, refreshed by
+  //    `git remote set-head origin -a`. When it exists, it's the
+  //    repository owner's declared default.
+  const symbolic = await run(repoPath, [
+    'symbolic-ref',
+    '--quiet',
+    'refs/remotes/origin/HEAD',
+  ]);
+  if (symbolic.ok) {
+    const ref = symbolic.stdout.trim();
+    const m = ref.match(/^refs\/remotes\/origin\/(.+)$/);
+    if (m) return m[1];
+  }
+  // 2. Heuristic: pick the first of main/master/develop that exists.
+  for (const candidate of ['main', 'master', 'develop']) {
+    const exists = await run(repoPath, [
+      'show-ref',
+      '--verify',
+      '--quiet',
+      `refs/heads/${candidate}`,
+    ]);
+    if (exists.ok) return candidate;
+  }
+  return null;
+}
+
+export interface BranchSummary {
+  name: string;
+  /// Short display name. For local branches this equals `name`; for
+  /// remote-tracking branches it's the part after the remote ("foo"
+  /// for "origin/foo").
+  shortName: string;
+  kind: 'local' | 'remote';
+  isCurrent: boolean;
+  /// Tip commit. Used by the picker to show the user what state each
+  /// branch is in without having to switch first.
+  sha: string;
+  shortSha: string;
+  subject: string;
+  author: string;
+  date: string;
+  /// Configured upstream tracking ref ("origin/main" for local "main"),
+  /// or null if untracked. Lets the picker tag a branch as "tracks X".
+  upstream: string | null;
+}
+
+const BRANCH_FORMAT = [
+  '%(refname:short)',
+  '%(objectname)',
+  '%(objectname:short)',
+  '%(subject)',
+  '%(authorname)',
+  '%(committerdate:iso-strict)',
+  '%(upstream:short)',
+].join('%1f');
+
+/// Enumerate every branch — local + remote. We hit `for-each-ref` twice
+/// rather than once (heads + remotes in a single call) so we can tag the
+/// `kind` from the namespace it came from, instead of doing N `show-ref`
+/// round-trips per branch to disambiguate.
+export async function branchSummaries(repoPath: string): Promise<BranchSummary[]> {
+  if (!looksLikeRepo(repoPath)) return [];
+
+  const [headRes, locals, remotes] = await Promise.all([
+    run(repoPath, ['rev-parse', '--abbrev-ref', 'HEAD']),
+    run(repoPath, [
+      'for-each-ref',
+      '--sort=-committerdate',
+      `--format=${BRANCH_FORMAT}`,
+      'refs/heads',
+    ]),
+    run(repoPath, [
+      'for-each-ref',
+      '--sort=-committerdate',
+      `--format=${BRANCH_FORMAT}`,
+      'refs/remotes',
+    ]),
+  ]);
+
+  const currentBranch = headRes.ok ? headRes.stdout.trim() : '';
+  const out: BranchSummary[] = [];
+
+  const consume = (raw: string, kind: 'local' | 'remote') => {
+    for (const line of raw.split('\n')) {
+      if (!line) continue;
+      const [name, sha, shortSha, subject, author, date, upstream] = line.split('\x1f');
+      if (!name) continue;
+      // `<remote>/HEAD` is a symbolic alias to whatever the remote's
+      // default branch is — the same commit shows up under its real name
+      // already, so dropping the alias keeps the picker tidy.
+      if (name.endsWith('/HEAD')) continue;
+      const shortName =
+        kind === 'remote' ? name.split('/').slice(1).join('/') : name;
+      out.push({
+        name,
+        shortName,
+        kind,
+        isCurrent: kind === 'local' && name === currentBranch,
+        sha: sha ?? '',
+        shortSha: shortSha ?? '',
+        subject: subject ?? '',
+        author: author ?? '',
+        date: date ?? '',
+        upstream: upstream && upstream.length > 0 ? upstream : null,
+      });
+    }
+  };
+
+  if (locals.ok) consume(locals.stdout, 'local');
+  if (remotes.ok) consume(remotes.stdout, 'remote');
+  return out;
+}
+
+export async function listBranchCommits(
+  repoPath: string,
+  ref: string,
+  limit = 50,
+): Promise<Commit[]> {
+  if (!looksLikeRepo(repoPath)) return [];
+  if (!ref || /[\s;|`$]/.test(ref)) return [];
+  const res = await run(repoPath, [
+    'log',
+    `-${Math.max(1, Math.min(limit, 500))}`,
+    `--pretty=format:${LOG_FORMAT}`,
+    ref,
+    '--',
+  ]);
+  if (!res.ok) return [];
+  const out: Commit[] = [];
+  for (const record of res.stdout.split('\x1e')) {
+    const t = record.trim();
+    if (!t) continue;
+    const [sha, shortSha, parents, subject, author, authorEmail, date] = t.split('\x1f');
+    if (!sha) continue;
+    out.push({
+      sha,
+      shortSha: shortSha ?? sha.slice(0, 7),
+      parents: parents ? parents.split(' ').filter(Boolean) : [],
+      subject: subject ?? '',
+      author: author ?? '',
+      authorEmail: authorEmail ?? '',
+      date: date ?? '',
+    });
+  }
+  return out;
+}
+
+/// Apply commits onto the current branch via `git cherry-pick`. We pass
+/// shas individually rather than a range so a partial failure leaves
+/// the user a clean intermediate state to recover from (cherry-pick
+/// auto-stops on conflict; we surface the error and the user can resolve).
+export async function cherryPick(
+  repoPath: string,
+  shas: string[],
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  if (shas.length === 0) return { ok: true };
+  // Reject shas that don't look like git object names. A surprising
+  // amount of damage is possible if someone managed to slip `; rm -rf`
+  // into a sha — `spawn(..., {shell: false})` already protects us, but
+  // belt-and-braces.
+  for (const s of shas) {
+    if (!/^[0-9a-fA-F]{4,64}$/.test(s)) {
+      return { ok: false, error: `Refusing to cherry-pick non-sha "${s}"` };
+    }
+  }
+  const res = await run(repoPath, ['cherry-pick', ...shas]);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git cherry-pick exited ${res.code}` };
+}
+
 export async function deleteBranch(
   repoPath: string,
   name: string,
@@ -523,6 +722,119 @@ export async function deleteBranch(
   const res = await run(repoPath, ['branch', flag, name.trim()]);
   if (res.ok) return { ok: true };
   return { ok: false, error: res.stderr.trim() || `git branch exited ${res.code}` };
+}
+
+/// One commit row in the rendered branch graph.
+export interface GraphCommit {
+  sha: string;
+  shortSha: string;
+  parents: string[];
+  subject: string;
+  author: string;
+  date: string;
+  /// Refs decorating this commit ("main", "origin/main", "HEAD -> feat/x").
+  /// Already split apart and trimmed; the renderer pins them as labels.
+  refs: string[];
+  /// Lane index (0-based) we lay this commit on. Computed by a tiny
+  /// stripe-allocator that walks the commits in topological order and
+  /// assigns lanes greedily — good enough for typical history shapes
+  /// (linear, occasional merges) without pulling in a full DAG layout.
+  lane: number;
+  /// Lane indices of this commit's parents at the moment we placed
+  /// them. Used by the renderer to draw connecting lines.
+  parentLanes: number[];
+}
+
+const GRAPH_FORMAT = '%H%x1f%h%x1f%P%x1f%s%x1f%an%x1f%aI%x1f%D%x1e';
+
+/// Build a small commit graph for the branch visualization. Pulls
+/// `git log --all --topo-order` and lays the commits onto vertical lanes
+/// so the UI can draw a left-rail graph with branch labels.
+export async function commitGraph(repoPath: string, limit = 200): Promise<GraphCommit[]> {
+  if (!looksLikeRepo(repoPath)) return [];
+  const res = await run(repoPath, [
+    'log',
+    '--all',
+    '--topo-order',
+    `-${Math.max(1, Math.min(limit, 2000))}`,
+    `--pretty=format:${GRAPH_FORMAT}`,
+  ]);
+  if (!res.ok) return [];
+
+  const parsed: Omit<GraphCommit, 'lane' | 'parentLanes'>[] = [];
+  for (const record of res.stdout.split('\x1e')) {
+    const t = record.trim();
+    if (!t) continue;
+    const [sha, shortSha, parents, subject, author, date, refs] = t.split('\x1f');
+    if (!sha) continue;
+    parsed.push({
+      sha,
+      shortSha: shortSha ?? sha.slice(0, 7),
+      parents: parents ? parents.split(' ').filter(Boolean) : [],
+      subject: subject ?? '',
+      author: author ?? '',
+      date: date ?? '',
+      refs: refs
+        ? refs
+            .split(',')
+            .map((r) => r.trim())
+            .filter(Boolean)
+        : [],
+    });
+  }
+
+  // Standard graph layout: walk commits child-first (the order git
+  // emits) so when we see a child we can claim a lane for each of its
+  // parents; when the parent itself shows up later we look it up in
+  // `active` and inherit that reserved lane. The earlier version walked
+  // parents-first which broke linear histories — every commit grabbed a
+  // brand-new lane because no future child had reserved one yet.
+  //
+  // Sibling-merge semantics: if multiple children point at the same
+  // parent (a fork that re-merges), the FIRST child to declare it wins
+  // the lane; later children share that lane via the `findIndex` lookup
+  // before allocating a new one. That keeps merges from spuriously
+  // multiplying lanes.
+  const out: GraphCommit[] = [];
+  const active: (string | null)[] = [];
+  for (let i = 0; i < parsed.length; i += 1) {
+    const c = parsed[i];
+
+    let lane = active.findIndex((s) => s === c.sha);
+    if (lane === -1) {
+      lane = active.findIndex((s) => s === null);
+      if (lane === -1) {
+        lane = active.length;
+        active.push(null);
+      }
+    }
+    active[lane] = null;
+
+    const parentLanes: number[] = [];
+    for (let pi = 0; pi < c.parents.length; pi += 1) {
+      const parent = c.parents[pi];
+
+      let pLane = active.findIndex((s) => s === parent);
+      if (pLane === -1) {
+        if (pi === 0) {
+          // First parent inherits this commit's lane — keeps the trunk
+          // running straight down through linear history.
+          pLane = lane;
+        } else {
+          pLane = active.findIndex((s) => s === null);
+          if (pLane === -1) {
+            pLane = active.length;
+            active.push(null);
+          }
+        }
+      }
+      active[pLane] = parent;
+      parentLanes.push(pLane);
+    }
+
+    out.push({ ...c, lane, parentLanes });
+  }
+  return out;
 }
 
 /// Single-file diff for the Changes pane. `staged` shows index vs HEAD;

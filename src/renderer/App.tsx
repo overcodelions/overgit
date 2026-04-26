@@ -1,29 +1,44 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useStore } from './store';
 import { RepoDetail } from './RepoDetail';
+import { TitleBar } from './TitleBar';
+import { SheetHost } from './Sheets';
 import type {
   CheckoutOutcome,
   CliPresence,
   PullRequest,
+  Repo,
   RepoPRs,
   RepoStatus,
   UUID,
+  Workspace,
 } from '@shared/types';
 
 export function App(): JSX.Element {
   const { loaded, hydrate } = useStore();
+  const sidebarVisible = useStore((s) => s.settings.sidebarVisible);
+
   useEffect(() => {
     hydrate();
   }, [hydrate]);
 
   if (!loaded) {
-    return <div className="p-6 text-ink-muted">Loading…</div>;
+    return (
+      <div className="flex flex-col h-full">
+        <TitleBar />
+        <div className="p-6 text-ink-muted text-sm">Loading…</div>
+      </div>
+    );
   }
 
   return (
-    <div className="flex h-full">
-      <Sidebar />
-      <Main />
+    <div className="flex flex-col h-full">
+      <TitleBar />
+      <div className="flex flex-1 min-h-0">
+        {sidebarVisible && <Sidebar />}
+        <Main />
+      </div>
+      <SheetHost />
     </div>
   );
 }
@@ -36,130 +51,252 @@ function Sidebar(): JSX.Element {
   const selectWs = useStore((s) => s.selectWorkspace);
   const selectRepo = useStore((s) => s.selectRepo);
   const pickAndAddRepo = useStore((s) => s.pickAndAddRepo);
-  const createWorkspace = useStore((s) => s.createWorkspace);
+  const setSheet = useStore((s) => s.setSheet);
+  const removeRepo = useStore((s) => s.removeRepo);
+  const removeWorkspace = useStore((s) => s.removeWorkspace);
 
-  const [name, setName] = useState('');
-  const [picked, setPicked] = useState<Set<UUID>>(new Set());
+  const [search, setSearch] = useState('');
+  const query = search.trim().toLowerCase();
+
+  const visibleRepos = useMemo(
+    () =>
+      query
+        ? repos.filter(
+            (r) =>
+              r.name.toLowerCase().includes(query) ||
+              r.path.toLowerCase().includes(query),
+          )
+        : repos,
+    [repos, query],
+  );
+
+  const visibleWorkspaces = useMemo(
+    () =>
+      query
+        ? workspaces.filter((w) => w.name.toLowerCase().includes(query))
+        : workspaces,
+    [workspaces, query],
+  );
 
   return (
-    <aside className="w-72 shrink-0 border-r border-card bg-surface-muted p-4 flex flex-col gap-6 overflow-y-auto">
-      <header>
-        <div className="text-xs uppercase tracking-wide text-ink-faint">Overgit</div>
-        <div className="text-base font-semibold">Workspaces over your repos</div>
-      </header>
+    <aside className="w-72 shrink-0 flex flex-col border-r border-card bg-surface-muted">
+      <div className="px-2 pt-2 pb-1">
+        <input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Search"
+          className="field w-full px-2 py-1 text-xs"
+        />
+      </div>
 
-      <section>
-        <h2 className="text-xs uppercase tracking-wide text-ink-faint mb-2">Workspaces</h2>
-        {workspaces.length === 0 ? (
-          <div className="text-sm text-ink-faint">No workspaces yet.</div>
-        ) : (
-          <ul className="flex flex-col gap-1">
-            {workspaces.map((w) => (
-              <li key={w.id}>
-                <button
-                  onClick={() => selectWs(w.id)}
-                  className={`w-full text-left px-2 py-1.5 rounded-md text-sm ${
-                    selectedWs === w.id && !selectedRepo
-                      ? 'bg-accent text-white'
-                      : 'hover:bg-card'
-                  }`}
-                >
-                  <div className="font-medium">{w.name}</div>
-                  <div
-                    className={`text-xs ${
-                      selectedWs === w.id && !selectedRepo ? 'text-white/70' : 'text-ink-faint'
-                    }`}
-                  >
-                    {w.repoIds.length} {w.repoIds.length === 1 ? 'repo' : 'repos'}
-                  </div>
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
-
-      <section>
-        <div className="flex items-center justify-between mb-2">
-          <h2 className="text-xs uppercase tracking-wide text-ink-faint">Repos</h2>
-          <button
-            onClick={pickAndAddRepo}
-            className="text-xs px-2 py-0.5 rounded bg-accent text-white hover:bg-accent-strong"
-          >
-            Add
-          </button>
-        </div>
-        {repos.length === 0 ? (
-          <div className="text-sm text-ink-faint">
-            Add a local git repo to get started.
-          </div>
-        ) : (
-          <ul className="flex flex-col gap-1">
-            {repos.map((r) => {
-              const isPicked = picked.has(r.id);
-              const isOpen = selectedRepo === r.id;
-              return (
-                <li
-                  key={r.id}
-                  className={`flex items-center gap-2 px-2 py-1 rounded text-sm ${
-                    isOpen ? 'bg-accent text-white' : 'hover:bg-card'
-                  }`}
-                >
-                  <input
-                    type="checkbox"
-                    checked={isPicked}
-                    onChange={() => {
-                      const next = new Set(picked);
-                      if (next.has(r.id)) next.delete(r.id);
-                      else next.add(r.id);
-                      setPicked(next);
-                    }}
-                  />
-                  <button
-                    onClick={() => selectRepo(r.id)}
-                    className="min-w-0 flex-1 text-left"
-                  >
-                    <div className="font-medium truncate">{r.name}</div>
-                    <div
-                      className={`text-xs truncate ${
-                        isOpen ? 'text-white/70' : 'text-ink-faint'
-                      }`}
-                    >
-                      {r.path}
-                    </div>
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </section>
-
-      {picked.size > 0 && (
-        <section className="border-t border-card pt-4">
-          <h2 className="text-xs uppercase tracking-wide text-ink-faint mb-2">
-            New workspace
-          </h2>
-          <input
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="Workspace name"
-            className="w-full px-2 py-1 rounded bg-surface-elevated border border-card text-sm mb-2"
+      <nav className="flex-1 min-h-0 overflow-y-auto px-1 pb-2">
+        {/* Repos on top — that's where users start. */}
+        <SectionHeader label="Repos" count={visibleRepos.length} />
+        {visibleRepos.length === 0 ? (
+          <EmptyHint
+            text={query ? 'No repos match.' : 'Add a local git repo to start.'}
           />
-          <button
-            disabled={!name.trim()}
-            onClick={async () => {
-              await createWorkspace(name.trim(), [...picked]);
-              setName('');
-              setPicked(new Set());
-            }}
-            className="w-full text-sm px-2 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            Create from {picked.size} {picked.size === 1 ? 'repo' : 'repos'}
-          </button>
-        </section>
-      )}
+        ) : (
+          visibleRepos.map((r) => (
+            <RepoRow
+              key={r.id}
+              repo={r}
+              selected={selectedRepo === r.id}
+              onSelect={() => selectRepo(r.id)}
+              onRemove={() => {
+                if (
+                  window.confirm(
+                    `Remove "${r.name}" from overgit? The repo on disk is left alone.`,
+                  )
+                ) {
+                  void removeRepo(r.id);
+                }
+              }}
+            />
+          ))
+        )}
+
+        <SectionHeader label="Workspaces" count={visibleWorkspaces.length} />
+        {visibleWorkspaces.length === 0 ? (
+          <EmptyHint
+            text={
+              query
+                ? 'No workspaces match.'
+                : 'Group repos that you switch together.'
+            }
+          />
+        ) : (
+          visibleWorkspaces.map((w) => (
+            <WorkspaceRow
+              key={w.id}
+              workspace={w}
+              selected={selectedWs === w.id && !selectedRepo}
+              onSelect={() => selectWs(w.id)}
+              onEdit={() => setSheet({ kind: 'editWorkspace', workspaceId: w.id })}
+              onRemove={() => {
+                if (window.confirm(`Remove workspace "${w.name}"?`)) {
+                  void removeWorkspace(w.id);
+                }
+              }}
+            />
+          ))
+        )}
+      </nav>
+
+      <div className="border-t border-card px-2 py-2 flex flex-col gap-1">
+        <button
+          onClick={pickAndAddRepo}
+          className="text-xs text-ink-muted hover:text-ink py-1 px-2 rounded hover:bg-card text-left"
+        >
+          + Add repo
+        </button>
+        <button
+          onClick={() => setSheet({ kind: 'newWorkspace' })}
+          disabled={repos.length === 0}
+          className="text-xs text-ink-muted hover:text-ink py-1 px-2 rounded hover:bg-card text-left disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-ink-muted"
+        >
+          + New workspace
+        </button>
+      </div>
     </aside>
+  );
+}
+
+function SectionHeader({ label, count }: { label: string; count: number }): JSX.Element {
+  return (
+    <div className="mt-3 first:mt-1 px-2 py-1 flex items-center gap-2">
+      <span className="text-[10px] uppercase tracking-wide text-ink-faint">{label}</span>
+      <span className="text-[10px] text-ink-faint">{count}</span>
+    </div>
+  );
+}
+
+function EmptyHint({ text }: { text: string }): JSX.Element {
+  return <div className="px-2 py-1 text-[11px] text-ink-faint">{text}</div>;
+}
+
+function RepoRow({
+  repo,
+  selected,
+  onSelect,
+  onRemove,
+}: {
+  repo: Repo;
+  selected: boolean;
+  onSelect: () => void;
+  onRemove: () => void;
+}): JSX.Element {
+  return (
+    <div
+      className={`sidebar-row group flex items-center gap-1.5 rounded text-xs ${
+        selected ? 'sidebar-row-selected text-ink' : 'text-ink-muted hover:bg-card hover:text-ink'
+      }`}
+    >
+      <button
+        onClick={onSelect}
+        className="flex items-center gap-1.5 flex-1 min-w-0 text-left px-2 py-1"
+        title={repo.path}
+      >
+        <RepoIcon />
+        <span className="truncate">{repo.name}</span>
+      </button>
+      <button
+        onClick={onRemove}
+        title="Remove from overgit"
+        className="w-5 h-5 flex items-center justify-center rounded text-ink-faint opacity-0 group-hover:opacity-100 hover:text-red-300 hover:bg-card"
+      >
+        <span className="text-[11px]">×</span>
+      </button>
+    </div>
+  );
+}
+
+function WorkspaceRow({
+  workspace,
+  selected,
+  onSelect,
+  onEdit,
+  onRemove,
+}: {
+  workspace: Workspace;
+  selected: boolean;
+  onSelect: () => void;
+  onEdit: () => void;
+  onRemove: () => void;
+}): JSX.Element {
+  return (
+    <div
+      className={`sidebar-row group flex items-center gap-1.5 rounded text-xs ${
+        selected ? 'sidebar-row-selected text-ink' : 'text-ink-muted hover:bg-card hover:text-ink'
+      }`}
+    >
+      <button
+        onClick={onSelect}
+        className="flex items-center gap-1.5 flex-1 min-w-0 text-left px-2 py-1"
+      >
+        <WorkspaceIcon />
+        <span className="truncate">{workspace.name}</span>
+        <span className="text-[10px] text-ink-faint">
+          {workspace.repoIds.length}
+        </span>
+      </button>
+      <button
+        onClick={onEdit}
+        title="Edit workspace"
+        className="w-5 h-5 flex items-center justify-center rounded text-ink-faint opacity-0 group-hover:opacity-100 hover:text-ink hover:bg-card"
+      >
+        <PencilIcon />
+      </button>
+      <button
+        onClick={onRemove}
+        title="Remove workspace"
+        className="w-5 h-5 flex items-center justify-center rounded text-ink-faint opacity-0 group-hover:opacity-100 hover:text-red-300 hover:bg-card"
+      >
+        <span className="text-[11px]">×</span>
+      </button>
+    </div>
+  );
+}
+
+function RepoIcon(): JSX.Element {
+  return (
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" className="text-ink-muted flex-shrink-0">
+      <path
+        d="M3.5 2.5h7l1 1v9.5a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1z"
+        stroke="currentColor"
+        strokeWidth="1.2"
+      />
+      <path d="M6 8 7.5 9.5 10 7" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function WorkspaceIcon(): JSX.Element {
+  return (
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" className="text-ink-muted flex-shrink-0">
+      <path
+        d="M3.5 2.5H5.7L6.7 3.6H12.5V5.5H3.5V2.5Z"
+        stroke="currentColor"
+        strokeWidth="1.1"
+        strokeLinejoin="round"
+        fill="currentColor"
+        fillOpacity="0.2"
+      />
+      <path
+        d="M1.5 5.5H4L5 6.5H14.5V13.3A1 1 0 0113.5 14.3H2.5A1 1 0 011.5 13.3V5.5Z"
+        stroke="currentColor"
+        strokeWidth="1.2"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function PencilIcon(): JSX.Element {
+  return (
+    <svg width="11" height="11" viewBox="0 0 20 20" fill="currentColor" className="flex-shrink-0">
+      <path d="M12.793 2.793a1 1 0 0 1 1.414 0l2 2a1 1 0 0 1 0 1.414l-8.2 8.2a2.5 2.5 0 0 1-1.14.63l-2.26.566a.75.75 0 0 1-.91-.91l.566-2.26a2.5 2.5 0 0 1 .63-1.14l8.2-8.2Z" />
+    </svg>
   );
 }
 
@@ -172,19 +309,16 @@ function Main(): JSX.Element {
     [workspaces, selectedWs],
   );
 
-  // The repo detail pane wins when a repo is open — workspaces remain
-  // selected in the sidebar so the user can pop back without re-picking.
   if (selectedRepo) return <RepoDetail repoId={selectedRepo} />;
 
   if (!ws) {
     return (
       <main className="flex-1 flex items-center justify-center text-ink-muted">
         <div className="text-center max-w-sm">
-          <div className="text-lg font-medium mb-1">Pick a workspace or open a repo</div>
-          <p className="text-sm text-ink-faint">
-            A workspace is just a named group of repos — overgit coordinates
-            branches, status, and PRs across them without changing anything
-            inside the repos themselves.
+          <div className="text-base font-medium mb-1">Pick a repo or a workspace</div>
+          <p className="text-xs text-ink-faint">
+            Repos give you a single-repo working pane (changes, history, files,
+            graph). Workspaces fan operations across many repos at once.
           </p>
         </div>
       </main>
@@ -206,6 +340,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
   const fetchWs = useStore((s) => s.fetchWorkspace);
   const checkout = useStore((s) => s.checkoutWorkspaceBranch);
   const selectRepo = useStore((s) => s.selectRepo);
+  const setSheet = useStore((s) => s.setSheet);
 
   const [branch, setBranch] = useState('');
   const [createIfMissing, setCreateIfMissing] = useState(false);
@@ -220,17 +355,42 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
 
   const reposById = new Map(repos.map((r) => [r.id, r]));
 
+  // Compact overview computed across the workspace's per-repo statuses.
+  // We flash this even before statuses finish loading so the page always
+  // has something useful at the top — the prior version showed just an
+  // input box on a fresh workspace, which read as blank.
+  const summary = useMemo(() => {
+    const total = ws.repoIds.length;
+    const loaded = statuses.length;
+    const dirty = statuses.filter((s) => s.dirtyCount > 0).length;
+    const ahead = statuses.filter((s) => (s.ahead ?? 0) > 0).length;
+    const behind = statuses.filter((s) => (s.behind ?? 0) > 0).length;
+    const branchTally = new Map<string, number>();
+    for (const s of statuses) {
+      const b = s.branch ?? '(detached)';
+      branchTally.set(b, (branchTally.get(b) ?? 0) + 1);
+    }
+    const sortedBranches = [...branchTally.entries()].sort((a, b) => b[1] - a[1]);
+    return { total, loaded, dirty, ahead, behind, sortedBranches };
+  }, [ws.repoIds.length, statuses]);
+
   return (
     <main className="flex-1 overflow-y-auto p-6">
       <header className="flex items-baseline justify-between mb-4">
         <div>
-          <h1 className="text-xl font-semibold">{ws.name}</h1>
-          <p className="text-xs text-ink-faint">
+          <h1 className="text-base font-semibold">{ws.name}</h1>
+          <p className="text-[11px] text-ink-faint">
             {ws.repoIds.length} {ws.repoIds.length === 1 ? 'repo' : 'repos'} ·
             CLIs: {cliSummary(cli)}
           </p>
         </div>
         <div className="flex gap-2">
+          <button
+            onClick={() => setSheet({ kind: 'editWorkspace', workspaceId })}
+            className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
+          >
+            Edit
+          </button>
           <button
             disabled={busy}
             onClick={async () => {
@@ -241,7 +401,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
                 setBusy(false);
               }
             }}
-            className="text-sm px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+            className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
           >
             Fetch all
           </button>
@@ -251,15 +411,53 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
               refresh(workspaceId);
               refreshPRs(workspaceId);
             }}
-            className="text-sm px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+            className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
           >
             Refresh
           </button>
         </div>
       </header>
 
+      {/* Overview tiles. Always render so a freshly-created workspace
+          has visible content while statuses load. */}
+      <section className="mb-4 grid grid-cols-2 md:grid-cols-4 gap-2">
+        <OverviewTile label="Repos" value={summary.total.toString()} hint={
+          summary.loaded < summary.total
+            ? `Loading ${summary.loaded}/${summary.total}…`
+            : 'all loaded'
+        } />
+        <OverviewTile
+          label="Dirty"
+          value={summary.dirty.toString()}
+          hint={summary.dirty === 0 ? 'all clean' : 'have local changes'}
+          tone={summary.dirty > 0 ? 'warn' : 'muted'}
+        />
+        <OverviewTile
+          label="Ahead / Behind"
+          value={`${summary.ahead} / ${summary.behind}`}
+          hint="vs upstream"
+          tone={summary.ahead + summary.behind > 0 ? 'warn' : 'muted'}
+        />
+        <OverviewTile
+          label="Branch spread"
+          value={
+            summary.sortedBranches.length === 0
+              ? '—'
+              : summary.sortedBranches[0][0]
+          }
+          hint={
+            summary.sortedBranches.length <= 1
+              ? `${summary.sortedBranches[0]?.[1] ?? 0} ${
+                  (summary.sortedBranches[0]?.[1] ?? 0) === 1 ? 'repo' : 'repos'
+                }`
+              : `${summary.sortedBranches.length} different branches`
+          }
+          tone={summary.sortedBranches.length > 1 ? 'warn' : 'muted'}
+        />
+      </section>
+
       <section className="mb-6 p-3 rounded-lg bg-card border border-card">
-        <div className="text-xs uppercase tracking-wide text-ink-faint mb-2">
+        <div className="text-[10px] uppercase tracking-wide text-ink-faint mb-2">
           Bring workspace to a branch
         </div>
         <div className="flex gap-2 items-center">
@@ -267,9 +465,9 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
             value={branch}
             onChange={(e) => setBranch(e.target.value)}
             placeholder="branch name"
-            className="flex-1 px-2 py-1.5 rounded bg-surface-elevated border border-card text-sm"
+            className="field flex-1 px-2 py-1.5 text-xs"
           />
-          <label className="flex items-center gap-1 text-xs text-ink-muted">
+          <label className="flex items-center gap-1 text-[11px] text-ink-muted">
             <input
               type="checkbox"
               checked={createIfMissing}
@@ -287,7 +485,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
                 setBusy(false);
               }
             }}
-            className="text-sm px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+            className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
           >
             Switch all
           </button>
@@ -305,12 +503,15 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
         )}
       </section>
 
-      {prs.length > 0 && (
-        <PRSection prs={prs} reposById={reposById} cli={cli} />
-      )}
+      {prs.length > 0 && <PRSection prs={prs} reposById={reposById} cli={cli} />}
 
       <section>
-        <h2 className="text-xs uppercase tracking-wide text-ink-faint mb-2">Status</h2>
+        <h2 className="text-[10px] uppercase tracking-wide text-ink-faint mb-2">Status</h2>
+        {ws.repoIds.length === 0 && (
+          <div className="text-xs text-ink-faint p-3 rounded border border-card bg-card">
+            This workspace has no repos yet. Click "Edit" to add some.
+          </div>
+        )}
         <ul className="flex flex-col gap-1">
           {ws.repoIds.map((id) => {
             const repo = reposById.get(id);
@@ -325,8 +526,8 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
                   className="min-w-0 flex-1 text-left hover:underline"
                   title="Open repo detail"
                 >
-                  <div className="font-medium truncate">{repo?.name ?? id}</div>
-                  <div className="text-xs text-ink-faint truncate">{repo?.path}</div>
+                  <div className="text-sm font-medium truncate">{repo?.name ?? id}</div>
+                  <div className="text-[11px] text-ink-faint truncate font-mono">{repo?.path}</div>
                 </button>
                 <StatusCell status={st} />
               </li>
@@ -335,6 +536,33 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
         </ul>
       </section>
     </main>
+  );
+}
+
+function OverviewTile({
+  label,
+  value,
+  hint,
+  tone = 'muted',
+}: {
+  label: string;
+  value: string;
+  hint: string;
+  tone?: 'muted' | 'warn';
+}): JSX.Element {
+  return (
+    <div className="p-3 rounded-lg border border-card bg-card">
+      <div className="text-[10px] uppercase tracking-wide text-ink-faint">{label}</div>
+      <div
+        className={`text-lg font-mono mt-0.5 truncate ${
+          tone === 'warn' ? 'text-amber-300' : 'text-ink'
+        }`}
+        title={value}
+      >
+        {value}
+      </div>
+      <div className="text-[10px] text-ink-faint mt-0.5">{hint}</div>
+    </div>
   );
 }
 
@@ -385,7 +613,7 @@ function CheckoutOutcomeRow({
   };
 
   return (
-    <li className="text-xs flex flex-col gap-1">
+    <li className="text-[11px] flex flex-col gap-1">
       <div className="flex gap-2 items-center">
         <span className="text-ink-faint w-40 truncate">{repoName}</span>
         <CheckoutBadge outcome={outcome} />
@@ -418,12 +646,12 @@ function CheckoutOutcomeRow({
             value={message}
             onChange={(e) => setMessage(e.target.value)}
             placeholder="commit message"
-            className="flex-1 px-2 py-1 rounded bg-surface-elevated border border-card text-xs"
+            className="field flex-1 px-2 py-1 text-[11px]"
           />
           <button
             disabled={busy || !message.trim()}
             onClick={onCommit}
-            className="px-2 py-1 rounded bg-accent text-white text-xs hover:bg-accent-strong disabled:opacity-50"
+            className="px-2 py-1 rounded bg-accent text-white text-[11px] hover:bg-accent-strong disabled:opacity-50"
           >
             Commit
           </button>
@@ -433,7 +661,7 @@ function CheckoutOutcomeRow({
               setShowCommit(false);
               setMessage('');
             }}
-            className="px-2 py-1 rounded border border-card text-xs hover:bg-card disabled:opacity-50"
+            className="px-2 py-1 rounded border border-card text-[11px] hover:bg-card disabled:opacity-50"
           >
             Cancel
           </button>
@@ -458,26 +686,20 @@ function PRSection({
     const repoName = reposById.get(entry.repoId)?.name ?? entry.repoId;
     for (const pr of entry.prs) flat.push({ repoId: entry.repoId, repoName, pr });
   }
-  // Sort across repos by most recently updated; that matches what GitHub
-  // itself shows by default and is the most useful first scan order.
   flat.sort((a, b) => (a.pr.updatedAt < b.pr.updatedAt ? 1 : -1));
-
-  // Repos that errored — show a thin note so the user knows gh didn't
-  // silently skip them. Suppressed entirely if gh isn't installed at all
-  // (then the whole section is just informational).
   const errored = prs.filter((p) => p.error && p.prs === null);
 
   return (
     <section className="mb-6">
-      <h2 className="text-xs uppercase tracking-wide text-ink-faint mb-2">
+      <h2 className="text-[10px] uppercase tracking-wide text-ink-faint mb-2">
         Open pull requests
       </h2>
       {!cli?.gh ? (
-        <div className="text-xs text-ink-faint p-3 rounded border border-card bg-card">
+        <div className="text-[11px] text-ink-faint p-3 rounded border border-card bg-card">
           Install <span className="font-mono">gh</span> to surface PRs across the workspace.
         </div>
       ) : flat.length === 0 ? (
-        <div className="text-xs text-ink-faint p-3 rounded border border-card bg-card">
+        <div className="text-[11px] text-ink-faint p-3 rounded border border-card bg-card">
           No open PRs in this workspace.
         </div>
       ) : (
@@ -485,7 +707,7 @@ function PRSection({
           {flat.map(({ repoId, repoName, pr }) => (
             <li
               key={`${repoId}:${pr.number}`}
-              className="flex items-center gap-3 px-3 py-2 rounded border border-card bg-card text-sm"
+              className="flex items-center gap-3 px-3 py-2 rounded border border-card bg-card text-xs"
             >
               <span className="text-ink-faint w-40 truncate">{repoName}</span>
               <a
@@ -501,10 +723,10 @@ function PRSection({
                   draft
                 </span>
               )}
-              <span className="text-xs text-ink-faint font-mono">
+              <span className="text-[11px] text-ink-faint font-mono">
                 {pr.headBranch} → {pr.baseBranch}
               </span>
-              <span className="text-xs text-ink-faint">{pr.author}</span>
+              <span className="text-[11px] text-ink-faint">{pr.author}</span>
             </li>
           ))}
         </ul>
@@ -520,12 +742,12 @@ function PRSection({
 }
 
 function StatusCell({ status }: { status?: RepoStatus }): JSX.Element {
-  if (!status) return <span className="text-xs text-ink-faint">…</span>;
+  if (!status) return <span className="text-[11px] text-ink-faint">…</span>;
   if (status.error) {
-    return <span className="text-xs text-red-400">{status.error}</span>;
+    return <span className="text-[11px] text-red-400">{status.error}</span>;
   }
   return (
-    <div className="flex items-center gap-3 text-xs">
+    <div className="flex items-center gap-3 text-[11px]">
       <span className="font-mono">{status.branch ?? '(detached)'}</span>
       {status.dirtyCount > 0 && (
         <span className="text-amber-400">{status.dirtyCount} dirty</span>

@@ -1,8 +1,11 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useStore } from './store';
+import { FileEditor } from './FileEditor';
+import { BranchGraph } from './BranchGraph';
+import { BranchPicker } from './BranchPicker';
 import type { ChangedFile, Commit, FileDiff, RepoStatus, UUID } from '@shared/types';
 
-type Tab = 'changes' | 'history';
+type Tab = 'changes' | 'history' | 'files' | 'graph';
 
 /// Detail view for a single repo. Two tabs:
 /// - Changes: stage / unstage / discard / commit (the standard daily flow)
@@ -31,7 +34,10 @@ export function RepoDetail({ repoId }: { repoId: UUID }): JSX.Element {
     <main className="flex-1 grid grid-rows-[auto_auto_1fr] overflow-hidden">
       <RepoHeader repoId={repoId} />
       <Tabs tab={tab} onChange={setTab} />
-      {tab === 'changes' ? <ChangesTab repoId={repoId} /> : <HistoryTab repoId={repoId} />}
+      {tab === 'changes' && <ChangesTab repoId={repoId} />}
+      {tab === 'history' && <HistoryTab repoId={repoId} />}
+      {tab === 'files' && <FileEditor repoId={repoId} />}
+      {tab === 'graph' && <BranchGraph repoId={repoId} />}
     </main>
   );
 }
@@ -39,53 +45,13 @@ export function RepoDetail({ repoId }: { repoId: UUID }): JSX.Element {
 function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
   const repo = useStore((s) => s.repos.find((r) => r.id === repoId))!;
   const status = useStore((s) => s.repoStatus[repoId]);
-  const branches = useStore((s) => s.repoBranches[repoId]);
   const fetchRepo = useStore((s) => s.fetchRepo);
   const pullRepo = useStore((s) => s.pullRepo);
   const pushRepo = useStore((s) => s.pushRepo);
-  const checkoutRepo = useStore((s) => s.checkoutRepo);
-  const createBranch = useStore((s) => s.createRepoBranch);
 
   const [busy, setBusy] = useState(false);
-  const [showCreate, setShowCreate] = useState(false);
-  const [newBranch, setNewBranch] = useState('');
-
-  const localBranches = branches?.local ?? [];
-
-  const onPickBranch = async (target: string) => {
-    if (!target || target === status?.branch) return;
-    setBusy(true);
-    try {
-      const outcome = await checkoutRepo(repoId, target, false);
-      if (outcome.result === 'dirty') {
-        alert(
-          `Can't switch to ${target}: working tree has uncommitted changes. Stash, commit, or discard first.`,
-        );
-      } else if (outcome.result === 'missing-branch') {
-        alert(`Branch ${target} doesn't exist.`);
-      } else if (outcome.result === 'error') {
-        alert(outcome.message ?? 'Checkout failed');
-      }
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const onCreate = async () => {
-    if (!newBranch.trim()) return;
-    setBusy(true);
-    try {
-      const res = await createBranch(repoId, newBranch.trim(), true);
-      if (!res.ok) {
-        alert(res.error ?? 'Create branch failed');
-        return;
-      }
-      setNewBranch('');
-      setShowCreate(false);
-    } finally {
-      setBusy(false);
-    }
-  };
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
 
   const onAction = (fn: () => Promise<{ ok: boolean; error?: string }>) => async () => {
     setBusy(true);
@@ -97,106 +63,100 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
     }
   };
 
+  const branchLabel = status?.branch ?? '(detached)';
+
   return (
     <header className="px-6 py-3 border-b border-card flex items-center gap-4">
       <div className="min-w-0">
-        <div className="text-base font-semibold truncate">{repo.name}</div>
-        <div className="text-xs text-ink-faint truncate">{repo.path}</div>
+        <div className="text-sm font-semibold truncate">{repo.name}</div>
+        <div className="text-[11px] text-ink-faint truncate font-mono">{repo.path}</div>
       </div>
 
       <div className="flex items-center gap-2 ml-auto">
-        <select
-          disabled={busy}
-          value={status?.branch ?? ''}
-          onChange={(e) => onPickBranch(e.target.value)}
-          className="text-sm px-2 py-1 rounded bg-surface-elevated border border-card disabled:opacity-50"
-          title="Switch branch"
-        >
-          {!status?.branch && <option value="">(detached)</option>}
-          {localBranches.map((b) => (
-            <option key={b} value={b}>
-              {b}
-            </option>
-          ))}
-        </select>
-
         <button
+          ref={triggerRef}
           disabled={busy}
-          onClick={() => setShowCreate((s) => !s)}
-          className="text-sm px-2 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
-          title="Create branch"
+          onClick={() => setPickerOpen((v) => !v)}
+          className={`text-xs px-2.5 py-1 rounded border flex items-center gap-1.5 disabled:opacity-50 ${
+            pickerOpen ? 'border-accent bg-accent/10' : 'border-card hover:bg-card'
+          }`}
+          title="Switch branch, create one, or cherry-pick"
         >
-          + Branch
+          <BranchGlyph />
+          <span className="font-mono truncate max-w-[180px]">{branchLabel}</span>
+          <span className="text-[9px] text-ink-faint">▾</span>
         </button>
 
-        <div className="w-px h-6 bg-card mx-1" />
+        <div className="w-px h-5 bg-card mx-1" />
 
         <button
           disabled={busy}
           onClick={onAction(() => fetchRepo(repoId))}
-          className="text-sm px-3 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
+          className="text-xs px-2.5 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
         >
           Fetch
         </button>
         <button
           disabled={busy || !status?.branch}
           onClick={onAction(() => pullRepo(repoId))}
-          className="text-sm px-3 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
+          className="text-xs px-2.5 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
         >
           Pull{status?.behind ? ` ↓${status.behind}` : ''}
         </button>
         <button
           disabled={busy || !status?.branch}
           onClick={onAction(() => pushRepo(repoId))}
-          className="text-sm px-3 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+          className="text-xs px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
         >
           Push{status?.ahead ? ` ↑${status.ahead}` : ''}
         </button>
       </div>
 
-      {showCreate && (
-        <div className="absolute right-6 top-16 z-10 p-3 rounded-lg bg-surface-elevated border border-card shadow-lg flex gap-2">
-          <input
-            autoFocus
-            value={newBranch}
-            onChange={(e) => setNewBranch(e.target.value)}
-            placeholder="new-branch-name"
-            className="px-2 py-1 rounded bg-surface-elevated border border-card text-sm"
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') onCreate();
-              if (e.key === 'Escape') {
-                setShowCreate(false);
-                setNewBranch('');
-              }
-            }}
-          />
-          <button
-            disabled={busy || !newBranch.trim()}
-            onClick={onCreate}
-            className="text-sm px-3 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
-          >
-            Create & switch
-          </button>
-        </div>
+      {pickerOpen && (
+        <BranchPicker
+          repoId={repoId}
+          anchorRef={triggerRef}
+          onClose={() => setPickerOpen(false)}
+        />
       )}
     </header>
   );
 }
 
+function BranchGlyph(): JSX.Element {
+  return (
+    <svg width="11" height="11" viewBox="0 0 16 16" fill="none" className="flex-shrink-0">
+      <path
+        d="M5 3v6m0 0a2 2 0 1 0 0 4 2 2 0 0 0 0-4Zm0-6a2 2 0 1 1 0-2 2 2 0 0 1 0 2Zm6 0v3a3 3 0 0 1-3 3H6m5-6a2 2 0 1 0 0-2 2 2 0 0 0 0 2Z"
+        stroke="currentColor"
+        strokeWidth="1.2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 function Tabs({ tab, onChange }: { tab: Tab; onChange: (t: Tab) => void }): JSX.Element {
+  const labels: Record<Tab, string> = {
+    changes: 'Changes',
+    history: 'History',
+    files: 'Files',
+    graph: 'Graph',
+  };
   return (
     <nav className="px-6 border-b border-card flex gap-2">
-      {(['changes', 'history'] as const).map((t) => (
+      {(['changes', 'history', 'files', 'graph'] as const).map((t) => (
         <button
           key={t}
           onClick={() => onChange(t)}
-          className={`px-3 py-2 text-sm border-b-2 -mb-px ${
+          className={`px-3 py-2 text-xs border-b-2 -mb-px ${
             tab === t
               ? 'border-accent text-ink'
               : 'border-transparent text-ink-muted hover:text-ink'
           }`}
         >
-          {t === 'changes' ? 'Changes' : 'History'}
+          {labels[t]}
         </button>
       ))}
     </nav>
@@ -211,6 +171,8 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
   const commit = useStore((s) => s.commitRepo);
   const loadDiff = useStore((s) => s.loadRepoFileDiff);
   const diffEntry = useStore((s) => s.repoDiff[repoId]);
+  const cli = useStore((s) => s.cliPresence);
+  const setSheet = useStore((s) => s.setSheet);
 
   const [selected, setSelected] = useState<{ path: string; side: 'staged' | 'unstaged' } | null>(
     null,
@@ -220,6 +182,7 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
 
   const staged = ch?.staged ?? [];
   const unstaged = ch?.unstaged ?? [];
+  const anyLlm = !!(cli?.claude || cli?.codex || cli?.gemini);
 
   const onSelect = (file: ChangedFile, side: 'staged' | 'unstaged') => {
     setSelected({ path: file.path, side });
@@ -254,17 +217,50 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
   return (
     <div className="grid grid-cols-[360px_1fr] overflow-hidden">
       <aside className="border-r border-card overflow-y-auto flex flex-col">
+        <div className="flex items-center gap-1 px-3 py-2 border-b border-card flex-wrap">
+          <button
+            disabled={unstaged.length === 0}
+            onClick={() => stage(repoId, unstaged.map((f) => f.path))}
+            className="text-xs px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+            title="Stage every changed file"
+          >
+            Stage all{unstaged.length ? ` (${unstaged.length})` : ''}
+          </button>
+          <button
+            disabled={staged.length === 0}
+            onClick={() => unstage(repoId, staged.map((f) => f.path))}
+            className="text-xs px-2.5 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
+            title="Unstage every staged file"
+          >
+            Unstage all{staged.length ? ` (${staged.length})` : ''}
+          </button>
+          <div className="flex-1" />
+          <button
+            disabled={!anyLlm || (staged.length === 0 && unstaged.length === 0)}
+            onClick={() =>
+              setSheet({
+                kind: 'reviewChanges',
+                repoId,
+                scope: staged.length > 0 ? 'staged' : 'working',
+              })
+            }
+            className="text-xs px-2.5 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
+            title={
+              anyLlm
+                ? 'Send the diff to an installed LLM CLI for review'
+                : 'Install claude, codex, or gemini to review with AI'
+            }
+          >
+            Review with AI
+          </button>
+        </div>
+
         <FileGroup
           title="Staged"
           files={staged}
           activePath={selected?.side === 'staged' ? selected.path : null}
           actionLabel="Unstage"
           onAction={(f) => unstage(repoId, [f.path])}
-          onActionAll={
-            staged.length > 0
-              ? () => unstage(repoId, staged.map((f) => f.path))
-              : undefined
-          }
           onSelect={(f) => onSelect(f, 'staged')}
         />
         <FileGroup
@@ -273,11 +269,6 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
           activePath={selected?.side === 'unstaged' ? selected.path : null}
           actionLabel="Stage"
           onAction={(f) => stage(repoId, [f.path])}
-          onActionAll={
-            unstaged.length > 0
-              ? () => stage(repoId, unstaged.map((f) => f.path))
-              : undefined
-          }
           onSelect={(f) => onSelect(f, 'unstaged')}
           extraAction={{ label: 'Discard', onAction: onDiscard }}
         />
@@ -325,7 +316,6 @@ function FileGroup({
   activePath,
   actionLabel,
   onAction,
-  onActionAll,
   onSelect,
   extraAction,
 }: {
@@ -334,24 +324,15 @@ function FileGroup({
   activePath: string | null;
   actionLabel: string;
   onAction: (file: ChangedFile) => void;
-  onActionAll?: () => void;
   onSelect: (file: ChangedFile) => void;
   extraAction?: { label: string; onAction: (file: ChangedFile) => void };
 }): JSX.Element {
   return (
     <div className="border-b border-card">
       <div className="flex items-center justify-between px-3 py-2 bg-card">
-        <div className="text-xs uppercase tracking-wide text-ink-faint">
+        <div className="text-[10px] uppercase tracking-wide text-ink-faint">
           {title} <span className="text-ink-faint">({files.length})</span>
         </div>
-        {onActionAll && (
-          <button
-            onClick={onActionAll}
-            className="text-xs px-2 py-0.5 rounded border border-card hover:bg-surface-elevated"
-          >
-            {actionLabel} all
-          </button>
-        )}
       </div>
       {files.length === 0 ? (
         <div className="px-3 py-2 text-xs text-ink-faint">No files.</div>

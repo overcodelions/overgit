@@ -7,10 +7,12 @@
 import { create } from 'zustand';
 import type {
   AppSettings,
+  BranchSummary,
   CheckoutOutcome,
   CliPresence,
   Commit,
   FileDiff,
+  GraphCommit,
   Repo,
   RepoChanges,
   RepoPRs,
@@ -19,6 +21,22 @@ import type {
   UUID,
   Workspace,
 } from '@shared/types';
+
+/// Sheet (modal) the user has currently open. `null` means no sheet.
+/// Centralized so the title bar's Settings button and the sidebar's
+/// "+ New workspace" button can both drive the same single overlay
+/// instead of each component owning a useState.
+export type Sheet =
+  | { kind: 'settings' }
+  | { kind: 'about' }
+  | { kind: 'newWorkspace' }
+  | { kind: 'editWorkspace'; workspaceId: UUID }
+  | { kind: 'reviewChanges'; repoId: UUID; scope: 'staged' | 'working' };
+
+interface OpenFile {
+  repoId: UUID;
+  path: string;
+}
 
 interface UiState {
   loaded: boolean;
@@ -34,7 +52,21 @@ interface UiState {
   repoChanges: Record<UUID, RepoChanges>;
   repoStatus: Record<UUID, RepoStatus>;
   repoBranches: Record<UUID, { local: string[]; remote: string[] }>;
+  repoBranchSummaries: Record<UUID, BranchSummary[]>;
+  repoGraph: Record<UUID, GraphCommit[]>;
+  repoFileList: Record<UUID, string[]>;
   cliPresence: CliPresence | null;
+
+  /// Currently open file in the in-app editor. Per-repo we'd allow many
+  /// open files in the future; for v1 a single open slot keeps the UI
+  /// readable without a tabbed editor.
+  openFile: OpenFile | null;
+  openFileContent: string;
+  openFileDirty: boolean;
+  openFileError: string | null;
+  openFileLoading: boolean;
+
+  sheet: Sheet | null;
   /// The most recent workspace-checkout result, kept around so the UI
   /// can show per-repo outcomes and offer Stash/Commit affordances on
   /// repos that came back dirty.
@@ -58,6 +90,10 @@ interface UiState {
   refreshRepoChanges: (id: UUID) => Promise<void>;
   refreshRepoStatus: (id: UUID) => Promise<void>;
   refreshRepoBranches: (id: UUID) => Promise<void>;
+  refreshRepoBranchSummaries: (id: UUID) => Promise<void>;
+  refreshRepoGraph: (id: UUID) => Promise<void>;
+  refreshRepoFileList: (id: UUID) => Promise<void>;
+  setRepoDefaultBranch: (id: UUID, branch: string | null) => Promise<void>;
   stageFiles: (id: UUID, paths: string[]) => Promise<void>;
   unstageFiles: (id: UUID, paths: string[]) => Promise<void>;
   discardFiles: (id: UUID, paths: string[]) => Promise<void>;
@@ -69,6 +105,18 @@ interface UiState {
   createRepoBranch: (id: UUID, name: string, checkout: boolean) => Promise<{ ok: boolean; error?: string }>;
   deleteRepoBranch: (id: UUID, name: string, force: boolean) => Promise<{ ok: boolean; error?: string }>;
   loadRepoFileDiff: (id: UUID, path: string, side: 'staged' | 'unstaged') => Promise<void>;
+
+  openRepoFile: (repoId: UUID, path: string) => Promise<void>;
+  closeRepoFile: () => void;
+  setOpenFileContent: (content: string) => void;
+  saveOpenFile: () => Promise<{ ok: boolean; error?: string }>;
+
+  toggleSidebar: () => void;
+  setSheet: (sheet: Sheet | null) => void;
+
+  removeRepo: (id: UUID) => Promise<void>;
+  removeWorkspace: (id: UUID) => Promise<void>;
+  updateWorkspace: (id: UUID, patch: Partial<Pick<Workspace, 'name' | 'repoIds'>>) => Promise<void>;
 }
 
 function uuid(): UUID {
@@ -83,7 +131,7 @@ export const useStore = create<UiState>((set, get) => ({
   loaded: false,
   repos: [],
   workspaces: [],
-  settings: { theme: 'system' },
+  settings: { theme: 'system', sidebarVisible: true },
   selectedWorkspaceId: null,
   selectedRepoId: null,
   workspaceStatuses: {},
@@ -93,8 +141,17 @@ export const useStore = create<UiState>((set, get) => ({
   repoChanges: {},
   repoStatus: {},
   repoBranches: {},
+  repoBranchSummaries: {},
+  repoGraph: {},
+  repoFileList: {},
   cliPresence: null,
   lastCheckout: null,
+  openFile: null,
+  openFileContent: '',
+  openFileDirty: false,
+  openFileError: null,
+  openFileLoading: false,
+  sheet: null,
 
   hydrate: async () => {
     const snap: StoreSnapshot = await window.overgit.invoke('store:load');
@@ -222,6 +279,19 @@ export const useStore = create<UiState>((set, get) => ({
     set({ repoBranches: { ...get().repoBranches, [id]: br } });
   },
 
+  refreshRepoBranchSummaries: async (id) => {
+    const summaries = await window.overgit.invoke('repo:branchSummaries', id);
+    set({ repoBranchSummaries: { ...get().repoBranchSummaries, [id]: summaries } });
+  },
+
+  setRepoDefaultBranch: async (id, branch) => {
+    const repos = get().repos.map((r) =>
+      r.id === id ? { ...r, defaultBranch: branch ?? undefined } : r,
+    );
+    set({ repos });
+    await window.overgit.invoke('repo:setDefaultBranch', { repoId: id, branch });
+  },
+
   stageFiles: async (id, paths) => {
     const res = await window.overgit.invoke('repo:stageFiles', { repoId: id, paths });
     if (!res.ok) alert(res.error ?? 'Stage failed');
@@ -325,5 +395,123 @@ export const useStore = create<UiState>((set, get) => ({
       side,
     });
     set({ repoDiff: { ...get().repoDiff, [id]: { key: `${side}:${p}`, files } } });
+  },
+
+  refreshRepoGraph: async (id) => {
+    const commits = await window.overgit.invoke('repo:graph', { repoId: id, limit: 200 });
+    set({ repoGraph: { ...get().repoGraph, [id]: commits } });
+  },
+
+  refreshRepoFileList: async (id) => {
+    const files = await window.overgit.invoke('fs:listFiles', id);
+    set({ repoFileList: { ...get().repoFileList, [id]: files } });
+  },
+
+  openRepoFile: async (repoId, p) => {
+    set({
+      openFile: { repoId, path: p },
+      openFileContent: '',
+      openFileDirty: false,
+      openFileError: null,
+      openFileLoading: true,
+    });
+    const res = await window.overgit.invoke('fs:readFile', { repoId, path: p });
+    if (res.ok) {
+      set({
+        openFileContent: res.content,
+        openFile: { repoId, path: res.resolvedPath },
+        openFileDirty: false,
+        openFileError: null,
+        openFileLoading: false,
+      });
+    } else {
+      set({
+        openFileContent: '',
+        openFileDirty: false,
+        openFileError: res.error,
+        openFileLoading: false,
+      });
+    }
+  },
+
+  closeRepoFile: () => {
+    set({
+      openFile: null,
+      openFileContent: '',
+      openFileDirty: false,
+      openFileError: null,
+      openFileLoading: false,
+    });
+  },
+
+  setOpenFileContent: (content) => {
+    set({ openFileContent: content, openFileDirty: true });
+  },
+
+  saveOpenFile: async () => {
+    const file = get().openFile;
+    if (!file) return { ok: false, error: 'No file open' };
+    const res = await window.overgit.invoke('fs:writeFile', {
+      repoId: file.repoId,
+      path: file.path,
+      content: get().openFileContent,
+    });
+    if (res.ok) {
+      set({ openFileDirty: false });
+      // Saving a tracked file usually changes its status; refresh both
+      // panes so the Changes tab and the working-tree diff are honest.
+      await Promise.all([
+        get().refreshRepoChanges(file.repoId),
+        get().refreshRepoStatus(file.repoId),
+      ]);
+    }
+    return res;
+  },
+
+  toggleSidebar: async () => {
+    const cur = get().settings;
+    const next = { ...cur, sidebarVisible: !cur.sidebarVisible };
+    set({ settings: next });
+    await window.overgit.invoke('store:saveSettings', next);
+  },
+
+  setSheet: (sheet) => set({ sheet }),
+
+  removeRepo: async (id) => {
+    const repos = get().repos.filter((r) => r.id !== id);
+    // Drop the repo from any workspace that referenced it. We don't
+    // delete workspaces that empty out — empty workspaces are valid; the
+    // user can re-populate or delete them explicitly.
+    const workspaces = get().workspaces.map((w) =>
+      w.repoIds.includes(id) ? { ...w, repoIds: w.repoIds.filter((r) => r !== id) } : w,
+    );
+    const patch: Partial<UiState> = { repos, workspaces };
+    if (get().selectedRepoId === id) patch.selectedRepoId = null;
+    if (get().openFile?.repoId === id) {
+      patch.openFile = null;
+      patch.openFileContent = '';
+      patch.openFileDirty = false;
+    }
+    set(patch);
+    await Promise.all([
+      window.overgit.invoke('store:saveRepos', repos),
+      window.overgit.invoke('store:saveWorkspaces', workspaces),
+    ]);
+  },
+
+  removeWorkspace: async (id) => {
+    const workspaces = get().workspaces.filter((w) => w.id !== id);
+    const patch: Partial<UiState> = { workspaces };
+    if (get().selectedWorkspaceId === id) patch.selectedWorkspaceId = null;
+    set(patch);
+    await window.overgit.invoke('store:saveWorkspaces', workspaces);
+  },
+
+  updateWorkspace: async (id, patch) => {
+    const workspaces = get().workspaces.map((w) =>
+      w.id === id ? { ...w, ...patch } : w,
+    );
+    set({ workspaces });
+    await window.overgit.invoke('store:saveWorkspaces', workspaces);
   },
 }));
