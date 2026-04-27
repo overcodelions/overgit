@@ -34,6 +34,7 @@ import {
   stageFiles,
   stash as gitStash,
   stashDiff,
+  stashFiles as gitStashFiles,
   status as gitStatus,
   unstageFiles,
 } from './git';
@@ -203,6 +204,15 @@ function registerIpc(): void {
     if (!repo) return { ok: false, error: 'Unknown repo' };
     return gitStash(repo.path, args.message);
   });
+
+  ipcMain.handle(
+    'repo:stashFiles',
+    async (_e, args: { repoId: string; paths: string[]; message?: string }) => {
+      const repo = Store.load().repos.find((r) => r.id === args.repoId);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return gitStashFiles(repo.path, args.paths, args.message);
+    },
+  );
 
   ipcMain.handle('repo:commitAll', async (_e, args: { repoId: string; message: string }) => {
     const repo = Store.load().repos.find((r) => r.id === args.repoId);

@@ -104,6 +104,7 @@ interface UiState {
   refreshRepoStashes: (id: UUID) => Promise<void>;
   applyStash: (id: UUID, index: number, pop: boolean) => Promise<{ ok: boolean; error?: string }>;
   dropStash: (id: UUID, index: number) => Promise<{ ok: boolean; error?: string }>;
+  stashFiles: (id: UUID, paths: string[], message?: string) => Promise<{ ok: boolean; error?: string }>;
   setRepoDefaultBranch: (id: UUID, branch: string | null) => Promise<void>;
   stageFiles: (id: UUID, paths: string[]) => Promise<void>;
   unstageFiles: (id: UUID, paths: string[]) => Promise<void>;
@@ -171,6 +172,14 @@ export const useStore = create<UiState>((set, get) => ({
   hydrate: async () => {
     const snap: StoreSnapshot = await window.overgit.invoke('store:load');
     const cli = await window.overgit.invoke('cli:detect');
+    // Auto-select the first repo (or workspace, if there are no repos)
+    // on launch when nothing is selected. Without this, a fresh-install
+    // user lands on the empty "Pick a repo or a workspace" pane even
+    // though their library has entries.
+    const cur = get();
+    const haveSelection =
+      (cur.selectedRepoId && snap.repos.some((r) => r.id === cur.selectedRepoId)) ||
+      (cur.selectedWorkspaceId && snap.workspaces.some((w) => w.id === cur.selectedWorkspaceId));
     set({
       loaded: true,
       repos: snap.repos,
@@ -178,6 +187,13 @@ export const useStore = create<UiState>((set, get) => ({
       settings: snap.settings,
       cliPresence: cli,
     });
+    if (!haveSelection) {
+      if (snap.repos.length > 0) {
+        get().selectRepo(snap.repos[0].id);
+      } else if (snap.workspaces.length > 0) {
+        get().selectWorkspace(snap.workspaces[0].id);
+      }
+    }
   },
 
   pickAndAddRepo: async () => {
@@ -445,6 +461,26 @@ export const useStore = create<UiState>((set, get) => ({
   dropStash: async (id, index) => {
     const res = await window.overgit.invoke('repo:dropStash', { repoId: id, index });
     if (res.ok) await get().refreshRepoStashes(id);
+    return res;
+  },
+
+  stashFiles: async (id, paths, message) => {
+    const res = await window.overgit.invoke('repo:stashFiles', {
+      repoId: id,
+      paths,
+      message,
+    });
+    if (res.ok) {
+      // Stashing removes the listed paths from staged + worktree, so
+      // every dependent view (status, changes, stash list) needs to
+      // refresh together. The Stash tab is what the user usually
+      // navigates to next; that list is now one entry longer.
+      await Promise.all([
+        get().refreshRepoStatus(id),
+        get().refreshRepoChanges(id),
+        get().refreshRepoStashes(id),
+      ]);
+    }
     return res;
   },
 
