@@ -421,7 +421,7 @@ export async function applyStash(
   repoPath: string,
   index: number,
   pop: boolean,
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; error?: string; conflicts?: string[] }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
   if (!Number.isInteger(index) || index < 0) {
     return { ok: false, error: `Invalid stash index ${index}` };
@@ -429,7 +429,103 @@ export async function applyStash(
   const ref = `stash@{${index}}`;
   const res = await run(repoPath, ['stash', pop ? 'pop' : 'apply', ref]);
   if (res.ok) return { ok: true };
-  return { ok: false, error: res.stderr.trim() || `git stash exited ${res.code}` };
+  const stderr = res.stderr.trim() || `git stash exited ${res.code}`;
+  // Detect the "untracked file already exists" failure shape so the
+  // renderer can offer a force-overwrite affordance instead of just
+  // surfacing a wall of git output.
+  const conflicts = parseAlreadyExistsConflicts(stderr);
+  return { ok: false, error: stderr, conflicts: conflicts.length ? conflicts : undefined };
+}
+
+function parseAlreadyExistsConflicts(stderr: string): string[] {
+  // `git stash apply` emits one line per conflicting untracked file:
+  //   "<path> already exists, no checkout"
+  // followed by "error: could not restore untracked files from stash".
+  // We pluck the filenames so the renderer can list and target them.
+  const out: string[] = [];
+  for (const line of stderr.split('\n')) {
+    const m = line.match(/^(.+) already exists, no checkout$/);
+    if (m) out.push(m[1].trim());
+  }
+  return out;
+}
+
+/// Force-apply: delete the working-tree files that block the apply,
+/// then re-run. We restrict the deletion to files reported by git as
+/// "already exists, no checkout" so we don't nuke unrelated content.
+/// Path safety: every candidate is path.resolve()'d against repoPath
+/// and rejected if it escapes — defense against a stash containing a
+/// crafted "../../../etc/passwd" name.
+export async function applyStashForce(
+  repoPath: string,
+  index: number,
+  pop: boolean,
+): Promise<{ ok: boolean; error?: string; removed?: string[] }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  if (!Number.isInteger(index) || index < 0) {
+    return { ok: false, error: `Invalid stash index ${index}` };
+  }
+
+  // First, run the normal apply to capture the exact conflict list.
+  // We could use `git ls-tree stash@{N}^3` to enumerate the stash's
+  // untracked entries, but ^3 only exists when --include-untracked was
+  // used at push time, AND we'd remove files that aren't actually in
+  // conflict. Trusting git's own error output keeps the deletion
+  // minimal.
+  const probe = await applyStash(repoPath, index, false);
+  if (probe.ok) {
+    // Apply already succeeded on its own — convert to pop if the
+    // caller asked for pop.
+    if (pop) {
+      const drop = await run(repoPath, ['stash', 'drop', `stash@{${index}}`]);
+      if (!drop.ok) {
+        return {
+          ok: false,
+          error: drop.stderr.trim() || `git stash drop exited ${drop.code}`,
+        };
+      }
+    }
+    return { ok: true };
+  }
+  if (!probe.conflicts?.length) {
+    // Failure but not the "already exists" class — pass it back.
+    return { ok: false, error: probe.error };
+  }
+
+  const removed: string[] = [];
+  for (const rel of probe.conflicts) {
+    const full = path.resolve(repoPath, rel);
+    const root = path.resolve(repoPath);
+    if (full !== root && !full.startsWith(root + path.sep)) {
+      return {
+        ok: false,
+        error: `Refusing to remove "${rel}" — path escapes the repo.`,
+        removed,
+      };
+    }
+    try {
+      fs.rmSync(full, { force: true, recursive: false });
+      removed.push(rel);
+    } catch (err: unknown) {
+      return {
+        ok: false,
+        error:
+          err instanceof Error
+            ? `Could not remove ${rel}: ${err.message}`
+            : `Could not remove ${rel}`,
+        removed,
+      };
+    }
+  }
+
+  const ref = `stash@{${index}}`;
+  const retry = await run(repoPath, ['stash', pop ? 'pop' : 'apply', ref]);
+  if (retry.ok) return { ok: true, removed };
+  return {
+    ok: false,
+    error: retry.stderr.trim() || `git stash exited ${retry.code}`,
+    removed,
+  };
 }
 
 export async function dropStash(

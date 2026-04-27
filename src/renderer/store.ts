@@ -102,7 +102,16 @@ interface UiState {
   refreshRepoGraph: (id: UUID) => Promise<void>;
   refreshRepoFileList: (id: UUID) => Promise<void>;
   refreshRepoStashes: (id: UUID) => Promise<void>;
-  applyStash: (id: UUID, index: number, pop: boolean) => Promise<{ ok: boolean; error?: string }>;
+  applyStash: (
+    id: UUID,
+    index: number,
+    pop: boolean,
+  ) => Promise<{ ok: boolean; error?: string; conflicts?: string[] }>;
+  applyStashForce: (
+    id: UUID,
+    index: number,
+    pop: boolean,
+  ) => Promise<{ ok: boolean; error?: string; removed?: string[] }>;
   dropStash: (id: UUID, index: number) => Promise<{ ok: boolean; error?: string }>;
   stashFiles: (id: UUID, paths: string[], message?: string) => Promise<{ ok: boolean; error?: string }>;
   setRepoDefaultBranch: (id: UUID, branch: string | null) => Promise<void>;
@@ -449,6 +458,22 @@ export const useStore = create<UiState>((set, get) => ({
       // Apply/pop changes the working tree; refresh status + changes so
       // the user sees the result without flipping tabs. Pop also drops
       // the stash, so re-fetch the stash list either way.
+      await Promise.all([
+        get().refreshRepoStatus(id),
+        get().refreshRepoChanges(id),
+        get().refreshRepoStashes(id),
+      ]);
+    }
+    return res;
+  },
+
+  applyStashForce: async (id, index, pop) => {
+    const res = await window.overgit.invoke('repo:applyStashForce', {
+      repoId: id,
+      index,
+      pop,
+    });
+    if (res.ok) {
       await Promise.all([
         get().refreshRepoStatus(id),
         get().refreshRepoChanges(id),

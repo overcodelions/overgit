@@ -1055,11 +1055,21 @@ function StashTab({ repoId }: { repoId: UUID }): JSX.Element {
   const stashes = useStore((s) => s.repoStashes[repoId]);
   const refreshStashes = useStore((s) => s.refreshRepoStashes);
   const applyStash = useStore((s) => s.applyStash);
+  const applyStashForce = useStore((s) => s.applyStashForce);
   const dropStash = useStore((s) => s.dropStash);
 
   const [selected, setSelected] = useState<number | null>(null);
   const [files, setFiles] = useState<FileDiff[] | null>(null);
   const [busy, setBusy] = useState(false);
+  // Surface git's apply errors inline (instead of alert) so the user
+  // can see exactly what's blocking and act on it. `conflicts` is
+  // populated when git reports "<path> already exists, no checkout";
+  // we render it as a force-overwrite affordance.
+  const [error, setError] = useState<{
+    message: string;
+    conflicts?: string[];
+    pop: boolean;
+  } | null>(null);
 
   useEffect(() => {
     refreshStashes(repoId);
@@ -1096,9 +1106,35 @@ function StashTab({ repoId }: { repoId: UUID }): JSX.Element {
 
   const onApply = async (index: number, pop: boolean) => {
     setBusy(true);
+    setError(null);
     try {
       const res = await applyStash(repoId, index, pop);
-      if (!res.ok) alert(res.error ?? 'Apply failed');
+      if (!res.ok) {
+        setError({ message: res.error ?? 'Apply failed', conflicts: res.conflicts, pop });
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onForceApply = async () => {
+    if (selected == null || !error) return;
+    if (
+      !window.confirm(
+        `Force overwrite ${error.conflicts?.length ?? 0} working-tree ${
+          error.conflicts?.length === 1 ? 'file' : 'files'
+        } and ${error.pop ? 'pop' : 'apply'} the stash? The local copies are deleted before the stash content is restored.`,
+      )
+    )
+      return;
+    setBusy(true);
+    try {
+      const res = await applyStashForce(repoId, selected, error.pop);
+      if (!res.ok) {
+        setError({ message: res.error ?? 'Force apply failed', pop: error.pop });
+      } else {
+        setError(null);
+      }
     } finally {
       setBusy(false);
     }
@@ -1112,13 +1148,23 @@ function StashTab({ repoId }: { repoId: UUID }): JSX.Element {
     )
       return;
     setBusy(true);
+    setError(null);
     try {
       const res = await dropStash(repoId, index);
-      if (!res.ok) alert(res.error ?? 'Drop failed');
+      if (!res.ok) setError({ message: res.error ?? 'Drop failed', pop: false });
     } finally {
       setBusy(false);
     }
   };
+
+  // Switching selected stash should reset the per-row error so we
+  // don't keep showing a stale "X already exists" message on a
+  // different entry.
+  useEffect(() => {
+    setError(null);
+  }, [selected]);
+
+  const selectedStash = stashes?.find((s) => s.index === selected) ?? null;
 
   return (
     <main className="flex-1 grid grid-cols-[340px_1fr] grid-rows-[auto_1fr] overflow-hidden">
@@ -1145,10 +1191,10 @@ function StashTab({ repoId }: { repoId: UUID }): JSX.Element {
         {stashes && stashes.length > 0 ? (
           <ul>
             {stashes.map((s) => (
-              <li key={s.ref} className="border-b border-card last:border-0">
+              <li key={s.ref}>
                 <button
                   onClick={() => setSelected(s.index)}
-                  className={`w-full text-left px-4 py-2.5 ${
+                  className={`w-full text-left px-4 py-2.5 border-b border-card ${
                     selected === s.index ? 'bg-accent text-white' : 'hover:bg-card'
                   }`}
                 >
@@ -1171,61 +1217,139 @@ function StashTab({ repoId }: { repoId: UUID }): JSX.Element {
                         on {s.branch}
                       </span>
                     )}
+                    <span
+                      className={`text-[10px] ml-auto font-mono ${
+                        selected === s.index ? 'text-white/70' : 'text-ink-faint'
+                      }`}
+                    >
+                      {relativeAgo(s.date)}
+                    </span>
                   </div>
                   <div className="text-xs mt-0.5 truncate" title={s.subject}>
                     {s.subject || '(no message)'}
                   </div>
                   <div
-                    className={`text-[10px] mt-0.5 flex gap-2 font-mono ${
-                      selected === s.index ? 'text-white/70' : 'text-ink-faint'
+                    className={`text-[10px] mt-0.5 font-mono ${
+                      selected === s.index ? 'text-white/60' : 'text-ink-faint'
                     }`}
                   >
-                    <span>{s.shortSha}</span>
-                    <span>{relativeAgo(s.date)}</span>
+                    {s.shortSha}
                   </div>
                 </button>
-                {selected === s.index && (
-                  <div className="flex gap-1 px-4 pb-2.5">
-                    <button
-                      disabled={busy}
-                      onClick={() => onApply(s.index, false)}
-                      className="text-[11px] px-2 py-0.5 rounded border border-card bg-surface-elevated hover:bg-card disabled:opacity-50"
-                      title="git stash apply — keeps the stash"
-                    >
-                      Apply
-                    </button>
-                    <button
-                      disabled={busy}
-                      onClick={() => onApply(s.index, true)}
-                      className="text-[11px] px-2 py-0.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
-                      title="git stash pop — applies and drops the stash"
-                    >
-                      Pop
-                    </button>
-                    <div className="flex-1" />
-                    <button
-                      disabled={busy}
-                      onClick={() => onDrop(s.index)}
-                      className="text-[11px] px-2 py-0.5 rounded border border-red-500/40 text-red-300 hover:bg-red-500/10 disabled:opacity-50"
-                      title="git stash drop — irreversible"
-                    >
-                      Drop
-                    </button>
-                  </div>
-                )}
               </li>
             ))}
           </ul>
         ) : null}
       </aside>
 
-      <section className="overflow-y-auto p-4">
-        {selected == null ? (
-          <div className="text-xs text-ink-faint">
+      <section className="flex flex-col min-h-0 overflow-hidden">
+        {selectedStash ? (
+          <>
+            {/* Detail header — subject + meta on the left, action
+                cluster on the right. Keeps the list rows uncluttered
+                and gives the actions consistent sizing + tone. */}
+            <div className="flex items-start gap-3 px-4 py-3 border-b border-card">
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium truncate" title={selectedStash.subject}>
+                  {selectedStash.subject || '(no message)'}
+                </div>
+                <div className="mt-0.5 text-[11px] text-ink-faint font-mono flex flex-wrap gap-x-2 gap-y-0.5">
+                  <span>
+                    stash@{'{'}
+                    {selectedStash.index}
+                    {'}'}
+                  </span>
+                  <span>{selectedStash.shortSha}</span>
+                  {selectedStash.branch && <span>on {selectedStash.branch}</span>}
+                  <span>{relativeAgo(selectedStash.date)}</span>
+                </div>
+              </div>
+              <div className="flex items-center gap-1 flex-shrink-0">
+                <button
+                  disabled={busy}
+                  onClick={() => onApply(selectedStash.index, false)}
+                  className="text-[11px] h-7 px-2.5 rounded-md border border-card text-ink hover:bg-card disabled:opacity-50"
+                  title="git stash apply — keeps the stash"
+                >
+                  Apply
+                </button>
+                <button
+                  disabled={busy}
+                  onClick={() => onApply(selectedStash.index, true)}
+                  className="text-[11px] h-7 px-2.5 rounded-md bg-accent text-white hover:bg-accent-strong border border-accent disabled:opacity-50"
+                  title="git stash pop — applies and drops the stash"
+                >
+                  Pop
+                </button>
+                <button
+                  disabled={busy}
+                  onClick={() => onDrop(selectedStash.index)}
+                  className="text-[11px] h-7 px-2.5 rounded-md border border-red-500/40 text-red-300 hover:bg-red-500/10 disabled:opacity-50"
+                  title="git stash drop — irreversible"
+                >
+                  Drop
+                </button>
+              </div>
+            </div>
+            {error && (
+              <div className="px-4 py-3 border-b border-red-500/30 bg-red-500/10">
+                <div className="text-[11px] font-semibold text-red-300">
+                  Git refused to {error.pop ? 'pop' : 'apply'} this stash.
+                </div>
+                <pre className="mt-1 text-[11px] text-ink-muted whitespace-pre-wrap font-mono leading-snug">
+                  {error.message}
+                </pre>
+                {error.conflicts && error.conflicts.length > 0 && (
+                  <>
+                    <div className="mt-3 text-[10px] uppercase tracking-wide text-ink-faint">
+                      Conflicting working-tree files
+                    </div>
+                    <ul className="mt-1 text-[11px] font-mono text-ink-muted">
+                      {error.conflicts.map((c) => (
+                        <li key={c} className="truncate" title={c}>
+                          · {c}
+                        </li>
+                      ))}
+                    </ul>
+                    <div className="mt-3 flex gap-2">
+                      <button
+                        disabled={busy}
+                        onClick={onForceApply}
+                        className="text-[11px] h-7 px-2.5 rounded-md bg-red-500/30 text-red-100 hover:bg-red-500/40 border border-red-500/50 disabled:opacity-50"
+                        title="Delete the working-tree copies and re-run apply"
+                      >
+                        {busy ? 'Working…' : 'Overwrite & retry'}
+                      </button>
+                      <button
+                        disabled={busy}
+                        onClick={() => setError(null)}
+                        className="text-[11px] h-7 px-2.5 rounded-md border border-card text-ink hover:bg-card disabled:opacity-50"
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  </>
+                )}
+                {!error.conflicts?.length && (
+                  <div className="mt-2 flex justify-end">
+                    <button
+                      onClick={() => setError(null)}
+                      className="text-[11px] h-7 px-2.5 rounded-md border border-card text-ink hover:bg-card"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+            <div className="flex-1 min-h-0 overflow-y-auto p-4">
+              <DiffView files={files ?? []} />
+            </div>
+          </>
+        ) : (
+          <div className="flex-1 flex items-center justify-center text-xs text-ink-faint">
             Pick a stash on the left to preview it.
           </div>
-        ) : (
-          <DiffView files={files ?? []} />
         )}
       </section>
     </main>

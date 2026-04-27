@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { Store } from './store';
 import {
   applyStash,
+  applyStashForce,
   branchSummaries,
   changes as gitChanges,
   checkoutBranch,
@@ -343,6 +344,15 @@ function registerIpc(): void {
       const repo = repoFromArg(args);
       if (!repo) return { ok: false, error: 'Unknown repo' };
       return applyStash(repo.path, args.index, args.pop);
+    },
+  );
+
+  ipcMain.handle(
+    'repo:applyStashForce',
+    async (_e, args: { repoId: string; index: number; pop: boolean }) => {
+      const repo = repoFromArg(args);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return applyStashForce(repo.path, args.index, args.pop);
     },
   );
 
