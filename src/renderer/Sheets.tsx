@@ -1,6 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useStore } from './store';
-import type { LlmTool, Repo, ReviewResult, UUID } from '@shared/types';
+import type {
+  LlmTool,
+  Repo,
+  ReviewResult,
+  SyncAndBranchOutcome,
+  UUID,
+} from '@shared/types';
 
 /// Top-level sheet host. Picks which sheet (modal) to render based on
 /// `store.sheet` and provides the common backdrop + escape-to-close.
@@ -41,6 +47,9 @@ export function SheetHost(): JSX.Element | null {
         )}
         {sheet.kind === 'reviewChanges' && (
           <ReviewSheet repoId={sheet.repoId} initialScope={sheet.scope} />
+        )}
+        {sheet.kind === 'newBranchInWorkspace' && (
+          <WorkspaceBranchSheet workspaceId={sheet.workspaceId} />
         )}
       </div>
     </div>
@@ -131,6 +140,19 @@ function SettingsSheet(): JSX.Element {
           </Section>
         )}
 
+        <Section title="Keyboard shortcuts">
+          <ul className="text-xs flex flex-col gap-1 font-mono">
+            <ShortcutRow keys="⌘ ," what="Open settings" />
+            <ShortcutRow keys="⌘ \\" what="Toggle sidebar" />
+            <ShortcutRow keys="⌘ R" what="Refresh current pane" />
+            <ShortcutRow keys="⌘ B" what="Open branch picker (in a repo)" />
+            <ShortcutRow keys="⌘ N" what="New branch (in a workspace)" />
+            <ShortcutRow keys="⌘ 1 / 2 / 3 / 4" what="Repo tabs: Changes / History / Files / Graph" />
+            <ShortcutRow keys="↑ ↓ Enter" what="Navigate the branch picker" />
+            <ShortcutRow keys="⌘ S" what="Save the open file (in Files tab)" />
+          </ul>
+        </Section>
+
         <Section title="Theme" subtitle="System follows your OS dark/light setting.">
           <div className="flex gap-2">
             {(['system', 'light', 'dark'] as const).map((t) => (
@@ -163,6 +185,15 @@ function SettingsSheet(): JSX.Element {
         </Section>
       </div>
     </>
+  );
+}
+
+function ShortcutRow({ keys, what }: { keys: string; what: string }): JSX.Element {
+  return (
+    <li className="flex justify-between items-baseline gap-3">
+      <span className="text-ink-muted">{keys}</span>
+      <span className="text-ink-faint flex-1 text-right font-sans">{what}</span>
+    </li>
   );
 }
 
@@ -670,6 +701,202 @@ function ReviewBody({ result }: { result: ReviewResult }): JSX.Element {
       )}
     </div>
   );
+}
+
+/// Workspace-wide "create branch" workflow. The user names a branch and
+/// picks two switches (defaults match the GitHub-Desktop "back to
+/// mainline → pull → branch" pattern). On submit we run
+/// `workspace:syncAndBranch`, then render per-repo outcomes inline so a
+/// partial failure (one repo dirty, one repo's pull conflicted) is
+/// readable and recoverable.
+function WorkspaceBranchSheet({ workspaceId }: { workspaceId: UUID }): JSX.Element {
+  const ws = useStore((s) => s.workspaces.find((w) => w.id === workspaceId));
+  const repos = useStore((s) => s.repos);
+  const refreshStatus = useStore((s) => s.refreshWorkspaceStatus);
+  const setSheet = useStore((s) => s.setSheet);
+
+  const [branch, setBranch] = useState('');
+  const [syncDefault, setSyncDefault] = useState(true);
+  const [pullBefore, setPullBefore] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [outcomes, setOutcomes] = useState<SyncAndBranchOutcome[] | null>(null);
+
+  const reposById = useMemo(() => new Map(repos.map((r) => [r.id, r])), [repos]);
+  const memberRepos = useMemo(
+    () => (ws?.repoIds ?? []).map((id) => reposById.get(id)).filter((r): r is Repo => !!r),
+    [ws?.repoIds, reposById],
+  );
+
+  const onRun = async () => {
+    if (!branch.trim()) return;
+    setBusy(true);
+    setOutcomes(null);
+    try {
+      const res = await window.overgit.invoke('workspace:syncAndBranch', {
+        workspaceId,
+        branch: branch.trim(),
+        syncDefault,
+        pullBeforeBranch: pullBefore,
+      });
+      setOutcomes(res);
+      await refreshStatus(workspaceId);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const allCreated =
+    outcomes !== null && outcomes.every((o) => o.result === 'created');
+
+  return (
+    <>
+      <SheetHeader
+        title={`New branch · ${ws?.name ?? ''}`}
+        onClose={() => setSheet(null)}
+      />
+      <div className="p-5 flex flex-col gap-4 text-sm overflow-y-auto">
+        <label className="flex flex-col gap-1">
+          <span className="text-[10px] uppercase tracking-wide text-ink-faint">
+            Branch name
+          </span>
+          <input
+            autoFocus
+            value={branch}
+            onChange={(e) => setBranch(e.target.value)}
+            disabled={busy}
+            placeholder="feature/my-thing"
+            className="field px-2 py-1.5 text-sm font-mono"
+          />
+        </label>
+
+        <fieldset className="flex flex-col gap-2 p-3 rounded border border-card bg-card">
+          <legend className="text-[10px] uppercase tracking-wide text-ink-faint px-1">
+            Workflow
+          </legend>
+          <Switch
+            label="Sync to default branch first"
+            sublabel="Switch each repo to its trunk before branching. Skipped per-repo if no default is configured."
+            checked={syncDefault}
+            disabled={busy}
+            onChange={setSyncDefault}
+          />
+          <Switch
+            label="Pull latest before branching"
+            sublabel="Run `git pull` so the new branch starts from origin's latest. Disable if you're offline."
+            checked={pullBefore}
+            disabled={busy}
+            onChange={setPullBefore}
+          />
+        </fieldset>
+
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-ink-faint mb-1">
+            Will run on {memberRepos.length}{' '}
+            {memberRepos.length === 1 ? 'repo' : 'repos'}
+          </div>
+          <ul className="text-[11px] text-ink-faint flex flex-col gap-0.5">
+            {memberRepos.map((r) => (
+              <li key={r.id} className="flex justify-between gap-2">
+                <span className="truncate">{r.name}</span>
+                <span className="font-mono">
+                  {r.defaultBranch ?? <span className="text-amber-400">no default</span>}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+
+        {outcomes && (
+          <ul className="flex flex-col gap-1 text-[11px]">
+            {outcomes.map((o) => (
+              <li
+                key={o.repoId}
+                className="flex items-center gap-2 px-2 py-1 rounded border border-card bg-card"
+              >
+                <span className="w-32 truncate">
+                  {reposById.get(o.repoId)?.name ?? o.repoId}
+                </span>
+                <BranchOutcomeBadge result={o.result} />
+                {o.message && (
+                  <span className="text-ink-faint truncate flex-1" title={o.message}>
+                    — {o.message}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+      <div className="px-5 py-3 border-t border-card flex justify-end gap-2">
+        <button
+          onClick={() => setSheet(null)}
+          className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
+        >
+          {allCreated ? 'Done' : 'Cancel'}
+        </button>
+        <button
+          disabled={busy || !branch.trim()}
+          onClick={onRun}
+          className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+        >
+          {busy
+            ? 'Running…'
+            : outcomes
+              ? `Run again`
+              : `Create on ${memberRepos.length} ${
+                  memberRepos.length === 1 ? 'repo' : 'repos'
+                }`}
+        </button>
+      </div>
+    </>
+  );
+}
+
+function Switch({
+  label,
+  sublabel,
+  checked,
+  disabled,
+  onChange,
+}: {
+  label: string;
+  sublabel?: string;
+  checked: boolean;
+  disabled?: boolean;
+  onChange: (v: boolean) => void;
+}): JSX.Element {
+  return (
+    <label className="flex items-start gap-2 cursor-pointer">
+      <input
+        type="checkbox"
+        checked={checked}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.checked)}
+        className="mt-0.5"
+      />
+      <div className="flex-1 min-w-0">
+        <div className="text-xs">{label}</div>
+        {sublabel && <div className="text-[10px] text-ink-faint">{sublabel}</div>}
+      </div>
+    </label>
+  );
+}
+
+function BranchOutcomeBadge({
+  result,
+}: {
+  result: SyncAndBranchOutcome['result'];
+}): JSX.Element {
+  const map: Record<SyncAndBranchOutcome['result'], { label: string; cls: string }> = {
+    created: { label: 'created', cls: 'text-emerald-400' },
+    'no-default-branch': { label: 'no default', cls: 'text-amber-400' },
+    dirty: { label: 'dirty', cls: 'text-amber-400' },
+    'pull-failed': { label: 'pull failed', cls: 'text-red-400' },
+    'create-failed': { label: 'create failed', cls: 'text-red-400' },
+    'switch-failed': { label: 'switch failed', cls: 'text-red-400' },
+  };
+  const { label, cls } = map[result];
+  return <span className={`font-mono ${cls}`}>{label}</span>;
 }
 
 function RepoPickRow({

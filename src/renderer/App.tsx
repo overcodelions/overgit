@@ -22,6 +22,8 @@ export function App(): JSX.Element {
     hydrate();
   }, [hydrate]);
 
+  useGlobalShortcuts();
+
   if (!loaded) {
     return (
       <div className="flex flex-col h-full">
@@ -41,6 +43,99 @@ export function App(): JSX.Element {
       <SheetHost />
     </div>
   );
+}
+
+/// Global keyboard shortcuts. We attach one keydown listener and
+/// dispatch on Cmd/Ctrl + key. Inputs and textareas are NOT skipped for
+/// nav-like shortcuts on purpose — Cmd+1..4 should always switch the
+/// repo tab, even while you're typing. We do skip alphabetic shortcuts
+/// (Cmd+B, Cmd+N) inside text fields so they don't steal browser
+/// behavior in the search box / commit message.
+function useGlobalShortcuts(): void {
+  const setSheet = useStore((s) => s.setSheet);
+  const toggleSidebar = useStore((s) => s.toggleSidebar);
+  const selectedRepoId = useStore((s) => s.selectedRepoId);
+  const selectedWsId = useStore((s) => s.selectedWorkspaceId);
+  const refreshRepoStatus = useStore((s) => s.refreshRepoStatus);
+  const refreshRepoChanges = useStore((s) => s.refreshRepoChanges);
+  const refreshWsStatus = useStore((s) => s.refreshWorkspaceStatus);
+  const refreshWsPRs = useStore((s) => s.refreshWorkspacePRs);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey;
+      if (!mod) return;
+      const target = e.target as HTMLElement | null;
+      const inField =
+        !!target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.isContentEditable);
+
+      // Cmd+, → Settings (matches macOS convention).
+      if (e.key === ',') {
+        e.preventDefault();
+        setSheet({ kind: 'settings' });
+        return;
+      }
+      // Cmd+\ → toggle sidebar.
+      if (e.key === '\\') {
+        e.preventDefault();
+        toggleSidebar();
+        return;
+      }
+      // Cmd+R → refresh whatever's in focus (repo or workspace pane).
+      // Don't steal in fields — the user might be wanting to undo etc.
+      if ((e.key === 'r' || e.key === 'R') && !e.shiftKey && !inField) {
+        e.preventDefault();
+        if (selectedRepoId) {
+          void refreshRepoStatus(selectedRepoId);
+          void refreshRepoChanges(selectedRepoId);
+        } else if (selectedWsId) {
+          void refreshWsStatus(selectedWsId);
+          void refreshWsPRs(selectedWsId);
+        }
+        return;
+      }
+      // Cmd+N → New branch (workspace-wide if a workspace is open;
+      // otherwise we let the repo's BranchPicker handle it via Cmd+B).
+      if ((e.key === 'n' || e.key === 'N') && !e.shiftKey && !inField && selectedWsId) {
+        e.preventDefault();
+        setSheet({ kind: 'newBranchInWorkspace', workspaceId: selectedWsId });
+        return;
+      }
+      // Cmd+1..4 dispatch a custom event that RepoDetail listens for.
+      // Done this way so the shortcut works regardless of focus and
+      // doesn't require lifting tab state into the global store.
+      if (selectedRepoId && /^[1-4]$/.test(e.key)) {
+        e.preventDefault();
+        const tabs = ['changes', 'history', 'files', 'graph'] as const;
+        window.dispatchEvent(
+          new CustomEvent('overgit:setRepoTab', {
+            detail: tabs[Number.parseInt(e.key, 10) - 1],
+          }),
+        );
+        return;
+      }
+      // Cmd+B → open branch picker (RepoDetail listens for this).
+      if ((e.key === 'b' || e.key === 'B') && !inField && selectedRepoId) {
+        e.preventDefault();
+        window.dispatchEvent(new CustomEvent('overgit:openBranchPicker'));
+        return;
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [
+    setSheet,
+    toggleSidebar,
+    selectedRepoId,
+    selectedWsId,
+    refreshRepoStatus,
+    refreshRepoChanges,
+    refreshWsStatus,
+    refreshWsPRs,
+  ]);
 }
 
 function Sidebar(): JSX.Element {
@@ -351,16 +446,13 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
     refreshPRs(workspaceId);
   }, [refresh, refreshPRs, workspaceId]);
 
-  if (!ws) return <main className="flex-1" />;
-
-  const reposById = new Map(repos.map((r) => [r.id, r]));
-
-  // Compact overview computed across the workspace's per-repo statuses.
-  // We flash this even before statuses finish loading so the page always
-  // has something useful at the top — the prior version showed just an
-  // input box on a fresh workspace, which read as blank.
+  // Overview tiles, computed BEFORE any early return so React's hook
+  // order stays stable. The previous version put this useMemo after
+  // `if (!ws) return …` — the crash that left the whole app rendering
+  // blank when a freshly-created workspace momentarily lagged the
+  // selector. Falls back to zeroes when ws hasn't materialized yet.
   const summary = useMemo(() => {
-    const total = ws.repoIds.length;
+    const total = ws?.repoIds.length ?? 0;
     const loaded = statuses.length;
     const dirty = statuses.filter((s) => s.dirtyCount > 0).length;
     const ahead = statuses.filter((s) => (s.ahead ?? 0) > 0).length;
@@ -372,7 +464,11 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
     }
     const sortedBranches = [...branchTally.entries()].sort((a, b) => b[1] - a[1]);
     return { total, loaded, dirty, ahead, behind, sortedBranches };
-  }, [ws.repoIds.length, statuses]);
+  }, [ws?.repoIds.length, statuses]);
+
+  if (!ws) return <main className="flex-1" />;
+
+  const reposById = new Map(repos.map((r) => [r.id, r]));
 
   return (
     <main className="flex-1 overflow-y-auto p-6">
@@ -385,6 +481,14 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
           </p>
         </div>
         <div className="flex gap-2">
+          <button
+            onClick={() => setSheet({ kind: 'newBranchInWorkspace', workspaceId })}
+            disabled={ws.repoIds.length === 0}
+            title="Sync each repo to its default branch, pull, and create a new branch — all in one go"
+            className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+          >
+            + New branch
+          </button>
           <button
             onClick={() => setSheet({ kind: 'editWorkspace', workspaceId })}
             className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"

@@ -39,8 +39,9 @@ import {
   workspaceFetch,
   workspaceListPRs,
   workspaceStatus,
+  workspaceSyncAndBranch,
 } from './workspace';
-import { detectCliPresence, reviewDiffWithLlm } from './cli';
+import { detectCliPresence, reviewDiffWithLlm, suggestCommitMessage } from './cli';
 import { Repo } from '../shared/types';
 
 // Dev vs prod: hit the Vite dev server only when VITE_DEV_SERVER_URL is
@@ -404,6 +405,29 @@ function registerIpc(): void {
     return workspaceListPRs(workspaceId, workspaces, repos);
   });
 
+  ipcMain.handle(
+    'workspace:syncAndBranch',
+    async (
+      _e,
+      args: {
+        workspaceId: string;
+        branch: string;
+        syncDefault: boolean;
+        pullBeforeBranch: boolean;
+      },
+    ) => {
+      const { workspaces, repos } = Store.load();
+      return workspaceSyncAndBranch(
+        args.workspaceId,
+        args.branch,
+        args.syncDefault,
+        args.pullBeforeBranch,
+        workspaces,
+        repos,
+      );
+    },
+  );
+
   ipcMain.handle('cli:detect', () => detectCliPresence());
 
   ipcMain.handle(
@@ -421,6 +445,21 @@ function registerIpc(): void {
         return { ok: false, output: '', error: diff.error ?? 'Could not read diff', tool: args.tool };
       }
       return reviewDiffWithLlm(args.tool, diff.text);
+    },
+  );
+
+  ipcMain.handle(
+    'cli:suggestCommitMessage',
+    async (_e, args: { repoId: string; tool: 'claude' | 'codex' | 'gemini' }) => {
+      const repo = repoFromArg(args);
+      if (!repo) {
+        return { ok: false, error: 'Unknown repo', tool: args.tool };
+      }
+      const diff = await rawDiff(repo.path, 'staged');
+      if (!diff.ok) {
+        return { ok: false, error: diff.error ?? 'Could not read staged diff', tool: args.tool };
+      }
+      return suggestCommitMessage(args.tool, diff.text);
     },
   );
 }

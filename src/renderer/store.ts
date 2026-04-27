@@ -31,7 +31,8 @@ export type Sheet =
   | { kind: 'about' }
   | { kind: 'newWorkspace' }
   | { kind: 'editWorkspace'; workspaceId: UUID }
-  | { kind: 'reviewChanges'; repoId: UUID; scope: 'staged' | 'working' };
+  | { kind: 'reviewChanges'; repoId: UUID; scope: 'staged' | 'working' }
+  | { kind: 'newBranchInWorkspace'; workspaceId: UUID };
 
 interface OpenFile {
   repoId: UUID;
