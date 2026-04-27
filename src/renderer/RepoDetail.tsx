@@ -3,7 +3,14 @@ import { useStore } from './store';
 import { FileEditor } from './FileEditor';
 import { BranchGraph } from './BranchGraph';
 import { BranchPicker } from './BranchPicker';
-import type { ChangedFile, Commit, FileDiff, RepoStatus, UUID } from '@shared/types';
+import type {
+  ChangedFile,
+  Commit,
+  FileDiff,
+  LlmTool,
+  RepoStatus,
+  UUID,
+} from '@shared/types';
 
 type Tab = 'changes' | 'history' | 'files' | 'graph';
 
@@ -30,6 +37,27 @@ export function RepoDetail({ repoId }: { repoId: UUID }): JSX.Element {
 
   if (!repo) return <main className="flex-1" />;
 
+  // Global Cmd+1..4 shortcuts are dispatched as a custom event from App;
+  // we just listen and update local tab state. Same story for Cmd+B
+  // which RepoHeader picks up — the RepoDetail level forwards that
+  // event by re-dispatching on a header-local element via a simple
+  // boolean ping that RepoHeader subscribes to.
+  useEffect(() => {
+    const onTab = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (
+        detail === 'changes' ||
+        detail === 'history' ||
+        detail === 'files' ||
+        detail === 'graph'
+      ) {
+        setTab(detail);
+      }
+    };
+    window.addEventListener('overgit:setRepoTab', onTab);
+    return () => window.removeEventListener('overgit:setRepoTab', onTab);
+  }, []);
+
   return (
     <main className="flex-1 grid grid-rows-[auto_auto_1fr] overflow-hidden">
       <RepoHeader repoId={repoId} />
@@ -52,6 +80,14 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
   const [busy, setBusy] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
+
+  // Cmd+B shortcut → toggle the picker. The global handler in App
+  // dispatches a window event when a repo is open; we just toggle.
+  useEffect(() => {
+    const onOpen = () => setPickerOpen((v) => !v);
+    window.addEventListener('overgit:openBranchPicker', onOpen);
+    return () => window.removeEventListener('overgit:openBranchPicker', onOpen);
+  }, []);
 
   const onAction = (fn: () => Promise<{ ok: boolean; error?: string }>) => async () => {
     setBusy(true);
@@ -274,6 +310,11 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
         />
 
         <div className="mt-auto p-3 border-t border-card flex flex-col gap-2">
+          <CommitMessageSuggest
+            repoId={repoId}
+            stagedCount={staged.length}
+            onSuggested={(text) => setMessage(text)}
+          />
           <textarea
             value={message}
             onChange={(e) => setMessage(e.target.value)}
@@ -307,6 +348,161 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
         )}
       </section>
     </div>
+  );
+}
+
+/// Inline "✨ Suggest" affordance above the commit message box. Picks
+/// the first available LLM CLI by default (claude > codex > gemini),
+/// runs `cli:suggestCommitMessage` on the staged diff, and drops the
+/// result into the commit input on success.
+function CommitMessageSuggest({
+  repoId,
+  stagedCount,
+  onSuggested,
+}: {
+  repoId: UUID;
+  stagedCount: number;
+  onSuggested: (text: string) => void;
+}): JSX.Element {
+  const cli = useStore((s) => s.cliPresence);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<
+    | { kind: 'idle' }
+    | { kind: 'drafting'; tool: LlmTool }
+    | { kind: 'ok'; tool: LlmTool }
+    | { kind: 'err'; message: string }
+  >({ kind: 'idle' });
+
+  const tool: LlmTool | null = useMemo(() => {
+    if (cli?.claude) return 'claude';
+    if (cli?.codex) return 'codex';
+    if (cli?.gemini) return 'gemini';
+    return null;
+  }, [cli]);
+
+  // Auto-clear the success badge after a couple seconds so the row
+  // settles back to "Commit message" and the user can re-suggest
+  // without the stale ✓ confusing them.
+  useEffect(() => {
+    if (status.kind !== 'ok') return;
+    const t = setTimeout(() => setStatus({ kind: 'idle' }), 2500);
+    return () => clearTimeout(t);
+  }, [status]);
+
+  const onClick = async () => {
+    if (!tool) return;
+    if (stagedCount === 0) {
+      setStatus({ kind: 'err', message: 'Stage some changes first.' });
+      return;
+    }
+    setBusy(true);
+    setStatus({ kind: 'drafting', tool });
+    try {
+      const res = await window.overgit.invoke('cli:suggestCommitMessage', {
+        repoId,
+        tool,
+      });
+      if (!res.ok) {
+        setStatus({ kind: 'err', message: res.error ?? 'Suggest failed' });
+        return;
+      }
+      onSuggested(res.message);
+      setStatus({ kind: 'ok', tool: res.tool });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center justify-between text-[10px]">
+        <span className="text-ink-faint">Commit message</span>
+        <StatusPill status={status} />
+      </div>
+      {tool ? (
+        <button
+          onClick={onClick}
+          disabled={busy || stagedCount === 0}
+          className="self-end text-[11px] px-2 py-1 rounded border border-card hover:bg-card disabled:opacity-50 flex items-center gap-1"
+          title={
+            stagedCount === 0
+              ? 'Stage changes first'
+              : `Draft a commit message with ${tool}`
+          }
+        >
+          <span>✨</span>
+          <span>{busy ? `Drafting with ${tool}…` : `Suggest with ${tool}`}</span>
+        </button>
+      ) : (
+        <span
+          className="self-end text-[10px] text-ink-faint"
+          title="Install claude, codex, or gemini to enable suggestions"
+        >
+          Install an LLM CLI to enable Suggest
+        </span>
+      )}
+    </div>
+  );
+}
+
+function StatusPill({
+  status,
+}: {
+  status:
+    | { kind: 'idle' }
+    | { kind: 'drafting'; tool: LlmTool }
+    | { kind: 'ok'; tool: LlmTool }
+    | { kind: 'err'; message: string };
+}): JSX.Element | null {
+  if (status.kind === 'idle') return null;
+  if (status.kind === 'drafting') {
+    return (
+      <span className="text-[10px] text-ink-muted flex items-center gap-1">
+        <Spinner />
+        Drafting with {status.tool}…
+      </span>
+    );
+  }
+  if (status.kind === 'ok') {
+    return (
+      <span className="text-[10px] text-emerald-400">
+        ✓ Suggested by {status.tool} — review &amp; edit before committing
+      </span>
+    );
+  }
+  return (
+    <span className="text-[10px] text-red-400 truncate max-w-[280px]" title={status.message}>
+      {status.message}
+    </span>
+  );
+}
+
+function Spinner(): JSX.Element {
+  return (
+    <svg
+      width="10"
+      height="10"
+      viewBox="0 0 16 16"
+      className="animate-spin"
+      aria-hidden="true"
+    >
+      <circle
+        cx="8"
+        cy="8"
+        r="6"
+        stroke="currentColor"
+        strokeWidth="2"
+        fill="none"
+        opacity="0.25"
+      />
+      <path
+        d="M14 8a6 6 0 0 0-6-6"
+        stroke="currentColor"
+        strokeWidth="2"
+        fill="none"
+        strokeLinecap="round"
+      />
+    </svg>
   );
 }
 

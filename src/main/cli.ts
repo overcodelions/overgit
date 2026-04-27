@@ -149,6 +149,98 @@ Respond in three short sections:
 
 Do not include preamble, headings beyond the three above, or markdown fences.`;
 
+const COMMIT_MESSAGE_PROMPT = `You are writing the commit message for the staged git diff below.
+
+Output ONLY the commit message itself — no preamble, no commentary, no markdown fences. Format:
+
+  <type>(<scope>): <subject>
+
+  <body, optional, wrap at 72 chars>
+
+Where <type> is one of: feat, fix, refactor, docs, test, chore, perf. Skip <scope> if not obvious. The subject line must be under 72 characters and start with a lowercase verb. Add a body only if the diff has non-obvious "why" worth recording.`;
+
+/// Run an LLM CLI on the staged diff to draft a commit message. Strips
+/// any markdown fences the model wrapped around its answer (some CLIs
+/// reflexively add ```text/```), trims trailing whitespace, and returns
+/// just the message string for the renderer to drop straight into the
+/// commit input.
+export async function suggestCommitMessage(
+  tool: LlmTool,
+  diff: string,
+): Promise<
+  | { ok: true; message: string; tool: LlmTool }
+  | { ok: false; error: string; tool: LlmTool }
+> {
+  if (!diff.trim()) {
+    return { ok: false, error: 'No staged changes to summarize.', tool };
+  }
+  const result = await runOneShot(tool, COMMIT_MESSAGE_PROMPT + '\n\n' + diff);
+  if (!result.ok) {
+    return { ok: false, error: result.error ?? 'CLI failed', tool };
+  }
+  const cleaned = stripFences(result.output).trim();
+  if (!cleaned) {
+    return { ok: false, error: 'CLI returned an empty message.', tool };
+  }
+  return { ok: true, message: cleaned, tool };
+}
+
+function stripFences(s: string): string {
+  // Tolerate ```text\n…\n``` or ```\n…\n``` wrappers some CLIs emit.
+  const m = s.match(/^```[a-zA-Z]*\n([\s\S]*?)\n```\s*$/);
+  return m ? m[1] : s;
+}
+
+/// Shared one-shot LLM invocation: spawn `tool argsForTool(tool)`, write
+/// `prompt` to stdin, capture stdout, post-process for codex.
+async function runOneShot(
+  tool: LlmTool,
+  prompt: string,
+): Promise<{ ok: boolean; output: string; error?: string }> {
+  const args = argsForTool(tool);
+  return new Promise((resolve) => {
+    const child = spawn(tool, args, { env: process.env });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const done = (r: { ok: boolean; output: string; error?: string }) => {
+      if (settled) return;
+      settled = true;
+      resolve(r);
+    };
+    const timer = setTimeout(() => {
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        /* ignore */
+      }
+      done({ ok: false, output: stdout, error: `${tool} took longer than 90s — aborted.` });
+    }, 90_000);
+    child.stdout.on('data', (b) => {
+      stdout += b.toString('utf8');
+    });
+    child.stderr.on('data', (b) => {
+      stderr += b.toString('utf8');
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      const cleaned = tool === 'codex' ? extractCodexBody(stdout) : stdout.trim();
+      if (code === 0) done({ ok: true, output: cleaned });
+      else done({ ok: false, output: cleaned, error: stderr.trim() || `${tool} exited ${code}` });
+    });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      done({ ok: false, output: '', error: String(err) });
+    });
+    try {
+      child.stdin.write(prompt);
+      child.stdin.end();
+    } catch {
+      if (!settled) child.kill('SIGTERM');
+    }
+  });
+}
+
 function argsForTool(tool: LlmTool): string[] {
   // The "-" / "exec" args for each CLI come from overcli's reviewer.ts;
   // they're the documented one-shot, stdin-prompt invocations:

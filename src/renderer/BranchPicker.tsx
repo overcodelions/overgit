@@ -109,9 +109,38 @@ export function BranchPicker({ repoId, anchorRef, onClose }: Props): JSX.Element
     }
   };
 
-  const onCreate = async (name: string) => {
+  const pullRepo = useStore((s) => s.pullRepo);
+
+  const onCreate = async (
+    name: string,
+    opts: { syncDefault: boolean; pull: boolean },
+  ) => {
     setBusy(true);
     try {
+      // Optional sync to default branch first. We skip silently if no
+      // default is configured — the create still runs from current HEAD,
+      // which matches the workspace-wide flow's "no-default-branch"
+      // behavior.
+      if (opts.syncDefault && repo?.defaultBranch) {
+        const switchRes = await checkout(repoId, repo.defaultBranch, false);
+        if (switchRes.result === 'dirty') {
+          alert(
+            `Can't sync to ${repo.defaultBranch}: working tree is dirty. Stash or commit first.`,
+          );
+          return;
+        }
+        if (switchRes.result === 'error' || switchRes.result === 'missing-branch') {
+          alert(switchRes.message ?? `Could not switch to ${repo.defaultBranch}`);
+          return;
+        }
+      }
+      if (opts.pull) {
+        const pullRes = await pullRepo(repoId);
+        if (!pullRes.ok) {
+          alert(pullRes.error ?? 'Pull failed');
+          return;
+        }
+      }
       const res = await create(repoId, name, true);
       if (!res.ok) {
         alert(res.error ?? 'Create failed');
@@ -165,8 +194,9 @@ export function BranchPicker({ repoId, anchorRef, onClose }: Props): JSX.Element
         <CreateMode
           inputRef={inputRef}
           busy={busy}
+          defaultBranch={repo?.defaultBranch ?? null}
           onCancel={() => setMode({ kind: 'list' })}
-          onSubmit={(name) => onCreate(name)}
+          onSubmit={(name, opts) => onCreate(name, opts)}
         />
       )}
       {mode.kind === 'cherryPickFrom' && (
@@ -346,44 +376,91 @@ function BranchRow({
 function CreateMode({
   inputRef,
   busy,
+  defaultBranch,
   onCancel,
   onSubmit,
 }: {
   inputRef: React.RefObject<HTMLInputElement>;
   busy: boolean;
+  defaultBranch: string | null;
   onCancel: () => void;
-  onSubmit: (name: string) => void;
+  onSubmit: (name: string, opts: { syncDefault: boolean; pull: boolean }) => void;
 }): JSX.Element {
   const [name, setName] = useState('');
+  // Default-on when a default branch exists. If the repo has no
+  // configured default, syncing is meaningless so we lock both off and
+  // tell the user where to set one.
+  const [syncDefault, setSyncDefault] = useState(!!defaultBranch);
+  const [pull, setPull] = useState(!!defaultBranch);
+
+  const submit = () => {
+    if (!name.trim()) return;
+    onSubmit(name.trim(), { syncDefault, pull });
+  };
+
   return (
     <div className="p-3 flex flex-col gap-2">
       <div className="text-[10px] uppercase tracking-wide text-ink-faint">
-        New branch (from current HEAD)
+        New branch
       </div>
       <input
         ref={inputRef}
         value={name}
         onChange={(e) => setName(e.target.value)}
+        disabled={busy}
         onKeyDown={(e) => {
-          if (e.key === 'Enter' && name.trim()) onSubmit(name.trim());
+          if (e.key === 'Enter') submit();
           else if (e.key === 'Escape') onCancel();
         }}
         placeholder="feature/your-branch"
         className="field px-2 py-1.5 text-xs"
       />
+      {defaultBranch ? (
+        <div className="flex flex-col gap-1 text-[11px] text-ink-muted">
+          <label className="flex items-start gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={syncDefault}
+              disabled={busy}
+              onChange={(e) => setSyncDefault(e.target.checked)}
+              className="mt-0.5"
+            />
+            <span>
+              Switch to{' '}
+              <span className="font-mono text-ink">{defaultBranch}</span> first
+            </span>
+          </label>
+          <label className="flex items-start gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={pull}
+              disabled={busy}
+              onChange={(e) => setPull(e.target.checked)}
+              className="mt-0.5"
+            />
+            <span>Pull latest before branching</span>
+          </label>
+        </div>
+      ) : (
+        <div className="text-[10px] text-ink-faint">
+          No default branch configured — branch will be created from current HEAD.
+          Set one in Settings → Default branches.
+        </div>
+      )}
       <div className="flex gap-2 justify-end">
         <button
           onClick={onCancel}
-          className="text-xs px-2.5 py-1 rounded border border-card hover:bg-card"
+          disabled={busy}
+          className="text-xs px-2.5 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
         >
           Back
         </button>
         <button
           disabled={busy || !name.trim()}
-          onClick={() => onSubmit(name.trim())}
+          onClick={submit}
           className="text-xs px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
         >
-          Create & switch
+          {busy ? 'Working…' : 'Create & switch'}
         </button>
       </div>
     </div>

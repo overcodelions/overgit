@@ -60,6 +60,26 @@ export interface CheckoutOutcome {
   message?: string;
 }
 
+/// Per-repo result of the "sync default branch and create new branch"
+/// workflow. Each repo can succeed at any point in the chain; the step
+/// names tell the renderer how far we got so a partial failure is
+/// readable ("synced default but couldn't create branch on origin/foo").
+export interface SyncAndBranchOutcome {
+  repoId: UUID;
+  /// Branch we tried to create.
+  branch: string;
+  /// Default branch we synced to (or attempted).
+  defaultBranch: string | null;
+  result:
+    | 'created'
+    | 'no-default-branch'
+    | 'dirty'
+    | 'pull-failed'
+    | 'create-failed'
+    | 'switch-failed';
+  message?: string;
+}
+
 /// Detected installed CLIs we can shell out to. The first three are
 /// review-host CLIs (PR/MR data). The rest are LLM CLIs that can review
 /// or comment on a diff in non-interactive mode. Discovered once at
@@ -266,6 +286,12 @@ export interface IPCInvokeMap {
   }) => CheckoutOutcome[];
   'workspace:fetchAll': (workspaceId: UUID) => { repoId: UUID; ok: boolean; error?: string }[];
   'workspace:listPRs': (workspaceId: UUID) => RepoPRs[];
+  'workspace:syncAndBranch': (args: {
+    workspaceId: UUID;
+    branch: string;
+    syncDefault: boolean;
+    pullBeforeBranch: boolean;
+  }) => SyncAndBranchOutcome[];
 
   'cli:detect': () => CliPresence;
   'cli:reviewChanges': (args: {
@@ -273,6 +299,10 @@ export interface IPCInvokeMap {
     scope: 'staged' | 'working';
     tool: LlmTool;
   }) => ReviewResult;
+  'cli:suggestCommitMessage': (args: {
+    repoId: UUID;
+    tool: LlmTool;
+  }) => { ok: true; message: string; tool: LlmTool } | { ok: false; error: string; tool: LlmTool };
 }
 
 export interface StoreSnapshot {
