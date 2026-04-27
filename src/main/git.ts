@@ -14,6 +14,7 @@ import {
   FileDiff,
   RepoChanges,
   RepoStatus,
+  Stash,
   UUID,
 } from '../shared/types';
 
@@ -344,6 +345,100 @@ export async function stash(
   const res = await run(repoPath, args);
   if (res.ok) return { ok: true };
   return { ok: false, error: res.stderr.trim() || `git exited ${res.code}` };
+}
+
+/// Enumerate the user's stash entries. We pull the structured fields
+/// (sha, branch, subject, date) via `--pretty=format` rather than
+/// parsing the human-readable `git stash list` output, which mixes the
+/// branch name into the subject and gets ambiguous when the subject
+/// contains punctuation.
+export async function listStashes(repoPath: string): Promise<Stash[]> {
+  if (!looksLikeRepo(repoPath)) return [];
+  const fmt = '%gd%x1f%h%x1f%gs%x1f%aI%x1e';
+  const res = await run(repoPath, ['stash', 'list', `--pretty=format:${fmt}`]);
+  if (!res.ok) return [];
+  const out: Stash[] = [];
+  for (const record of res.stdout.split('\x1e')) {
+    const t = record.trim();
+    if (!t) continue;
+    const [ref, shortSha, gs, date] = t.split('\x1f');
+    if (!ref) continue;
+    // `%gd` looks like "stash@{2}"; pull the index out for IPC calls.
+    const m = ref.match(/^stash@\{(\d+)\}$/);
+    const index = m ? Number.parseInt(m[1], 10) : 0;
+    // `%gs` (reflog subject) is shaped like
+    //   "WIP on main: c0ffee Some commit message"
+    // or "On main: <user message>" when the user passed -m. Split on
+    // the first ":" so the renderer can show the branch tag separately
+    // from the subject.
+    const colon = (gs ?? '').indexOf(':');
+    const branchPrefix = colon === -1 ? '' : (gs ?? '').slice(0, colon).trim();
+    const subject = colon === -1 ? (gs ?? '') : (gs ?? '').slice(colon + 1).trim();
+    // The branch part itself is "WIP on <name>" or "On <name>" — peel
+    // the leading verb so we can render just the branch name.
+    const branchMatch = branchPrefix.match(/^(?:WIP\s+on|On)\s+(.+)$/);
+    const branch = branchMatch ? branchMatch[1] : branchPrefix;
+    out.push({
+      index,
+      ref,
+      shortSha: shortSha ?? '',
+      branch,
+      subject,
+      date: date ?? '',
+    });
+  }
+  return out;
+}
+
+/// Apply (or pop) a stash by numeric index. We resolve by `stash@{N}`
+/// so the call targets the exact entry the user clicked even if the
+/// list reshuffles between fetch and click. `pop` removes the entry on
+/// success; without it the entry stays in the list.
+export async function applyStash(
+  repoPath: string,
+  index: number,
+  pop: boolean,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  if (!Number.isInteger(index) || index < 0) {
+    return { ok: false, error: `Invalid stash index ${index}` };
+  }
+  const ref = `stash@{${index}}`;
+  const res = await run(repoPath, ['stash', pop ? 'pop' : 'apply', ref]);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git stash exited ${res.code}` };
+}
+
+export async function dropStash(
+  repoPath: string,
+  index: number,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  if (!Number.isInteger(index) || index < 0) {
+    return { ok: false, error: `Invalid stash index ${index}` };
+  }
+  const res = await run(repoPath, ['stash', 'drop', `stash@{${index}}`]);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git stash drop exited ${res.code}` };
+}
+
+export async function stashDiff(repoPath: string, index: number): Promise<FileDiff[]> {
+  if (!looksLikeRepo(repoPath)) return [];
+  if (!Number.isInteger(index) || index < 0) return [];
+  // `git stash show -p stash@{N}` emits the same shape as `git show`
+  // (header + per-file blocks), with no commit-message preamble for
+  // stashes — but pass `--format=` defensively so future git versions
+  // don't surprise us. Reusing the same per-file parser as `diff()`.
+  const res = await run(repoPath, [
+    'stash',
+    'show',
+    '-p',
+    '--no-color',
+    '--format=',
+    `stash@{${index}}`,
+  ]);
+  if (!res.ok) return [];
+  return splitDiff(res.stdout).map(parseFileBlock);
 }
 
 export async function commitAll(

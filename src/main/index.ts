@@ -7,6 +7,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Store } from './store';
 import {
+  applyStash,
   branchSummaries,
   changes as gitChanges,
   checkoutBranch,
@@ -20,9 +21,11 @@ import {
   diff as gitDiff,
   diffFile,
   discardFiles,
+  dropStash,
   fetch as gitFetch,
   listBranches,
   listBranchCommits,
+  listStashes,
   log as gitLog,
   looksLikeRepo,
   pull as gitPull,
@@ -30,6 +33,7 @@ import {
   rawDiff,
   stageFiles,
   stash as gitStash,
+  stashDiff,
   status as gitStatus,
   unstageFiles,
 } from './git';
@@ -316,6 +320,39 @@ function registerIpc(): void {
     if (!repo) return [];
     return commitGraph(repo.path, args.limit ?? 200);
   });
+
+  ipcMain.handle('repo:listStashes', async (_e, repoId: string) => {
+    const repo = repoFromArg(repoId);
+    if (!repo) return [];
+    return listStashes(repo.path);
+  });
+
+  ipcMain.handle(
+    'repo:applyStash',
+    async (_e, args: { repoId: string; index: number; pop: boolean }) => {
+      const repo = repoFromArg(args);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return applyStash(repo.path, args.index, args.pop);
+    },
+  );
+
+  ipcMain.handle(
+    'repo:dropStash',
+    async (_e, args: { repoId: string; index: number }) => {
+      const repo = repoFromArg(args);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return dropStash(repo.path, args.index);
+    },
+  );
+
+  ipcMain.handle(
+    'repo:stashDiff',
+    async (_e, args: { repoId: string; index: number }) => {
+      const repo = repoFromArg(args);
+      if (!repo) return [];
+      return stashDiff(repo.path, args.index);
+    },
+  );
 
   ipcMain.handle('repo:branchSummaries', async (_e, repoId: string) => {
     const repo = repoFromArg(repoId);

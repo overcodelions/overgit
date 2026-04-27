@@ -17,6 +17,7 @@ import type {
   RepoChanges,
   RepoPRs,
   RepoStatus,
+  Stash,
   StoreSnapshot,
   UUID,
   Workspace,
@@ -56,6 +57,7 @@ interface UiState {
   repoBranchSummaries: Record<UUID, BranchSummary[]>;
   repoGraph: Record<UUID, GraphCommit[]>;
   repoFileList: Record<UUID, string[]>;
+  repoStashes: Record<UUID, Stash[]>;
   cliPresence: CliPresence | null;
 
   /// Currently open file in the in-app editor. Per-repo we'd allow many
@@ -68,6 +70,11 @@ interface UiState {
   openFileLoading: boolean;
 
   sheet: Sheet | null;
+  /// The Cmd+K command palette is its own overlay (not a Sheet) because
+  /// it has its own layout — top-anchored, narrower, no header chrome —
+  /// and its own keyboard semantics. One boolean is enough; the
+  /// renderer derives the result list from existing store fields.
+  paletteOpen: boolean;
   /// The most recent workspace-checkout result, kept around so the UI
   /// can show per-repo outcomes and offer Stash/Commit affordances on
   /// repos that came back dirty.
@@ -94,6 +101,9 @@ interface UiState {
   refreshRepoBranchSummaries: (id: UUID) => Promise<void>;
   refreshRepoGraph: (id: UUID) => Promise<void>;
   refreshRepoFileList: (id: UUID) => Promise<void>;
+  refreshRepoStashes: (id: UUID) => Promise<void>;
+  applyStash: (id: UUID, index: number, pop: boolean) => Promise<{ ok: boolean; error?: string }>;
+  dropStash: (id: UUID, index: number) => Promise<{ ok: boolean; error?: string }>;
   setRepoDefaultBranch: (id: UUID, branch: string | null) => Promise<void>;
   stageFiles: (id: UUID, paths: string[]) => Promise<void>;
   unstageFiles: (id: UUID, paths: string[]) => Promise<void>;
@@ -113,7 +123,9 @@ interface UiState {
   saveOpenFile: () => Promise<{ ok: boolean; error?: string }>;
 
   toggleSidebar: () => void;
+  setSidebarWidth: (px: number) => Promise<void>;
   setSheet: (sheet: Sheet | null) => void;
+  togglePalette: (open?: boolean) => void;
 
   removeRepo: (id: UUID) => Promise<void>;
   removeWorkspace: (id: UUID) => Promise<void>;
@@ -132,7 +144,7 @@ export const useStore = create<UiState>((set, get) => ({
   loaded: false,
   repos: [],
   workspaces: [],
-  settings: { theme: 'system', sidebarVisible: true },
+  settings: { theme: 'system', sidebarVisible: true, sidebarWidth: 288 },
   selectedWorkspaceId: null,
   selectedRepoId: null,
   workspaceStatuses: {},
@@ -145,6 +157,7 @@ export const useStore = create<UiState>((set, get) => ({
   repoBranchSummaries: {},
   repoGraph: {},
   repoFileList: {},
+  repoStashes: {},
   cliPresence: null,
   lastCheckout: null,
   openFile: null,
@@ -153,6 +166,7 @@ export const useStore = create<UiState>((set, get) => ({
   openFileError: null,
   openFileLoading: false,
   sheet: null,
+  paletteOpen: false,
 
   hydrate: async () => {
     const snap: StoreSnapshot = await window.overgit.invoke('store:load');
@@ -408,6 +422,32 @@ export const useStore = create<UiState>((set, get) => ({
     set({ repoFileList: { ...get().repoFileList, [id]: files } });
   },
 
+  refreshRepoStashes: async (id) => {
+    const stashes = await window.overgit.invoke('repo:listStashes', id);
+    set({ repoStashes: { ...get().repoStashes, [id]: stashes } });
+  },
+
+  applyStash: async (id, index, pop) => {
+    const res = await window.overgit.invoke('repo:applyStash', { repoId: id, index, pop });
+    if (res.ok) {
+      // Apply/pop changes the working tree; refresh status + changes so
+      // the user sees the result without flipping tabs. Pop also drops
+      // the stash, so re-fetch the stash list either way.
+      await Promise.all([
+        get().refreshRepoStatus(id),
+        get().refreshRepoChanges(id),
+        get().refreshRepoStashes(id),
+      ]);
+    }
+    return res;
+  },
+
+  dropStash: async (id, index) => {
+    const res = await window.overgit.invoke('repo:dropStash', { repoId: id, index });
+    if (res.ok) await get().refreshRepoStashes(id);
+    return res;
+  },
+
   openRepoFile: async (repoId, p) => {
     set({
       openFile: { repoId, path: p },
@@ -476,7 +516,22 @@ export const useStore = create<UiState>((set, get) => ({
     await window.overgit.invoke('store:saveSettings', next);
   },
 
+  /// Resize handler used by the drag divider. We persist on every
+  /// release-equivalent (the caller debounces to one save per drag); the
+  /// in-memory update happens synchronously so the layout tracks the
+  /// pointer without round-tripping the IPC.
+  setSidebarWidth: async (px) => {
+    const cur = get().settings;
+    if (cur.sidebarWidth === px) return;
+    const next = { ...cur, sidebarWidth: px };
+    set({ settings: next });
+    await window.overgit.invoke('store:saveSettings', next);
+  },
+
   setSheet: (sheet) => set({ sheet }),
+
+  togglePalette: (open) =>
+    set((s) => ({ paletteOpen: typeof open === 'boolean' ? open : !s.paletteOpen })),
 
   removeRepo: async (id) => {
     const repos = get().repos.filter((r) => r.id !== id);

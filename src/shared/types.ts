@@ -148,6 +148,21 @@ export interface RepoChanges {
   unstaged: ChangedFile[];
 }
 
+/// One stash entry in the user's stash list. The `index` is the
+/// stash@{N} reference git uses everywhere — the renderer keeps it
+/// alongside the human-readable subject so apply/pop/drop calls can
+/// target the exact entry the user clicked, even if the list
+/// reshuffles between calls.
+export interface Stash {
+  /// Numeric index for `stash@{N}`. 0 is the newest.
+  index: number;
+  ref: string;
+  shortSha: string;
+  branch: string;
+  subject: string;
+  date: string;
+}
+
 /// One branch in the picker. Carries enough metadata for the row UI
 /// (last-commit subject, date, upstream tag) to render without any
 /// follow-up IPC calls. Sorted by committer date, newest first.
@@ -205,12 +220,20 @@ export interface AppSettings {
   /// User-controlled visibility of the left sidebar. Persisted so the
   /// title-bar toggle survives relaunch.
   sidebarVisible: boolean;
+  /// Sidebar width in pixels. Persisted so the user's drag survives
+  /// relaunch. Clamped on read so a stale value can't push the sidebar
+  /// off-screen on a smaller display.
+  sidebarWidth: number;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
   theme: 'system',
   sidebarVisible: true,
+  sidebarWidth: 288,
 };
+
+export const SIDEBAR_MIN_WIDTH = 200;
+export const SIDEBAR_MAX_WIDTH = 520;
 
 /// Typed contract for ipcRenderer.invoke channels. Each entry is the
 /// signature the main-process handler implements; the preload exposes
@@ -261,6 +284,14 @@ export interface IPCInvokeMap {
     side: 'staged' | 'unstaged';
   }) => FileDiff[];
   'repo:graph': (args: { repoId: UUID; limit?: number }) => GraphCommit[];
+  'repo:listStashes': (repoId: UUID) => Stash[];
+  'repo:applyStash': (args: {
+    repoId: UUID;
+    index: number;
+    pop: boolean;
+  }) => { ok: boolean; error?: string };
+  'repo:dropStash': (args: { repoId: UUID; index: number }) => { ok: boolean; error?: string };
+  'repo:stashDiff': (args: { repoId: UUID; index: number }) => FileDiff[];
   'repo:branchSummaries': (repoId: UUID) => BranchSummary[];
   'repo:branchCommits': (args: { repoId: UUID; ref: string; limit?: number }) => Commit[];
   'repo:cherryPick': (args: { repoId: UUID; shas: string[] }) => { ok: boolean; error?: string };
