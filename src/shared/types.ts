@@ -294,7 +294,15 @@ export interface IPCInvokeMap {
     repoId: UUID;
     index: number;
     pop: boolean;
-  }) => { ok: boolean; error?: string };
+  }) => { ok: boolean; error?: string; conflicts?: string[] };
+  /// Same as applyStash but first deletes the working-tree files git
+  /// flagged as "already exists, no checkout" so the apply can proceed.
+  /// Destructive — the renderer must confirm before calling.
+  'repo:applyStashForce': (args: {
+    repoId: UUID;
+    index: number;
+    pop: boolean;
+  }) => { ok: boolean; error?: string; removed?: string[] };
   'repo:dropStash': (args: { repoId: UUID; index: number }) => { ok: boolean; error?: string };
   'repo:stashDiff': (args: { repoId: UUID; index: number }) => FileDiff[];
   'repo:branchSummaries': (repoId: UUID) => BranchSummary[];
