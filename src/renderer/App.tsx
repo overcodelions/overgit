@@ -3,6 +3,7 @@ import { useStore } from './store';
 import { RepoDetail } from './RepoDetail';
 import { TitleBar } from './TitleBar';
 import { SheetHost } from './Sheets';
+import { CommandPalette } from './CommandPalette';
 import type {
   CheckoutOutcome,
   CliPresence,
@@ -13,6 +14,16 @@ import type {
   UUID,
   Workspace,
 } from '@shared/types';
+import { SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH } from '@shared/types';
+
+// Stable empty arrays for Zustand selector fallbacks. Using `?? []`
+// inside a `useStore` selector returns a NEW array on every call, which
+// fails React's useSyncExternalStore snapshot equality check and looks
+// like an infinite render loop ("Maximum update depth exceeded").
+// Reusing one frozen reference lets the selector return the same value
+// across renders when there's no entry yet.
+const EMPTY_STATUSES: RepoStatus[] = [];
+const EMPTY_PRS: RepoPRs[] = [];
 
 export function App(): JSX.Element {
   const { loaded, hydrate } = useStore();
@@ -37,10 +48,65 @@ export function App(): JSX.Element {
     <div className="flex flex-col h-full">
       <TitleBar />
       <div className="flex flex-1 min-h-0">
-        {sidebarVisible && <Sidebar />}
+        {sidebarVisible && <SidebarWithResize />}
         <Main />
       </div>
       <SheetHost />
+      <CommandPalette />
+    </div>
+  );
+}
+
+/// Wraps Sidebar with a fixed-width container and a drag handle. The
+/// width lives in settings (persisted), so a relaunch keeps the chosen
+/// layout. Clamped to [SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH] both on
+/// drag and on read so a stale value can't push the sidebar off-screen.
+function SidebarWithResize(): JSX.Element {
+  const width = useStore((s) => s.settings.sidebarWidth);
+  const setWidth = useStore((s) => s.setSidebarWidth);
+  const clamped = Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, width));
+
+  // Drag handle. We track the last persisted width but update via the
+  // raw computed value during the drag — the saver on the store is
+  // already a no-op for unchanged values, so re-setting on every move
+  // doesn't churn the IPC.
+  const onMouseDown = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = clamped;
+    const onMove = (ev: MouseEvent) => {
+      const next = Math.max(
+        SIDEBAR_MIN_WIDTH,
+        Math.min(SIDEBAR_MAX_WIDTH, startW + (ev.clientX - startX)),
+      );
+      void setWidth(next);
+    };
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  };
+
+  return (
+    <div className="flex shrink-0" style={{ width: clamped }}>
+      <Sidebar />
+      <div
+        role="separator"
+        aria-label="Resize sidebar"
+        aria-valuenow={clamped}
+        aria-valuemin={SIDEBAR_MIN_WIDTH}
+        aria-valuemax={SIDEBAR_MAX_WIDTH}
+        onMouseDown={onMouseDown}
+        onDoubleClick={() => void setWidth(288)}
+        title="Drag to resize · Double-click to reset"
+        className="w-1 cursor-col-resize hover:bg-accent/40 active:bg-accent/60 transition-colors"
+      />
     </div>
   );
 }
@@ -54,6 +120,7 @@ export function App(): JSX.Element {
 function useGlobalShortcuts(): void {
   const setSheet = useStore((s) => s.setSheet);
   const toggleSidebar = useStore((s) => s.toggleSidebar);
+  const togglePalette = useStore((s) => s.togglePalette);
   const selectedRepoId = useStore((s) => s.selectedRepoId);
   const selectedWsId = useStore((s) => s.selectedWorkspaceId);
   const refreshRepoStatus = useStore((s) => s.refreshRepoStatus);
@@ -72,6 +139,17 @@ function useGlobalShortcuts(): void {
           target.tagName === 'TEXTAREA' ||
           target.isContentEditable);
 
+      // Cmd+K → command palette. Wins over the inField guard so the
+      // user can summon it from anywhere, including the search box.
+      // Cmd+P is deliberately NOT bound: in an Electron renderer it
+      // also fires the system Print dialog, and we'd rather not
+      // silently steal that on a diff or file view. Cmd+K alone is
+      // the documented shortcut.
+      if (e.key === 'k' || e.key === 'K') {
+        e.preventDefault();
+        togglePalette();
+        return;
+      }
       // Cmd+, → Settings (matches macOS convention).
       if (e.key === ',') {
         e.preventDefault();
@@ -174,7 +252,7 @@ function Sidebar(): JSX.Element {
   );
 
   return (
-    <aside className="w-72 shrink-0 flex flex-col border-r border-card bg-surface-muted">
+    <aside className="flex-1 min-w-0 flex flex-col border-r border-card bg-surface-muted">
       <div className="px-2 pt-2 pb-1">
         <input
           value={search}
@@ -426,8 +504,8 @@ function Main(): JSX.Element {
 function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
   const ws = useStore((s) => s.workspaces.find((w) => w.id === workspaceId));
   const repos = useStore((s) => s.repos);
-  const statuses = useStore((s) => s.workspaceStatuses[workspaceId] ?? []);
-  const prs = useStore((s) => s.workspacePRs[workspaceId] ?? []);
+  const statuses = useStore((s) => s.workspaceStatuses[workspaceId] ?? EMPTY_STATUSES);
+  const prs = useStore((s) => s.workspacePRs[workspaceId] ?? EMPTY_PRS);
   const lastCheckout = useStore((s) => s.lastCheckout);
   const cli = useStore((s) => s.cliPresence);
   const refresh = useStore((s) => s.refreshWorkspaceStatus);

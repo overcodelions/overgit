@@ -35,8 +35,12 @@ export function SheetHost(): JSX.Element | null {
       <div
         className={`bg-surface-elevated border border-card rounded-lg shadow-2xl overflow-hidden flex flex-col ${
           sheet.kind === 'reviewChanges'
-            ? 'w-[760px] max-w-[92vw] max-h-[85vh]'
-            : 'w-[640px] max-w-[90vw] max-h-[80vh]'
+            ? 'w-[760px] max-w-[92vw] h-[85vh]'
+            : sheet.kind === 'about'
+              ? 'w-[720px] max-w-[92vw] max-h-[85vh]'
+              : sheet.kind === 'settings'
+                ? 'w-[760px] max-w-[92vw] h-[80vh]'
+                : 'w-[640px] max-w-[90vw] max-h-[80vh]'
         }`}
       >
         {sheet.kind === 'settings' && <SettingsSheet />}
@@ -73,12 +77,88 @@ function SheetHeader({ title, onClose }: { title: string; onClose: () => void })
   );
 }
 
+type SettingsTab = 'general' | 'ai' | 'repos' | 'shortcuts';
+
+const SETTINGS_TABS: { id: SettingsTab; label: string; hint: string }[] = [
+  { id: 'general', label: 'General', hint: 'Theme, library' },
+  { id: 'ai', label: 'AI & Forges', hint: 'CLI integrations' },
+  { id: 'repos', label: 'Repos', hint: 'Default branches' },
+  { id: 'shortcuts', label: 'Shortcuts', hint: 'Keyboard' },
+];
+
 function SettingsSheet(): JSX.Element {
+  const setSheet = useStore((s) => s.setSheet);
+  const [tab, setTab] = useState<SettingsTab>('general');
+
+  return (
+    <div className="flex flex-col h-full min-h-0">
+      <div className="flex-shrink-0 flex items-center justify-between border-b border-card px-6 py-3.5">
+        <div>
+          <h2 className="text-base font-semibold leading-none">Settings</h2>
+          <p className="mt-1 text-[11px] text-ink-faint">
+            How overgit works · CLIs · Defaults · Shortcuts
+          </p>
+        </div>
+        <button
+          onClick={() => setSheet(null)}
+          className="text-ink-faint hover:text-ink rounded p-1.5 hover:bg-card"
+          aria-label="Close"
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+            <path d="M3 3l10 10M13 3L3 13" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+          </svg>
+        </button>
+      </div>
+
+      {/* Two-column body: tab rail on the left, scrollable content on
+          the right. Both columns share the modal's flex height; the
+          right side is the only one that scrolls. */}
+      <div className="flex-1 min-h-0 grid grid-cols-[180px_1fr] overflow-hidden">
+        <nav className="border-r border-card bg-card/30 px-2 py-3 overflow-y-auto">
+          {SETTINGS_TABS.map((t) => (
+            <button
+              key={t.id}
+              onClick={() => setTab(t.id)}
+              className={`w-full text-left px-3 py-2 rounded-md mb-0.5 ${
+                tab === t.id ? 'bg-accent text-white' : 'hover:bg-card text-ink-muted hover:text-ink'
+              }`}
+            >
+              <div className="text-[12px] font-semibold leading-tight">{t.label}</div>
+              <div
+                className={`text-[10px] mt-0.5 ${
+                  tab === t.id ? 'text-white/70' : 'text-ink-faint'
+                }`}
+              >
+                {t.hint}
+              </div>
+            </button>
+          ))}
+        </nav>
+
+        <div className="overflow-y-auto px-6 py-5">
+          {tab === 'general' && <SettingsGeneralPanel />}
+          {tab === 'ai' && <SettingsCliPanel />}
+          {tab === 'repos' && <SettingsReposPanel />}
+          {tab === 'shortcuts' && <SettingsShortcutsPanel />}
+        </div>
+      </div>
+
+      <div className="flex-shrink-0 flex items-center justify-end border-t border-card px-5 py-3">
+        <button
+          onClick={() => setSheet(null)}
+          className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong"
+        >
+          Done
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SettingsGeneralPanel(): JSX.Element {
   const settings = useStore((s) => s.settings);
-  const cli = useStore((s) => s.cliPresence);
   const repos = useStore((s) => s.repos);
   const workspaces = useStore((s) => s.workspaces);
-  const setSheet = useStore((s) => s.setSheet);
 
   const updateTheme = async (theme: 'light' | 'dark' | 'system') => {
     const next = { ...settings, theme };
@@ -88,111 +168,164 @@ function SettingsSheet(): JSX.Element {
   };
 
   return (
-    <>
-      <SheetHeader title="Settings" onClose={() => setSheet(null)} />
-      <div className="overflow-y-auto p-5 flex flex-col gap-6 text-sm">
-        <ProcessExplainer />
+    <div className="flex flex-col gap-6 text-sm">
+      <ProcessExplainer />
 
-        <Section
-          title="LLM CLIs (Review with AI)"
-          subtitle="Overgit pipes a diff into one of these CLIs in non-interactive mode and shows the response. Nothing leaves your machine via overgit — the CLI handles all auth and transport."
-        >
-          <ul className="text-xs flex flex-col gap-1.5">
-            <CliRow
-              name="claude"
-              present={cli?.claude}
-              purpose="Claude Code CLI · `claude -p -` reads prompt from stdin"
-            />
-            <CliRow
-              name="codex"
-              present={cli?.codex}
-              purpose="OpenAI Codex CLI · `codex exec --skip-git-repo-check -`"
-            />
-            <CliRow
-              name="gemini"
-              present={cli?.gemini}
-              purpose="Google Gemini CLI · `gemini -p -`"
-            />
-          </ul>
-        </Section>
+      <SettingsGroup
+        eyebrow="Display"
+        title="Theme"
+        subtitle="System follows your OS dark/light setting."
+      >
+        <div className="flex gap-2">
+          {(['system', 'light', 'dark'] as const).map((t) => (
+            <button
+              key={t}
+              onClick={() => updateTheme(t)}
+              className={`px-3 py-1.5 rounded-md border text-xs ${
+                settings.theme === t
+                  ? 'bg-accent text-white border-accent'
+                  : 'border-card hover:bg-card'
+              }`}
+            >
+              {t[0].toUpperCase() + t.slice(1)}
+            </button>
+          ))}
+        </div>
+      </SettingsGroup>
 
-        <Section
-          title="Forge CLIs"
-          subtitle="Used for PR / MR data and comments. Missing CLIs just hide their UI — they don't block anything else."
-        >
-          <ul className="text-xs flex flex-col gap-1.5">
-            <CliRow name="gh" present={cli?.gh} purpose="GitHub · PR list, comments, reviews" />
-            <CliRow name="glab" present={cli?.glab} purpose="GitLab MR list (planned)" />
-            <CliRow name="jj" present={cli?.jj} purpose="Jujutsu integration (planned)" />
-          </ul>
-        </Section>
+      <SettingsGroup
+        eyebrow="State"
+        title="Library"
+        subtitle="What overgit currently tracks. Nothing is written into your repos."
+      >
+        <div className="grid grid-cols-2 gap-2">
+          <Stat label="Repos" value={repos.length.toString()} />
+          <Stat label="Workspaces" value={workspaces.length.toString()} />
+        </div>
+      </SettingsGroup>
+    </div>
+  );
+}
 
-        {repos.length > 0 && (
-          <Section
-            title="Default branches"
-            subtitle="Each repo's trunk — the branch overgit treats as the base for compare/PR-base flows. Auto-detected from origin/HEAD when you add a repo; override here if your trunk differs."
-          >
-            <ul className="text-xs flex flex-col gap-1">
-              {repos.map((r) => (
-                <DefaultBranchRow key={r.id} repoId={r.id} />
-              ))}
-            </ul>
-          </Section>
-        )}
+function SettingsCliPanel(): JSX.Element {
+  const cli = useStore((s) => s.cliPresence);
+  return (
+    <div className="flex flex-col gap-6 text-sm">
+      <SettingsGroup
+        eyebrow="AI"
+        title="LLM CLIs"
+        subtitle="Overgit pipes a diff into one of these in non-interactive mode and shows the response. Nothing leaves your machine via overgit — each CLI handles its own auth and transport."
+      >
+        <ul className="flex flex-col">
+          <CliRow name="claude" present={cli?.claude} purpose="Claude Code · pipes prompt to claude -p -" />
+          <CliRow name="codex" present={cli?.codex} purpose="OpenAI Codex · codex exec --skip-git-repo-check -" />
+          <CliRow name="gemini" present={cli?.gemini} purpose="Google Gemini · gemini -p -" />
+        </ul>
+      </SettingsGroup>
 
-        <Section title="Keyboard shortcuts">
-          <ul className="text-xs flex flex-col gap-1 font-mono">
-            <ShortcutRow keys="⌘ ," what="Open settings" />
-            <ShortcutRow keys="⌘ \\" what="Toggle sidebar" />
-            <ShortcutRow keys="⌘ R" what="Refresh current pane" />
-            <ShortcutRow keys="⌘ B" what="Open branch picker (in a repo)" />
-            <ShortcutRow keys="⌘ N" what="New branch (in a workspace)" />
-            <ShortcutRow keys="⌘ 1 / 2 / 3 / 4" what="Repo tabs: Changes / History / Files / Graph" />
-            <ShortcutRow keys="↑ ↓ Enter" what="Navigate the branch picker" />
-            <ShortcutRow keys="⌘ S" what="Save the open file (in Files tab)" />
-          </ul>
-        </Section>
+      <SettingsGroup
+        eyebrow="Forge"
+        title="Review CLIs"
+        subtitle="Used for PR / MR data and comments. Missing CLIs just hide their UI."
+      >
+        <ul className="flex flex-col">
+          <CliRow name="gh" present={cli?.gh} purpose="GitHub · PR list, comments, reviews" />
+          <CliRow name="glab" present={cli?.glab} purpose="GitLab MR list (planned)" />
+          <CliRow name="jj" present={cli?.jj} purpose="Jujutsu integration (planned)" />
+        </ul>
+      </SettingsGroup>
+    </div>
+  );
+}
 
-        <Section title="Theme" subtitle="System follows your OS dark/light setting.">
-          <div className="flex gap-2">
-            {(['system', 'light', 'dark'] as const).map((t) => (
-              <button
-                key={t}
-                onClick={() => updateTheme(t)}
-                className={`px-3 py-1.5 rounded border text-xs ${
-                  settings.theme === t
-                    ? 'bg-accent text-white border-accent'
-                    : 'border-card hover:bg-card'
-                }`}
-              >
-                {t[0].toUpperCase() + t.slice(1)}
-              </button>
-            ))}
+function SettingsReposPanel(): JSX.Element {
+  const repos = useStore((s) => s.repos);
+  return (
+    <div className="flex flex-col gap-6 text-sm">
+      <SettingsGroup
+        eyebrow="Repos"
+        title="Default branches"
+        subtitle="Each repo's trunk — the branch overgit treats as the base for compare/PR-base and as the recovery target during a workspace sync-and-branch. Auto-detected from origin/HEAD on add."
+      >
+        {repos.length === 0 ? (
+          <div className="text-[11px] text-ink-faint p-3 rounded border border-card bg-card">
+            No repos yet. Add one from the sidebar to configure its default branch.
           </div>
-        </Section>
-
-        <Section title="Library" subtitle="Where overgit's overlay state lives.">
-          <ul className="text-xs flex flex-col gap-1">
-            <li>
-              <span className="text-ink-faint">Repos: </span>
-              <span className="font-mono">{repos.length}</span>
-            </li>
-            <li>
-              <span className="text-ink-faint">Workspaces: </span>
-              <span className="font-mono">{workspaces.length}</span>
-            </li>
+        ) : (
+          <ul className="flex flex-col gap-1.5">
+            {repos.map((r) => (
+              <DefaultBranchRow key={r.id} repoId={r.id} />
+            ))}
           </ul>
-        </Section>
+        )}
+      </SettingsGroup>
+    </div>
+  );
+}
+
+function SettingsShortcutsPanel(): JSX.Element {
+  return (
+    <div className="flex flex-col gap-6 text-sm">
+      <SettingsGroup
+        eyebrow="Input"
+        title="Keyboard shortcuts"
+        subtitle="Inputs and textareas are skipped for alphabetic shortcuts so typing isn't intercepted; ⌘K and number-tabs always fire."
+      >
+        <ul className="grid grid-cols-1 gap-y-1.5 font-mono text-[11px]">
+          <ShortcutRow keys="⌘ K" what="Command palette (switch / create branch, jump to repo, file)" />
+          <ShortcutRow keys="⌘ ," what="Open settings" />
+          <ShortcutRow keys="⌘ \\" what="Toggle sidebar" />
+          <ShortcutRow keys="⌘ R" what="Refresh current pane" />
+          <ShortcutRow keys="⌘ B" what="Branch picker (in a repo)" />
+          <ShortcutRow keys="⌘ N" what="New branch (in a workspace)" />
+          <ShortcutRow keys="⌘ 1 – 4" what="Changes / History / Files / Graph" />
+          <ShortcutRow keys="⌘ S" what="Save open file" />
+          <ShortcutRow keys="↑ ↓ ⏎" what="Navigate picker / palette" />
+        </ul>
+      </SettingsGroup>
+    </div>
+  );
+}
+
+function SettingsGroup({
+  eyebrow,
+  title,
+  subtitle,
+  children,
+}: {
+  eyebrow: string;
+  title: string;
+  subtitle?: string;
+  children: React.ReactNode;
+}): JSX.Element {
+  return (
+    <section>
+      <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-accent">
+        {eyebrow}
       </div>
-    </>
+      <div className="mt-0.5 text-[13px] font-semibold text-ink leading-tight">{title}</div>
+      {subtitle && (
+        <div className="mt-1 text-[11px] leading-snug text-ink-faint mb-2">{subtitle}</div>
+      )}
+      <div className="mt-2 min-w-0">{children}</div>
+    </section>
+  );
+}
+
+function Stat({ label, value }: { label: string; value: string }): JSX.Element {
+  return (
+    <div className="rounded-lg border border-card bg-card/40 px-3 py-2">
+      <div className="text-[10px] uppercase tracking-wide text-ink-faint">{label}</div>
+      <div className="text-lg font-mono leading-tight">{value}</div>
+    </div>
   );
 }
 
 function ShortcutRow({ keys, what }: { keys: string; what: string }): JSX.Element {
   return (
     <li className="flex justify-between items-baseline gap-3">
-      <span className="text-ink-muted">{keys}</span>
-      <span className="text-ink-faint flex-1 text-right font-sans">{what}</span>
+      <span className="text-ink min-w-[68px]">{keys}</span>
+      <span className="text-ink-faint flex-1 font-sans">{what}</span>
     </li>
   );
 }
@@ -257,37 +390,51 @@ function DefaultBranchRow({ repoId }: { repoId: UUID }): JSX.Element {
 }
 
 function ProcessExplainer(): JSX.Element {
+  const steps = [
+    {
+      title: 'Add a repo',
+      body:
+        'Overgit records the path in its own store. Your repo on disk is untouched — we never write inside .git.',
+    },
+    {
+      title: 'Group into a workspace',
+      body:
+        'A workspace is a named list of repo IDs. No symlinks, no synthetic root — just a coordinator that fans operations out.',
+    },
+    {
+      title: 'Run plain git',
+      body:
+        'Every action (status, fetch, checkout, push) is the equivalent shell command in the repo\'s existing directory.',
+    },
+    {
+      title: 'CLIs handle reviews',
+      body:
+        'gh, glab, jj for forges. claude, codex, gemini for AI review. Features appear only when the CLI is installed.',
+    },
+  ];
   return (
-    <section className="p-4 rounded-lg border border-accent/40 bg-accent/5">
-      <h3 className="text-xs uppercase tracking-wide text-accent mb-2">How overgit works</h3>
-      <ol className="text-xs text-ink-muted flex flex-col gap-2 list-decimal pl-4">
-        <li>
-          <strong className="text-ink">Add a repo.</strong> Overgit records the path in
-          its own store. Your repo on disk is untouched — overgit never writes to
-          <span className="font-mono"> .git</span> metadata.
-        </li>
-        <li>
-          <strong className="text-ink">Group repos into a workspace.</strong> A workspace
-          is just a named list of repo IDs. No symlinks, no synthetic root, no
-          junctions — just a coordinator that fans operations out.
-        </li>
-        <li>
-          <strong className="text-ink">Run actions.</strong> Every git operation
-          (status, fetch, checkout, push) is the equivalent shell command run in
-          the repo's existing directory. Anything you'd see in a terminal, you
-          see here.
-        </li>
-        <li>
-          <strong className="text-ink">CLIs handle reviews.</strong> Where it makes
-          sense, overgit shells out to <span className="font-mono">gh</span>,
-          <span className="font-mono"> glab</span>, or
-          <span className="font-mono"> jj</span> instead of rebuilding API clients.
-          The features show up only when the CLI is installed.
-        </li>
+    <section className="rounded-xl border border-accent/40 bg-gradient-to-br from-accent/10 to-transparent p-4">
+      <div className="flex items-center gap-2">
+        <span className="text-[10px] font-semibold uppercase tracking-[0.14em] text-accent">
+          How overgit works
+        </span>
+        <div className="h-px flex-1 bg-accent/20" />
+      </div>
+      <ol className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+        {steps.map((s, i) => (
+          <li key={s.title} className="flex gap-2.5">
+            <span className="mt-0.5 inline-flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-accent/20 text-[10px] font-mono font-semibold text-accent">
+              {i + 1}
+            </span>
+            <div className="min-w-0">
+              <div className="text-[12px] font-semibold text-ink">{s.title}</div>
+              <div className="text-[11px] leading-snug text-ink-muted">{s.body}</div>
+            </div>
+          </li>
+        ))}
       </ol>
-      <p className="text-[11px] text-ink-faint mt-3">
-        This means you can stop using overgit at any time and your repos behave
-        exactly the same in any other tool.
+      <p className="mt-3 text-[11px] text-ink-faint border-t border-accent/15 pt-2.5">
+        Stop using overgit at any time and your repos behave the same in any other tool.
       </p>
     </section>
   );
@@ -303,16 +450,34 @@ function CliRow({
   purpose: string;
 }): JSX.Element {
   return (
-    <li className="flex items-center gap-3">
-      <span className="font-mono w-12">{name}</span>
-      {present === undefined ? (
-        <span className="text-ink-faint text-[10px] uppercase">probing…</span>
-      ) : present ? (
-        <span className="text-emerald-400 text-[10px] uppercase">installed</span>
-      ) : (
-        <span className="text-ink-faint text-[10px] uppercase">missing</span>
-      )}
-      <span className="text-ink-faint">{purpose}</span>
+    <li className="flex items-center gap-3 py-1.5 border-b border-card last:border-0">
+      <span
+        className={`inline-block h-1.5 w-1.5 rounded-full flex-shrink-0 ${
+          present === undefined
+            ? 'bg-ink-faint'
+            : present
+              ? 'bg-emerald-400'
+              : 'bg-ink-faint/40'
+        }`}
+        title={
+          present === undefined ? 'probing…' : present ? 'installed' : 'not installed'
+        }
+      />
+      <span className={`font-mono text-xs w-16 ${present ? 'text-ink' : 'text-ink-faint'}`}>
+        {name}
+      </span>
+      <span className="text-[11px] text-ink-muted truncate flex-1">{purpose}</span>
+      <span
+        className={`text-[10px] uppercase tracking-wide font-mono ${
+          present === undefined
+            ? 'text-ink-faint'
+            : present
+              ? 'text-emerald-400'
+              : 'text-ink-faint'
+        }`}
+      >
+        {present === undefined ? '…' : present ? 'ready' : 'missing'}
+      </span>
     </li>
   );
 }
@@ -350,26 +515,207 @@ function applyTheme(theme: 'light' | 'dark' | 'system'): void {
   }
 }
 
+/// About sheet — designed as a real product page, not a "v0.1.0" stub.
+/// Hero with mark + tagline, three pillars explaining the value, a
+/// features grid, footer with credits and a GitHub link. Patterned on
+/// overcli's About so the two siblings feel related.
+const ABOUT_PILLARS = [
+  {
+    color: '#8a78ff',
+    kicker: 'Coordinate',
+    title: 'Workspaces, not single repos.',
+    body:
+      'Group polyrepo services into one workspace and switch them onto the same branch in one go. Status, PRs, and pull/push fan out across every member.',
+  },
+  {
+    color: '#5eead4',
+    kicker: 'Overlay',
+    title: 'No metadata in your repo.',
+    body:
+      'Overgit never writes inside .git. Every action runs as a plain git command in the repo\'s existing directory — stop using overgit any time and nothing changes.',
+  },
+  {
+    color: '#fbbf24',
+    kicker: 'AI in the loop',
+    title: 'Review and commit faster.',
+    body:
+      'Pipe a diff to claude, codex, or gemini for a quick review. Have an LLM CLI draft your commit message from the staged diff. Uses your existing CLI auth.',
+  },
+] as const;
+
+const ABOUT_FEATURES = [
+  { title: 'Workspace-wide branching', body: 'Sync to default → pull → branch, across N repos at once.' },
+  { title: 'Branch picker + cherry-pick', body: 'Searchable popover, ↑↓/Enter, per-branch commit picker.' },
+  { title: 'AI review & suggest', body: 'claude / codex / gemini on the staged or working diff.' },
+  { title: 'File editor', body: 'Syntax-highlighted, sandboxed to registered repos.' },
+  { title: 'Branch graph', body: 'Per-lane colored visualization with ref labels.' },
+  { title: 'Cmd+K palette', body: 'Branches, files, repos, workspaces, actions — one keystroke.' },
+] as const;
+
 function AboutSheet(): JSX.Element {
   const setSheet = useStore((s) => s.setSheet);
+  // Wrapper must fill the modal AND allow its children to shrink, or
+  // the inner `overflow-y-auto` body has no constrained height to
+  // scroll within. `h-full min-h-0 flex flex-col` is the recipe: fill,
+  // don't grow, become a flex parent for header/body/footer.
   return (
-    <>
-      <SheetHeader title="About overgit" onClose={() => setSheet(null)} />
-      <div className="p-6 text-sm flex flex-col gap-3">
-        <div>
-          <div className="text-base font-semibold">overgit</div>
-          <div className="text-xs text-ink-faint">v0.1.0 · workspace-overlay git client</div>
+    <div className="flex flex-col h-full min-h-0">
+      <div className="relative overflow-hidden border-b border-card bg-gradient-to-b from-accent/18 via-accent/6 to-transparent px-7 pt-7 pb-7 flex-shrink-0">
+        <div className="pointer-events-none absolute -right-24 -top-24 h-64 w-64 rounded-full bg-accent/15 blur-3xl" />
+        <div className="pointer-events-none absolute -left-16 -bottom-20 h-48 w-48 rounded-full bg-accent/8 blur-3xl" />
+
+        <div className="relative flex items-start gap-5">
+          <AppMark />
+          <div className="min-w-0 flex-1 pt-1">
+            <div className="flex items-baseline gap-3">
+              <div className="text-[30px] font-bold leading-none tracking-tight text-ink">overgit</div>
+              <div className="rounded-full border border-card bg-card/60 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider text-ink-muted">
+                v0.1.0
+              </div>
+            </div>
+            <div className="mt-2.5 text-sm leading-snug text-ink-muted">
+              A workspace-overlay git client. Coordinate many repos at once
+              without owning their state.
+            </div>
+          </div>
         </div>
-        <p className="text-ink-muted">
-          A desktop git client that coordinates many repos at once without owning
-          their state. Workspaces fan operations out to standalone repositories;
-          everything you do in overgit lands as plain git commands.
-        </p>
-        <p className="text-xs text-ink-faint">
-          Built with Electron, React, and Tailwind. Sibling project of overcli.
-        </p>
       </div>
-    </>
+
+      <div className="flex-1 min-h-0 overflow-y-auto px-7 py-5">
+        <SectionLabel>Why overgit</SectionLabel>
+        <div className="mt-3 flex flex-col gap-2">
+          {ABOUT_PILLARS.map((p, i) => (
+            <PillarRow key={p.title} index={i + 1} {...p} />
+          ))}
+        </div>
+
+        <SectionLabel className="mt-6">What's in the box</SectionLabel>
+        <div className="mt-3 grid grid-cols-2 gap-2">
+          {ABOUT_FEATURES.map((f) => (
+            <FeatureRow key={f.title} title={f.title} body={f.body} />
+          ))}
+        </div>
+
+        <div className="mt-6 flex items-center justify-between rounded-xl border border-card bg-card/40 px-4 py-3 text-xs">
+          <div>
+            <div className="font-semibold text-ink">Sibling of overcli.</div>
+            <div className="mt-0.5 text-ink-muted">
+              Apache-2.0 · feedback welcome.
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 text-[11px] text-ink-faint">
+            <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-400/80" />
+            No API keys collected
+          </div>
+        </div>
+      </div>
+
+      <div className="flex-shrink-0 flex items-center gap-2 border-t border-card px-5 py-3 text-[11px]">
+        <span className="text-ink-faint">
+          Shells out to git, gh, claude, codex, gemini — uses your existing CLIs.
+        </span>
+        <div className="flex-1" />
+        <a
+          href="https://github.com/lionelfarr/overgit"
+          target="_blank"
+          rel="noreferrer"
+          className="rounded px-2 py-1 text-ink-muted hover:bg-card hover:text-ink"
+        >
+          GitHub
+        </a>
+        <button
+          onClick={() => setSheet(null)}
+          className="rounded bg-accent px-3 py-1 font-medium text-white hover:bg-accent-strong"
+        >
+          Done
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function AppMark(): JSX.Element {
+  return (
+    <div className="relative flex h-[80px] w-[80px] items-center justify-center rounded-[20px] border border-card bg-gradient-to-br from-accent/55 via-accent/20 to-accent/5 shadow-[0_12px_24px_rgba(0,0,0,0.28)] flex-shrink-0">
+      <div className="absolute inset-[5px] rounded-[15px] border border-ink/5 bg-surface/30" />
+      <svg width="42" height="42" viewBox="0 0 42 42" fill="none" className="relative">
+        {/* Stylized branch glyph: trunk + fork. Reads as "git" without
+            being literal. White-on-purple keeps it punchy in dark mode. */}
+        <circle cx="13" cy="11" r="3.5" stroke="currentColor" strokeWidth="2.5" className="text-ink" />
+        <circle cx="13" cy="31" r="3.5" stroke="currentColor" strokeWidth="2.5" className="text-ink" />
+        <circle cx="29" cy="21" r="3.5" stroke="currentColor" strokeWidth="2.5" className="text-ink" />
+        <path d="M13 14.5 V 27.5" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" className="text-ink" />
+        <path
+          d="M13 21 Q 21 21 25.5 21"
+          stroke="currentColor"
+          strokeWidth="2.5"
+          strokeLinecap="round"
+          className="text-ink"
+        />
+      </svg>
+    </div>
+  );
+}
+
+function SectionLabel({
+  children,
+  className = '',
+}: {
+  children: React.ReactNode;
+  className?: string;
+}): JSX.Element {
+  return (
+    <div className={`flex items-center gap-2 ${className}`}>
+      <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-ink-faint">
+        {children}
+      </div>
+      <div className="h-px flex-1 bg-card" />
+    </div>
+  );
+}
+
+function PillarRow({
+  index,
+  color,
+  kicker,
+  title,
+  body,
+}: {
+  index: number;
+  color: string;
+  kicker: string;
+  title: string;
+  body: string;
+}): JSX.Element {
+  return (
+    <div
+      className="relative overflow-hidden rounded-xl border border-card bg-gradient-to-br from-card to-card/30 px-4 py-3 transition-colors hover:border-card"
+      style={{ boxShadow: `inset 0 1px 0 ${color}20` }}
+    >
+      <div
+        className="pointer-events-none absolute -right-12 -top-12 h-32 w-32 rounded-full blur-3xl"
+        style={{ backgroundColor: `${color}1a` }}
+      />
+      <div className="relative">
+        <span
+          className="inline-flex h-5 items-center rounded-full px-2 text-[10px] font-semibold uppercase tracking-[0.14em]"
+          style={{ backgroundColor: `${color}24`, color }}
+        >
+          {String(index).padStart(2, '0')} · {kicker}
+        </span>
+        <div className="mt-1.5 text-[14px] font-semibold leading-tight text-ink">{title}</div>
+        <div className="mt-1 text-[12px] leading-[1.5] text-ink-muted">{body}</div>
+      </div>
+    </div>
+  );
+}
+
+function FeatureRow({ title, body }: { title: string; body: string }): JSX.Element {
+  return (
+    <div className="rounded-lg border border-card bg-card/30 px-3 py-2.5">
+      <div className="text-[12px] font-semibold text-ink">{title}</div>
+      <div className="mt-0.5 text-[11px] leading-snug text-ink-muted">{body}</div>
+    </div>
   );
 }
 
@@ -420,7 +766,7 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
         title={editing ? `Edit workspace · ${editing.name}` : 'New workspace'}
         onClose={() => setSheet(null)}
       />
-      <div className="p-5 flex flex-col gap-4 text-sm overflow-y-auto">
+      <div className="flex-1 min-h-0 p-5 flex flex-col gap-4 text-sm overflow-y-auto">
         <label className="flex flex-col gap-1">
           <span className="text-xs uppercase tracking-wide text-ink-faint">Name</span>
           <input
@@ -754,7 +1100,7 @@ function WorkspaceBranchSheet({ workspaceId }: { workspaceId: UUID }): JSX.Eleme
         title={`New branch · ${ws?.name ?? ''}`}
         onClose={() => setSheet(null)}
       />
-      <div className="p-5 flex flex-col gap-4 text-sm overflow-y-auto">
+      <div className="flex-1 min-h-0 p-5 flex flex-col gap-4 text-sm overflow-y-auto">
         <label className="flex flex-col gap-1">
           <span className="text-[10px] uppercase tracking-wide text-ink-faint">
             Branch name
