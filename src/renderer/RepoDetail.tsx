@@ -229,6 +229,16 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
   const cli = useStore((s) => s.cliPresence);
   const setSheet = useStore((s) => s.setSheet);
   const openRepoFile = useStore((s) => s.openRepoFile);
+  const stashFilesAction = useStore((s) => s.stashFiles);
+
+  // Stashing prompts inline via the FileGroup bar (Electron renderers
+  // refuse window.prompt). The message is optional — empty string ⇒
+  // git uses its default "WIP on <branch>" subject.
+  const onStash = async (paths: string[], message?: string) => {
+    if (paths.length === 0) return;
+    const res = await stashFilesAction(repoId, paths, message);
+    if (!res.ok) alert(res.error ?? 'Stash failed');
+  };
 
   // "View" handler shared by both groups: switch to the Files tab and
   // open the absolute path. ChangedFile.path is repo-relative, so we
@@ -372,10 +382,21 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
           onSetAllChecked={(all) =>
             setStagedChecked(all ? new Set(staged.map((f) => f.path)) : new Set())
           }
-          bulkPrimary={{
-            label: 'Unstage selected',
-            onAction: (paths) => unstage(repoId, paths),
-          }}
+          bulkActions={[
+            {
+              label: 'Unstage',
+              glyph: ICON_UNSTAGE,
+              tone: 'primary',
+              onAction: (paths) => unstage(repoId, paths),
+            },
+            {
+              label: 'Stash',
+              glyph: ICON_STASH,
+              kind: 'with-message',
+              messagePlaceholder: 'Stash message (optional)…',
+              onAction: (paths, message) => onStash(paths, message),
+            },
+          ]}
         />
         <FileGroup
           title="Changes"
@@ -391,25 +412,37 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
           onSetAllChecked={(all) =>
             setUnstagedChecked(all ? new Set(unstaged.map((f) => f.path)) : new Set())
           }
-          bulkPrimary={{
-            label: 'Stage selected',
-            onAction: (paths) => stage(repoId, paths),
-          }}
-          bulkSecondary={{
-            label: 'Discard selected',
-            tone: 'danger',
-            onAction: (paths) => {
-              if (
-                !window.confirm(
-                  `Discard changes in ${paths.length} ${
-                    paths.length === 1 ? 'file' : 'files'
-                  }? This cannot be undone.`,
-                )
-              )
-                return;
-              void discard(repoId, paths);
+          bulkActions={[
+            {
+              label: 'Stage',
+              glyph: ICON_STAGE,
+              tone: 'primary',
+              onAction: (paths) => stage(repoId, paths),
             },
-          }}
+            {
+              label: 'Stash',
+              glyph: ICON_STASH,
+              kind: 'with-message',
+              messagePlaceholder: 'Stash message (optional)…',
+              onAction: (paths, message) => onStash(paths, message),
+            },
+            {
+              label: 'Discard',
+              glyph: ICON_DISCARD,
+              tone: 'danger',
+              onAction: (paths) => {
+                if (
+                  !window.confirm(
+                    `Discard changes in ${paths.length} ${
+                      paths.length === 1 ? 'file' : 'files'
+                    }? This cannot be undone.`,
+                  )
+                )
+                  return;
+                void discard(repoId, paths);
+              },
+            },
+          ]}
         />
 
         <div className="mt-auto p-3 border-t border-card flex flex-col gap-2">
@@ -630,6 +663,23 @@ function Spinner(): JSX.Element {
   );
 }
 
+interface BulkAction {
+  /// Short label, used in the visible button.
+  label: string;
+  /// Optional inline svg glyph; renders left of the label so the bar
+  /// reads at a glance even when collapsed to icon-only on tight widths.
+  glyph?: React.ReactNode;
+  tone?: 'primary' | 'neutral' | 'danger';
+  /// "with-message": clicking the button opens an inline message
+  /// input on the bulk bar instead of running immediately. Used by
+  /// Stash so the user can label the entry. Default is "fire on click."
+  kind?: 'fire' | 'with-message';
+  /// Placeholder shown in the inline message input. Ignored unless
+  /// `kind: 'with-message'`.
+  messagePlaceholder?: string;
+  onAction: (paths: string[], message?: string) => void;
+}
+
 function FileGroup({
   title,
   files,
@@ -642,8 +692,7 @@ function FileGroup({
   checked,
   onToggleChecked,
   onSetAllChecked,
-  bulkPrimary,
-  bulkSecondary,
+  bulkActions,
 }: {
   title: string;
   files: ChangedFile[];
@@ -651,46 +700,48 @@ function FileGroup({
   actionLabel: string;
   onAction: (file: ChangedFile) => void;
   onSelect: (file: ChangedFile) => void;
-  /// Side-quest action: jump to the Files tab with this path open in
-  /// the editor. Hidden for files git considers `D` (deleted) since
-  /// there's nothing on disk to view.
   onView?: (file: ChangedFile) => void;
   extraAction?: { label: string; onAction: (file: ChangedFile) => void };
-  /// Multi-select state for the bulk-action toolbar. The set of paths
-  /// the user has checked; empty when nothing's selected.
   checked: Set<string>;
   onToggleChecked: (path: string) => void;
-  /// All-or-nothing select toggle exposed via the header checkbox.
-  /// Caller decides what "all" means for its slice (typically all
-  /// visible files in this group).
   onSetAllChecked: (all: boolean) => void;
-  /// Primary bulk action — Stage / Unstage. Visible only when there's
-  /// at least one checked path.
-  bulkPrimary: { label: string; onAction: (paths: string[]) => void };
-  /// Optional secondary bulk action — used by the unstaged group for
-  /// Discard. `tone: 'danger'` styles the button red so the user sees
-  /// it's destructive.
-  bulkSecondary?: {
-    label: string;
-    tone?: 'danger';
-    onAction: (paths: string[]) => void;
-  };
+  /// Bulk actions shown in the slide-down toolbar that appears when at
+  /// least one file is selected. Order matters — first one is rendered
+  /// in primary color so the most-likely action sits on the left.
+  bulkActions: BulkAction[];
 }): JSX.Element {
   const checkedCount = files.reduce((n, f) => (checked.has(f.path) ? n + 1 : n), 0);
   const allChecked = files.length > 0 && checkedCount === files.length;
   const someChecked = checkedCount > 0;
   const checkedPaths = files.filter((f) => checked.has(f.path)).map((f) => f.path);
 
+  // Inline-message mode for actions that ask for one (Stash). When
+  // non-null, the bulk bar transforms into a single-line input + Save
+  // / Cancel pair instead of the action buttons.
+  const [pending, setPending] = useState<BulkAction | null>(null);
+  const [pendingMsg, setPendingMsg] = useState('');
+  // Selection changes (e.g. apply/stage drained the group) should
+  // dismiss the pending input — otherwise the bar shows an input for
+  // an action whose target paths just disappeared.
+  useEffect(() => {
+    if (!someChecked && pending) {
+      setPending(null);
+      setPendingMsg('');
+    }
+  }, [someChecked, pending]);
+
   return (
     <div className="border-b border-card">
+      {/* Static title row — uncluttered, keeps the visual hierarchy
+          stable as the selection toggles. The select-all checkbox
+          stays here because it's the entry point into multi-select. */}
       <div className="flex items-center gap-2 px-3 py-2 bg-card">
         <input
           type="checkbox"
           checked={allChecked}
-          // `indeterminate` isn't a standard React prop; assign it via
-          // ref so the header tri-state matches what the user has
-          // selected (e.g. "some staged, not all").
           ref={(el) => {
+            // `indeterminate` isn't a React-prop; set it via ref so the
+            // tri-state on the header matches the user's selection.
             if (el) el.indeterminate = someChecked && !allChecked;
           }}
           onChange={(e) => onSetAllChecked(e.target.checked)}
@@ -700,36 +751,99 @@ function FileGroup({
         />
         <div className="text-[10px] uppercase tracking-wide text-ink-faint">
           {title} <span className="text-ink-faint">({files.length})</span>
-          {someChecked && (
-            <span className="text-accent normal-case ml-2">
-              {checkedCount} selected
-            </span>
+        </div>
+      </div>
+
+      {/* Bulk-action bar — separate row that only renders when there's
+          a selection. Single-purpose row means the buttons can size
+          themselves without competing with the title for width.
+          `flex-nowrap` + `min-w-0` on each region keep the row on one
+          line; the pill carries the count so per-button counts are
+          dropped below to prevent the cramped two-line wrap. */}
+      {someChecked && (
+        <div className="flex flex-nowrap items-center gap-2 px-3 py-1.5 bg-accent/10 border-b border-accent/20">
+          {pending ? (
+            <>
+              <span className="text-[11px] font-medium text-accent whitespace-nowrap inline-flex items-center gap-1 flex-shrink-0">
+                <span className="font-mono">{checkedCount}</span>
+                <span>·</span>
+                <span>{pending.label}</span>
+              </span>
+              <input
+                autoFocus
+                value={pendingMsg}
+                onChange={(e) => setPendingMsg(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    pending.onAction(checkedPaths, pendingMsg.trim() || undefined);
+                    setPending(null);
+                    setPendingMsg('');
+                  } else if (e.key === 'Escape') {
+                    setPending(null);
+                    setPendingMsg('');
+                  }
+                }}
+                placeholder={pending.messagePlaceholder ?? 'Optional message…'}
+                className="field flex-1 min-w-0 px-2 py-1 text-[11px]"
+              />
+              <button
+                onClick={() => {
+                  pending.onAction(checkedPaths, pendingMsg.trim() || undefined);
+                  setPending(null);
+                  setPendingMsg('');
+                }}
+                className="text-[11px] h-7 px-2.5 rounded-md bg-accent text-white hover:bg-accent-strong border border-accent flex-shrink-0"
+              >
+                {pending.label}
+              </button>
+              <button
+                onClick={() => {
+                  setPending(null);
+                  setPendingMsg('');
+                }}
+                className="text-[11px] w-7 h-7 rounded text-ink-muted hover:bg-card hover:text-ink flex items-center justify-center flex-shrink-0"
+                title="Cancel"
+                aria-label="Cancel"
+              >
+                ✕
+              </button>
+            </>
+          ) : (
+            <>
+              <span className="text-[11px] font-medium text-accent whitespace-nowrap min-w-0 inline-flex items-center gap-1">
+                <span className="font-mono">{checkedCount}</span>
+                <span>selected</span>
+              </span>
+              <div className="flex flex-nowrap items-center gap-1 ml-auto">
+                {bulkActions.map((a, i) => (
+                  <BulkActionButton
+                    key={a.label}
+                    action={a}
+                    paths={checkedPaths}
+                    emphasis={a.tone ?? (i === 0 ? 'primary' : 'neutral')}
+                    onClick={() => {
+                      if (a.kind === 'with-message') {
+                        setPending(a);
+                        setPendingMsg('');
+                      } else {
+                        a.onAction(checkedPaths);
+                      }
+                    }}
+                  />
+                ))}
+                <button
+                  onClick={() => onSetAllChecked(false)}
+                  className="text-[11px] w-7 h-7 rounded text-ink-muted hover:bg-card hover:text-ink flex items-center justify-center flex-shrink-0"
+                  title="Clear selection"
+                  aria-label="Clear selection"
+                >
+                  ✕
+                </button>
+              </div>
+            </>
           )}
         </div>
-        <div className="flex-1" />
-        {someChecked && (
-          <div className="flex gap-1">
-            <button
-              onClick={() => bulkPrimary.onAction(checkedPaths)}
-              className="text-[11px] px-2.5 py-0.5 rounded bg-accent text-white hover:bg-accent-strong"
-            >
-              {bulkPrimary.label} ({checkedCount})
-            </button>
-            {bulkSecondary && (
-              <button
-                onClick={() => bulkSecondary.onAction(checkedPaths)}
-                className={`text-[11px] px-2.5 py-0.5 rounded border ${
-                  bulkSecondary.tone === 'danger'
-                    ? 'border-red-500/40 text-red-300 hover:bg-red-500/10'
-                    : 'border-card hover:bg-surface-elevated'
-                }`}
-              >
-                {bulkSecondary.label} ({checkedCount})
-              </button>
-            )}
-          </div>
-        )}
-      </div>
+      )}
       {files.length === 0 ? (
         <div className="px-3 py-2 text-xs text-ink-faint">No files.</div>
       ) : (
@@ -815,6 +929,75 @@ function FileGroup({
 /// emphasis (smaller, faint), which is the GitHub Desktop / VS Code
 /// convention. Renames show the original→new in the same shape on the
 /// title attribute already; the body just shows the new filename.
+/// Tone-aware bulk-action button used inside the FileGroup's
+/// slide-down bar. Three tones: `primary` (accent fill, used for the
+/// most likely action), `neutral` (subtle border, used for siblings
+/// like Stash), `danger` (red border for Discard). All three share the
+/// same height so the bar stays a clean horizontal line on any width.
+function BulkActionButton({
+  action,
+  paths,
+  emphasis,
+  onClick,
+}: {
+  action: BulkAction;
+  paths: string[];
+  emphasis: 'primary' | 'neutral' | 'danger';
+  /// Caller owns dispatch — it may swap the bar into a message-input
+  /// mode for `kind: 'with-message'` actions instead of firing onAction
+  /// straight away. Defaults to `action.onAction(paths)` when omitted.
+  onClick?: () => void;
+}): JSX.Element {
+  const cls =
+    emphasis === 'primary'
+      ? 'bg-accent text-white hover:bg-accent-strong border border-accent'
+      : emphasis === 'danger'
+        ? 'border border-red-500/40 text-red-300 hover:bg-red-500/10'
+        : 'border border-card text-ink hover:bg-card';
+  return (
+    <button
+      onClick={() => (onClick ? onClick() : action.onAction(paths))}
+      className={`text-[11px] h-7 px-2 rounded-md inline-flex items-center gap-1 whitespace-nowrap flex-shrink-0 ${cls}`}
+      title={`${action.label} ${paths.length}`}
+    >
+      {action.glyph}
+      <span>{action.label}</span>
+    </button>
+  );
+}
+
+const ICON_STAGE = (
+  <svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <path
+      d="M8 3v10M3 8h10"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      strokeLinecap="round"
+    />
+  </svg>
+);
+const ICON_UNSTAGE = (
+  <svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <path d="M3 8h10" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+  </svg>
+);
+const ICON_STASH = (
+  <svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <rect x="2.5" y="6" width="11" height="6" rx="1" stroke="currentColor" strokeWidth="1.4" />
+    <path d="M5 4h6" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+  </svg>
+);
+const ICON_DISCARD = (
+  <svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <path
+      d="M5 5l6 6M11 5l-6 6"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      strokeLinecap="round"
+    />
+  </svg>
+);
+
 function PathLabel({
   path,
   origPath,

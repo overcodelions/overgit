@@ -347,6 +347,29 @@ export async function stash(
   return { ok: false, error: res.stderr.trim() || `git exited ${res.code}` };
 }
 
+/// Path-scoped stash. `git stash push --include-untracked -- <paths>`
+/// stashes only the listed paths (tracked or untracked) and leaves the
+/// rest of the working tree alone — that's what the bulk-action bar's
+/// "Stash" affordance needs. We pass paths after `--` so they can't be
+/// misread as flags, and reject empties so an accidental zero-arg call
+/// doesn't end up stashing the whole tree.
+export async function stashFiles(
+  repoPath: string,
+  paths: string[],
+  message?: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  if (paths.length === 0) {
+    return { ok: false, error: 'No files selected' };
+  }
+  const args = ['stash', 'push', '--include-untracked'];
+  if (message?.trim()) args.push('-m', message.trim());
+  args.push('--', ...paths);
+  const res = await run(repoPath, args);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git exited ${res.code}` };
+}
+
 /// Enumerate the user's stash entries. We pull the structured fields
 /// (sha, branch, subject, date) via `--pretty=format` rather than
 /// parsing the human-readable `git stash list` output, which mixes the

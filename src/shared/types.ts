@@ -253,6 +253,11 @@ export interface IPCInvokeMap {
   /// the working tree vs HEAD (staged + unstaged combined).
   'repo:diff': (args: { repoId: UUID; sha?: string }) => FileDiff[];
   'repo:stash': (args: { repoId: UUID; message?: string }) => { ok: boolean; error?: string };
+  'repo:stashFiles': (args: {
+    repoId: UUID;
+    paths: string[];
+    message?: string;
+  }) => { ok: boolean; error?: string };
   'repo:commitAll': (args: { repoId: UUID; message: string }) => { ok: boolean; error?: string };
   'repo:retryCheckout': (args: {
     repoId: UUID;
