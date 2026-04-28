@@ -74,6 +74,8 @@ export async function status(
       repoId,
       branch: null,
       dirtyCount: 0,
+      worktreeAdds: null,
+      worktreeDels: null,
       ahead: null,
       behind: null,
       aheadDefault: null,
@@ -174,10 +176,35 @@ export async function status(
     }
   }
 
+  // Working-tree +/- totals vs HEAD. `--shortstat` is one line:
+  //   " 5 files changed, 47 insertions(+), 12 deletions(-)"
+  // Either insertion or deletion clause can be missing — we parse
+  // each independently and default to 0 when absent. Untracked files
+  // aren't included; that's `git diff` semantics, not a bug.
+  let worktreeAdds: number | null = null;
+  let worktreeDels: number | null = null;
+  if (branch) {
+    const shortstat = await run(repoPath, ['diff', '--shortstat', 'HEAD']);
+    if (shortstat.ok) {
+      const out = shortstat.stdout;
+      const ins = out.match(/(\d+)\s+insertion/);
+      const del = out.match(/(\d+)\s+deletion/);
+      if (ins || del) {
+        worktreeAdds = ins ? Number.parseInt(ins[1], 10) : 0;
+        worktreeDels = del ? Number.parseInt(del[1], 10) : 0;
+      } else if (/files? changed/.test(out)) {
+        worktreeAdds = 0;
+        worktreeDels = 0;
+      }
+    }
+  }
+
   return {
     repoId,
     branch,
     dirtyCount,
+    worktreeAdds,
+    worktreeDels,
     ahead,
     behind,
     aheadDefault,

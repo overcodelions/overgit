@@ -41,6 +41,13 @@ export interface RepoStatus {
   branch: string | null;
   /// Number of files with unstaged changes (modified, deleted, untracked).
   dirtyCount: number;
+  /// Total inserted / deleted line counts across the working tree
+  /// (staged + unstaged) vs HEAD. Computed via `git diff --shortstat
+  /// HEAD`. Does NOT count untracked files — git diff doesn't see
+  /// them. null on fresh repos with no commits or when shortstat
+  /// reports nothing parseable.
+  worktreeAdds: number | null;
+  worktreeDels: number | null;
   /// Commits ahead/behind upstream. null if no upstream is configured.
   ahead: number | null;
   behind: number | null;
