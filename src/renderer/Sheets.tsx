@@ -40,7 +40,9 @@ export function SheetHost(): JSX.Element | null {
               ? 'w-[720px] max-w-[92vw] max-h-[85vh]'
               : sheet.kind === 'settings'
                 ? 'w-[760px] max-w-[92vw] h-[80vh]'
-                : 'w-[640px] max-w-[90vw] max-h-[80vh]'
+                : sheet.kind === 'pullConflict'
+                  ? 'w-[680px] max-w-[92vw] max-h-[80vh]'
+                  : 'w-[640px] max-w-[90vw] max-h-[80vh]'
         }`}
       >
         {sheet.kind === 'settings' && <SettingsSheet />}
@@ -54,6 +56,13 @@ export function SheetHost(): JSX.Element | null {
         )}
         {sheet.kind === 'newBranchInWorkspace' && (
           <WorkspaceBranchSheet workspaceId={sheet.workspaceId} />
+        )}
+        {sheet.kind === 'pullConflict' && (
+          <PullConflictSheet
+            repoId={sheet.repoId}
+            conflicts={sheet.conflicts}
+            rawError={sheet.rawError}
+          />
         )}
       </div>
     </div>
@@ -1046,6 +1055,233 @@ function ReviewBody({ result }: { result: ReviewResult }): JSX.Element {
         </button>
       )}
     </div>
+  );
+}
+
+/// Surfaces a blocked-pull error with a clear path forward instead of
+/// dumping git's wall of stderr into an alert. Two recovery options:
+///   Stash & retry    → save the listed paths to a named stash, then
+///                      pull. The stash stays around for later pop.
+///   Discard & retry  → reset the listed paths to HEAD, then pull.
+///                      Destructive (local changes are lost), so the
+///                      button is red and confirms the file count.
+function PullConflictSheet({
+  repoId,
+  conflicts,
+  rawError,
+}: {
+  repoId: UUID;
+  conflicts: string[];
+  rawError: string;
+}): JSX.Element {
+  const setSheet = useStore((s) => s.setSheet);
+  const pullForce = useStore((s) => s.pullForce);
+  const repo = useStore((s) => s.repos.find((r) => r.id === repoId));
+  const [busy, setBusy] = useState<'stash' | 'discard' | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState<{ stashed: boolean } | null>(null);
+
+  const fileWord = conflicts.length === 1 ? 'file' : 'files';
+
+  const onRetry = async (strategy: 'stash' | 'discard') => {
+    if (
+      strategy === 'discard' &&
+      !window.confirm(
+        `Discard local changes in ${conflicts.length} ${fileWord}? This cannot be undone — the working-tree copies will be replaced with HEAD.`,
+      )
+    )
+      return;
+    setBusy(strategy);
+    setError(null);
+    try {
+      const res = await pullForce(repoId, conflicts, strategy);
+      if (!res.ok) {
+        setError(res.error ?? 'Pull failed');
+        return;
+      }
+      setDone({ stashed: !!res.stashed });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // Success state — flash a confirmation and close on user dismiss
+  // (rather than auto-closing) so the user sees what happened.
+  if (done) {
+    return (
+      <div className="flex flex-col">
+        <div className="flex items-center justify-between border-b border-card px-5 py-3">
+          <h2 className="text-sm font-semibold text-emerald-300">Pull complete</h2>
+          <button
+            onClick={() => setSheet(null)}
+            className="text-ink-faint hover:text-ink rounded p-1 hover:bg-card"
+            aria-label="Close"
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+              <path d="M3 3l10 10M13 3L3 13" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+            </svg>
+          </button>
+        </div>
+        <div className="p-5 text-sm flex flex-col gap-3">
+          <p className="text-ink">
+            Pulled successfully after recovering from the conflict.
+          </p>
+          {done.stashed && (
+            <p className="text-[12px] text-ink-muted">
+              Your local changes were saved as <span className="font-mono">stash@{'{0}'}</span> with
+              the message <span className="font-mono">"auto: pull"</span>. Pop it from the
+              Stash tab when you're ready to bring those edits back.
+            </p>
+          )}
+        </div>
+        <div className="px-5 py-3 border-t border-card flex justify-end">
+          <button
+            onClick={() => setSheet(null)}
+            className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong"
+          >
+            Done
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col h-full min-h-0">
+      <div className="flex items-start justify-between border-b border-card px-5 py-3 flex-shrink-0">
+        <div className="min-w-0">
+          <h2 className="text-sm font-semibold flex items-center gap-2">
+            <span className="text-amber-300">Pull blocked</span>
+            <span className="text-[10px] uppercase tracking-wide text-ink-faint font-mono">
+              {repo?.name}
+            </span>
+          </h2>
+          <p className="mt-1 text-[11px] text-ink-faint">
+            Git refused to merge — your local changes to {conflicts.length}{' '}
+            {fileWord} would be overwritten by the incoming commits.
+          </p>
+        </div>
+        <button
+          onClick={() => setSheet(null)}
+          className="text-ink-faint hover:text-ink rounded p-1 hover:bg-card flex-shrink-0"
+          aria-label="Close"
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+            <path d="M3 3l10 10M13 3L3 13" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+          </svg>
+        </button>
+      </div>
+
+      <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4 flex flex-col gap-4 text-sm">
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-ink-faint mb-1.5">
+            Files with local changes
+          </div>
+          <ul className="rounded border border-card bg-card/40 max-h-[220px] overflow-y-auto">
+            {conflicts.map((p) => (
+              <li
+                key={p}
+                className="flex items-center gap-2 px-3 py-1 text-[12px] font-mono border-b border-card last:border-0"
+              >
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-300/70 flex-shrink-0" />
+                <span className="truncate" title={p}>
+                  {p}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-ink-faint mb-1.5">
+            Recovery
+          </div>
+          <div className="flex flex-col gap-2">
+            <ActionCard
+              tone="primary"
+              title="Stash & retry"
+              subtitle="Save these files to a stash, pull, and leave the stash around so you can pop it later from the Stash tab."
+              cmd="git stash push -- <files> && git pull"
+              busy={busy === 'stash'}
+              disabled={busy !== null}
+              onClick={() => onRetry('stash')}
+            />
+            <ActionCard
+              tone="danger"
+              title="Discard & retry"
+              subtitle="Reset these files to the version on HEAD, then pull. Your local changes are lost."
+              cmd="git checkout HEAD -- <files> && git pull"
+              busy={busy === 'discard'}
+              disabled={busy !== null}
+              onClick={() => onRetry('discard')}
+            />
+          </div>
+        </div>
+
+        {error && (
+          <div className="rounded border border-red-500/40 bg-red-500/10 px-3 py-2 text-[11px] text-red-300">
+            <div className="font-semibold mb-1">Recovery failed</div>
+            <pre className="whitespace-pre-wrap font-mono">{error}</pre>
+          </div>
+        )}
+
+        <details className="text-[10px] text-ink-faint">
+          <summary className="cursor-pointer hover:text-ink-muted">
+            Show full git output
+          </summary>
+          <pre className="mt-2 px-3 py-2 rounded bg-card border border-card font-mono whitespace-pre-wrap leading-relaxed">
+            {rawError}
+          </pre>
+        </details>
+      </div>
+
+      <div className="flex-shrink-0 flex justify-end gap-2 border-t border-card px-5 py-3">
+        <button
+          onClick={() => setSheet(null)}
+          className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ActionCard({
+  tone,
+  title,
+  subtitle,
+  cmd,
+  busy,
+  disabled,
+  onClick,
+}: {
+  tone: 'primary' | 'danger';
+  title: string;
+  subtitle: string;
+  cmd: string;
+  busy: boolean;
+  disabled: boolean;
+  onClick: () => void;
+}): JSX.Element {
+  const cls =
+    tone === 'primary'
+      ? 'border-accent/40 hover:bg-accent/10'
+      : 'border-red-500/40 hover:bg-red-500/10';
+  const titleCls = tone === 'primary' ? 'text-ink' : 'text-red-300';
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className={`text-left rounded border ${cls} px-4 py-3 disabled:opacity-50 disabled:cursor-not-allowed transition-colors`}
+    >
+      <div className="flex items-baseline gap-2">
+        <span className={`text-[13px] font-semibold ${titleCls}`}>{title}</span>
+        {busy && <span className="text-[11px] text-ink-faint">running…</span>}
+      </div>
+      <div className="mt-1 text-[11px] text-ink-muted">{subtitle}</div>
+      <div className="mt-1.5 text-[10px] font-mono text-ink-faint">{cmd}</div>
+    </button>
   );
 }
 

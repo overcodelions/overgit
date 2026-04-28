@@ -303,7 +303,6 @@ export interface IPCInvokeMap {
   'repo:discardFiles': (args: { repoId: UUID; paths: string[] }) => { ok: boolean; error?: string };
   'repo:commit': (args: { repoId: UUID; message: string }) => { ok: boolean; error?: string };
   'repo:push': (repoId: UUID) => { ok: boolean; error?: string };
-  'repo:pull': (repoId: UUID) => { ok: boolean; error?: string };
   'repo:fetch': (repoId: UUID) => { ok: boolean; error?: string };
   'repo:createBranch': (args: {
     repoId: UUID;
@@ -387,6 +386,18 @@ export interface IPCInvokeMap {
     repoId: UUID;
     paths: string[];
   }) => { ok: boolean; remaining: string[]; error?: string };
+  /// Pull, with conflict-list reporting when local changes would be
+  /// overwritten. Renderer routes the user to a recovery sheet when
+  /// `conflicts` is populated.
+  'repo:pull': (repoId: UUID) => { ok: boolean; error?: string; conflicts?: string[] };
+  /// Recover from a blocked pull. `strategy: 'stash'` saves the
+  /// listed paths to a named stash, then pulls. `'discard'` resets
+  /// them to HEAD before pulling — destructive.
+  'repo:pullForce': (args: {
+    repoId: UUID;
+    conflicts: string[];
+    strategy: 'stash' | 'discard';
+  }) => { ok: boolean; error?: string; stashed?: boolean };
   'repo:detectDefaultBranch': (repoId: UUID) => string | null;
   'repo:setDefaultBranch': (args: { repoId: UUID; branch: string | null }) => void;
 

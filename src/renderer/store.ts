@@ -33,7 +33,8 @@ export type Sheet =
   | { kind: 'newWorkspace' }
   | { kind: 'editWorkspace'; workspaceId: UUID }
   | { kind: 'reviewChanges'; repoId: UUID; scope: 'staged' | 'working' }
-  | { kind: 'newBranchInWorkspace'; workspaceId: UUID };
+  | { kind: 'newBranchInWorkspace'; workspaceId: UUID }
+  | { kind: 'pullConflict'; repoId: UUID; conflicts: string[]; rawError: string };
 
 interface OpenFile {
   repoId: UUID;
@@ -141,7 +142,12 @@ interface UiState {
   discardFiles: (id: UUID, paths: string[]) => Promise<void>;
   commitRepo: (id: UUID, message: string) => Promise<{ ok: boolean; error?: string }>;
   pushRepo: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
-  pullRepo: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
+  pullRepo: (id: UUID) => Promise<{ ok: boolean; error?: string; conflicts?: string[] }>;
+  pullForce: (
+    id: UUID,
+    conflicts: string[],
+    strategy: 'stash' | 'discard',
+  ) => Promise<{ ok: boolean; error?: string; stashed?: boolean }>;
   fetchRepo: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
   checkoutRepo: (id: UUID, branch: string, createIfMissing: boolean) => Promise<CheckoutOutcome>;
   createRepoBranch: (
@@ -409,10 +415,31 @@ export const useStore = create<UiState>((set, get) => ({
     if (res.ok) {
       await Promise.all([
         get().refreshRepoLog(id),
+        get().refreshRepoGraph(id),
         get().refreshRepoChanges(id),
         get().refreshRepoStatus(id),
+        get().refreshRepoBranchSummaries(id),
       ]);
     }
+    return res;
+  },
+
+  pullForce: async (id, conflicts, strategy) => {
+    const res = await window.overgit.invoke('repo:pullForce', {
+      repoId: id,
+      conflicts,
+      strategy,
+    });
+    // Whether pull succeeded or not, status changed (the stash got
+    // created or files were reset). Refresh everything that could
+    // visibly differ so the UI is honest immediately.
+    await Promise.all([
+      get().refreshRepoStatus(id),
+      get().refreshRepoChanges(id),
+      get().refreshRepoLog(id),
+      get().refreshRepoGraph(id),
+      get().refreshRepoStashes(id),
+    ]);
     return res;
   },
 

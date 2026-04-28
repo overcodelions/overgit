@@ -40,6 +40,7 @@ import {
   markResolved,
   mergeBranch,
   pull as gitPull,
+  pullForce as gitPullForce,
   push as gitPush,
   rawDiff,
   rebaseOnto,
@@ -300,6 +301,22 @@ function registerIpc(): void {
     if (!repo) return { ok: false, error: 'Unknown repo' };
     return gitPull(repo.path);
   });
+
+  ipcMain.handle(
+    'repo:pullForce',
+    async (
+      _e,
+      args: {
+        repoId: string;
+        conflicts: string[];
+        strategy: 'stash' | 'discard';
+      },
+    ) => {
+      const repo = repoFromArg(args);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return gitPullForce(repo.path, args.conflicts, args.strategy);
+    },
+  );
 
   ipcMain.handle('repo:fetch', async (_e, repoId: string) => {
     const repo = repoFromArg(repoId);
