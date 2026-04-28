@@ -114,6 +114,12 @@ interface UiState {
   ) => Promise<{ ok: boolean; error?: string; removed?: string[] }>;
   dropStash: (id: UUID, index: number) => Promise<{ ok: boolean; error?: string }>;
   stashFiles: (id: UUID, paths: string[], message?: string) => Promise<{ ok: boolean; error?: string }>;
+  applyPatch: (
+    id: UUID,
+    patch: string,
+    mode: 'stage' | 'unstage' | 'discard',
+  ) => Promise<{ ok: boolean; error?: string }>;
+  amendCommit: (id: UUID, message: string | null) => Promise<{ ok: boolean; error?: string }>;
   setRepoDefaultBranch: (id: UUID, branch: string | null) => Promise<void>;
   stageFiles: (id: UUID, paths: string[]) => Promise<void>;
   unstageFiles: (id: UUID, paths: string[]) => Promise<void>;
@@ -123,7 +129,12 @@ interface UiState {
   pullRepo: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
   fetchRepo: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
   checkoutRepo: (id: UUID, branch: string, createIfMissing: boolean) => Promise<CheckoutOutcome>;
-  createRepoBranch: (id: UUID, name: string, checkout: boolean) => Promise<{ ok: boolean; error?: string }>;
+  createRepoBranch: (
+    id: UUID,
+    name: string,
+    checkout: boolean,
+    from?: string,
+  ) => Promise<{ ok: boolean; error?: string }>;
   deleteRepoBranch: (id: UUID, name: string, force: boolean) => Promise<{ ok: boolean; error?: string }>;
   loadRepoFileDiff: (id: UUID, path: string, side: 'staged' | 'unstaged') => Promise<void>;
 
@@ -134,6 +145,7 @@ interface UiState {
 
   toggleSidebar: () => void;
   setSidebarWidth: (px: number) => Promise<void>;
+  setHistoryAsideWidth: (px: number) => Promise<void>;
   setSheet: (sheet: Sheet | null) => void;
   togglePalette: (open?: boolean) => void;
 
@@ -154,7 +166,12 @@ export const useStore = create<UiState>((set, get) => ({
   loaded: false,
   repos: [],
   workspaces: [],
-  settings: { theme: 'system', sidebarVisible: true, sidebarWidth: 288 },
+  settings: {
+    theme: 'system',
+    sidebarVisible: true,
+    sidebarWidth: 288,
+    historyAsideWidth: 480,
+  },
   selectedWorkspaceId: null,
   selectedRepoId: null,
   workspaceStatuses: {},
@@ -406,14 +423,20 @@ export const useStore = create<UiState>((set, get) => ({
     return outcome;
   },
 
-  createRepoBranch: async (id, name, checkout) => {
+  createRepoBranch: async (id, name, checkout, from) => {
     const res = await window.overgit.invoke('repo:createBranch', {
       repoId: id,
       name,
       checkout,
+      from,
     });
     if (res.ok) {
-      await Promise.all([get().refreshRepoBranches(id), get().refreshRepoStatus(id)]);
+      await Promise.all([
+        get().refreshRepoBranches(id),
+        get().refreshRepoStatus(id),
+        get().refreshRepoBranchSummaries(id),
+        get().refreshRepoGraph(id),
+      ]);
     }
     return res;
   },
@@ -486,6 +509,43 @@ export const useStore = create<UiState>((set, get) => ({
   dropStash: async (id, index) => {
     const res = await window.overgit.invoke('repo:dropStash', { repoId: id, index });
     if (res.ok) await get().refreshRepoStashes(id);
+    return res;
+  },
+
+  applyPatch: async (id, patch, mode) => {
+    const res = await window.overgit.invoke('repo:applyPatch', {
+      repoId: id,
+      patch,
+      mode,
+    });
+    if (res.ok) {
+      // Hunk-level changes affect both staged + unstaged sides; refresh
+      // changes + status so the diff pane shows the new shape and
+      // counts update everywhere.
+      await Promise.all([
+        get().refreshRepoChanges(id),
+        get().refreshRepoStatus(id),
+      ]);
+    }
+    return res;
+  },
+
+  amendCommit: async (id, message) => {
+    const res = await window.overgit.invoke('repo:amendCommit', {
+      repoId: id,
+      message,
+    });
+    if (res.ok) {
+      // Amend rewrites HEAD; refresh the log + graph so History shows
+      // the new commit, and reset changes since `--amend` typically
+      // consumed the staged set.
+      await Promise.all([
+        get().refreshRepoChanges(id),
+        get().refreshRepoStatus(id),
+        get().refreshRepoLog(id),
+        get().refreshRepoGraph(id),
+      ]);
+    }
     return res;
   },
 
@@ -585,6 +645,14 @@ export const useStore = create<UiState>((set, get) => ({
     const cur = get().settings;
     if (cur.sidebarWidth === px) return;
     const next = { ...cur, sidebarWidth: px };
+    set({ settings: next });
+    await window.overgit.invoke('store:saveSettings', next);
+  },
+
+  setHistoryAsideWidth: async (px) => {
+    const cur = get().settings;
+    if (cur.historyAsideWidth === px) return;
+    const next = { ...cur, historyAsideWidth: px };
     set({ settings: next });
     await window.overgit.invoke('store:saveSettings', next);
   },

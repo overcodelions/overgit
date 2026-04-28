@@ -116,6 +116,10 @@ export interface Commit {
   authorEmail: string;
   /// ISO-8601 author date.
   date: string;
+  /// Full commit message body (everything after the subject line).
+  /// Empty string when the commit has no body. Comes from `%b` in the
+  /// log format and carries embedded newlines.
+  body: string;
 }
 
 export interface FileDiff {
@@ -181,14 +185,18 @@ export interface BranchSummary {
 
 /// One commit row in the project's branch visualization. `lane` and
 /// `parentLanes` come from a greedy stripe layout in main, so the
-/// renderer just draws lines between (lane, row) pairs.
+/// renderer just draws lines between (lane, row) pairs. We carry
+/// enough metadata (authorEmail, body) so the unified history view
+/// can render full commit detail without a follow-up roundtrip.
 export interface GraphCommit {
   sha: string;
   shortSha: string;
   parents: string[];
   subject: string;
   author: string;
+  authorEmail: string;
   date: string;
+  body: string;
   refs: string[];
   lane: number;
   parentLanes: number[];
@@ -224,16 +232,24 @@ export interface AppSettings {
   /// relaunch. Clamped on read so a stale value can't push the sidebar
   /// off-screen on a smaller display.
   sidebarWidth: number;
+  /// Width of the History tab's commit-list aside. Same persistence
+  /// idea as `sidebarWidth` — independent because the History pane is
+  /// usually wider than the app sidebar (it carries the lane rail +
+  /// ref badges + subject + meta on one row).
+  historyAsideWidth: number;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
   theme: 'system',
   sidebarVisible: true,
   sidebarWidth: 288,
+  historyAsideWidth: 480,
 };
 
 export const SIDEBAR_MIN_WIDTH = 200;
 export const SIDEBAR_MAX_WIDTH = 520;
+export const HISTORY_ASIDE_MIN_WIDTH = 320;
+export const HISTORY_ASIDE_MAX_WIDTH = 900;
 
 /// Typed contract for ipcRenderer.invoke channels. Each entry is the
 /// signature the main-process handler implements; the preload exposes
@@ -278,7 +294,14 @@ export interface IPCInvokeMap {
   'repo:push': (repoId: UUID) => { ok: boolean; error?: string };
   'repo:pull': (repoId: UUID) => { ok: boolean; error?: string };
   'repo:fetch': (repoId: UUID) => { ok: boolean; error?: string };
-  'repo:createBranch': (args: { repoId: UUID; name: string; checkout: boolean }) => { ok: boolean; error?: string };
+  'repo:createBranch': (args: {
+    repoId: UUID;
+    name: string;
+    checkout: boolean;
+    /// Optional starting commit (sha). When omitted the branch is
+    /// created from the current HEAD, which is the default flow.
+    from?: string;
+  }) => { ok: boolean; error?: string };
   'repo:deleteBranch': (args: { repoId: UUID; name: string; force: boolean }) => { ok: boolean; error?: string };
   /// Diff for a single path, scoped to either the index (staged vs HEAD)
   /// or the working tree (unstaged vs index). Used by the Changes pane
@@ -308,6 +331,24 @@ export interface IPCInvokeMap {
   'repo:branchSummaries': (repoId: UUID) => BranchSummary[];
   'repo:branchCommits': (args: { repoId: UUID; ref: string; limit?: number }) => Commit[];
   'repo:cherryPick': (args: { repoId: UUID; shas: string[] }) => { ok: boolean; error?: string };
+  /// Detach HEAD onto a sha. Used by the History view's "Checkout this
+  /// commit" affordance.
+  'repo:checkoutCommit': (args: { repoId: UUID; sha: string }) => { ok: boolean; error?: string };
+  /// Apply a unified-diff patch in one of three modes. The renderer
+  /// constructs a sub-patch from selected hunks and sends it here so
+  /// staging / unstaging / discarding can target a single hunk at a time
+  /// (or any subset of hunks within a file).
+  'repo:applyPatch': (args: {
+    repoId: UUID;
+    patch: string;
+    mode: 'stage' | 'unstage' | 'discard';
+  }) => { ok: boolean; error?: string };
+  /// `git commit --amend`. When `message` is null we keep the previous
+  /// message and just fold staged changes onto the previous commit.
+  'repo:amendCommit': (args: {
+    repoId: UUID;
+    message: string | null;
+  }) => { ok: boolean; error?: string };
   'repo:detectDefaultBranch': (repoId: UUID) => string | null;
   'repo:setDefaultBranch': (args: { repoId: UUID; branch: string | null }) => void;
 

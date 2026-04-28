@@ -1,16 +1,17 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useStore } from './store';
 import { FileEditor } from './FileEditor';
-import { BranchGraph } from './BranchGraph';
 import { BranchPicker } from './BranchPicker';
 import type {
   ChangedFile,
   Commit,
   FileDiff,
+  GraphCommit,
   LlmTool,
   RepoStatus,
   UUID,
 } from '@shared/types';
+import { HISTORY_ASIDE_MAX_WIDTH, HISTORY_ASIDE_MIN_WIDTH } from '@shared/types';
 
 // Stable fallback for the history-tab log selector. See App.tsx for the
 // rationale — a fresh `[]` per render breaks Zustand's snapshot
@@ -28,7 +29,7 @@ function joinRepoPath(repoRoot: string, relPath: string): string {
   return `${trimmedRoot}${sep}${normalized}`;
 }
 
-type Tab = 'changes' | 'history' | 'files' | 'graph' | 'stash';
+type Tab = 'changes' | 'history' | 'files' | 'stash';
 
 /// Detail view for a single repo. Two tabs:
 /// - Changes: stage / unstage / discard / commit (the standard daily flow)
@@ -65,7 +66,7 @@ export function RepoDetail({ repoId }: { repoId: UUID }): JSX.Element {
         detail === 'changes' ||
         detail === 'history' ||
         detail === 'files' ||
-        detail === 'graph'
+        detail === 'stash'
       ) {
         setTab(detail);
       }
@@ -81,7 +82,6 @@ export function RepoDetail({ repoId }: { repoId: UUID }): JSX.Element {
       {tab === 'changes' && <ChangesTab repoId={repoId} />}
       {tab === 'history' && <HistoryTab repoId={repoId} />}
       {tab === 'files' && <FileEditor repoId={repoId} />}
-      {tab === 'graph' && <BranchGraph repoId={repoId} />}
       {tab === 'stash' && <StashTab repoId={repoId} />}
     </main>
   );
@@ -195,12 +195,11 @@ function Tabs({ tab, onChange }: { tab: Tab; onChange: (t: Tab) => void }): JSX.
     changes: 'Changes',
     history: 'History',
     files: 'Files',
-    graph: 'Graph',
     stash: 'Stash',
   };
   return (
     <nav className="px-6 border-b border-card flex gap-2">
-      {(['changes', 'history', 'files', 'graph', 'stash'] as const).map((t) => (
+      {(['changes', 'history', 'files', 'stash'] as const).map((t) => (
         <button
           key={t}
           onClick={() => onChange(t)}
@@ -224,12 +223,22 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
   const unstage = useStore((s) => s.unstageFiles);
   const discard = useStore((s) => s.discardFiles);
   const commit = useStore((s) => s.commitRepo);
+  const amend = useStore((s) => s.amendCommit);
   const loadDiff = useStore((s) => s.loadRepoFileDiff);
   const diffEntry = useStore((s) => s.repoDiff[repoId]);
   const cli = useStore((s) => s.cliPresence);
   const setSheet = useStore((s) => s.setSheet);
   const openRepoFile = useStore((s) => s.openRepoFile);
   const stashFilesAction = useStore((s) => s.stashFiles);
+  // Last commit — pulled from the graph (already cached for History)
+  // so this doesn't trigger an extra IPC call.
+  const lastCommit = useStore((s) => s.repoGraph[repoId]?.[0]);
+  const refreshGraph = useStore((s) => s.refreshRepoGraph);
+  // Make sure the graph is loaded so the Amend toggle has a target
+  // commit to show. Cheap to call when already cached.
+  useEffect(() => {
+    if (!lastCommit) refreshGraph(repoId);
+  }, [lastCommit, refreshGraph, repoId]);
 
   // Stashing prompts inline via the FileGroup bar (Electron renderers
   // refuse window.prompt). The message is optional — empty string ⇒
@@ -293,6 +302,18 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
   const [unstagedChecked, setUnstagedChecked] = useState<Set<string>>(new Set());
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
+  const [amendMode, setAmendMode] = useState(false);
+  // Toggling amend on prefills the message box with the last commit's
+  // subject + body. Toggling off doesn't restore the prior text — we'd
+  // need to stash it; the simpler behavior is honest enough.
+  useEffect(() => {
+    if (amendMode && lastCommit && !message.trim()) {
+      setMessage(
+        lastCommit.body ? `${lastCommit.subject}\n\n${lastCommit.body}` : lastCommit.subject,
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [amendMode]);
 
   const staged = ch?.staged ?? [];
   const unstaged = ch?.unstaged ?? [];
@@ -304,16 +325,26 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
   };
 
   const onCommit = async () => {
-    if (!message.trim() || staged.length === 0) return;
+    // Amend allows commit with no staged changes (just rewrites the
+    // previous commit's message). Plain commit requires both a message
+    // AND something staged.
+    if (amendMode) {
+      if (!message.trim()) return;
+    } else if (!message.trim() || staged.length === 0) {
+      return;
+    }
     setBusy(true);
     try {
-      const res = await commit(repoId, message.trim());
+      const res = amendMode
+        ? await amend(repoId, message.trim())
+        : await commit(repoId, message.trim());
       if (!res.ok) {
-        alert(res.error ?? 'Commit failed');
+        alert(res.error ?? (amendMode ? 'Amend failed' : 'Commit failed'));
         return;
       }
       setMessage('');
       setSelected(null);
+      setAmendMode(false);
     } finally {
       setBusy(false);
     }
@@ -455,30 +486,78 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
             value={message}
             onChange={(e) => setMessage(e.target.value)}
             placeholder={
-              staged.length === 0
-                ? 'Stage files to commit'
-                : `Commit message (${staged.length} ${
-                    staged.length === 1 ? 'file' : 'files'
-                  } staged)`
+              amendMode
+                ? `Amend last commit${
+                    staged.length > 0 ? ` + ${staged.length} staged` : ''
+                  }`
+                : staged.length === 0
+                  ? 'Stage files to commit'
+                  : `Commit message (${staged.length} ${
+                      staged.length === 1 ? 'file' : 'files'
+                    } staged)`
             }
-            disabled={staged.length === 0}
+            disabled={!amendMode && staged.length === 0}
             className="w-full px-2 py-1.5 rounded bg-surface-elevated border border-card text-sm resize-y min-h-[64px] disabled:opacity-50"
           />
+
+          {/* Amend toggle. Disabled when there's no last commit yet
+              (fresh repo). Hint underneath shows what we're rewriting
+              so the user can see the target before pressing the
+              button. */}
+          {lastCommit && (
+            <label className="flex items-start gap-2 cursor-pointer text-[11px] text-ink-muted">
+              <input
+                type="checkbox"
+                checked={amendMode}
+                onChange={(e) => setAmendMode(e.target.checked)}
+                className="mt-0.5"
+              />
+              <div className="min-w-0 flex-1">
+                <div>Amend last commit</div>
+                <div
+                  className="text-[10px] text-ink-faint truncate"
+                  title={lastCommit.subject}
+                >
+                  {lastCommit.shortSha} · {lastCommit.subject || '(no subject)'}
+                </div>
+              </div>
+            </label>
+          )}
+
           <button
-            disabled={busy || staged.length === 0 || !message.trim()}
+            disabled={
+              busy ||
+              !message.trim() ||
+              (!amendMode && staged.length === 0)
+            }
             onClick={onCommit}
-            className="text-sm px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+            className={`text-sm px-3 py-1.5 rounded text-white disabled:opacity-50 ${
+              amendMode
+                ? 'bg-amber-500 hover:bg-amber-600'
+                : 'bg-accent hover:bg-accent-strong'
+            }`}
+            title={
+              amendMode
+                ? 'Rewrites the previous commit. Only safe if you haven\'t pushed it.'
+                : undefined
+            }
           >
-            Commit{staged.length > 0 ? ` ${staged.length}` : ''}
+            {amendMode
+              ? `Amend${staged.length > 0 ? ` + ${staged.length}` : ''}`
+              : `Commit${staged.length > 0 ? ` ${staged.length}` : ''}`}
           </button>
         </div>
       </aside>
 
-      <section className="overflow-y-auto p-4">
+      <section className="overflow-y-auto">
         {selected ? (
-          <DiffView files={diffEntry?.files ?? []} />
+          <ChangesDiffPane
+            repoId={repoId}
+            files={diffEntry?.files ?? []}
+            side={selected.side}
+          />
         ) : (
-          <div className="text-sm text-ink-faint">
+          <div className="p-4 text-sm text-ink-faint">
             Pick a file on the left to see its diff.
           </div>
         )}
@@ -1377,80 +1456,1090 @@ function relativeAgo(iso: string): string {
   }
 }
 
+// Lane palette shared with what BranchGraph used. Keeps the combined
+// view visually consistent with the prior standalone graph tab.
+const LANE_COLORS = [
+  '#8a78ff',
+  '#5eead4',
+  '#fbbf24',
+  '#f472b6',
+  '#60a5fa',
+  '#a3e635',
+  '#fb923c',
+  '#22d3ee',
+];
+// Tighter than the previous combined view (44px). Single-line rows
+// match what the old standalone Graph tab used and let the user see
+// many more commits at once.
+const ROW_HEIGHT = 28;
+const LANE_WIDTH = 14;
+const NODE_RADIUS = 4;
+const PADDING_X = 10;
+
+const EMPTY_GRAPH: GraphCommit[] = [];
+
+/// Combined graph + history view. The left rail draws each commit's
+/// lane and parent lines; commits then render to the right with refs,
+/// subject, author, and date. Selecting a commit loads its detail in
+/// the right pane (subject + body + per-file +/- list + diff). The
+/// "Working tree" entry is preserved at the top of the list so the
+/// user can still see uncommitted changes here.
+// Width of the rail column (where the lane SVG paints). Keeps row
+// padding stable regardless of how many lanes the visible window has;
+// past this we let the SVG overflow and the row's pl-[railWidth]
+// holds the layout.
+const RAIL_BASE_WIDTH = 56;
+
 function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
-  const commits = useStore((s) => s.repoLog[repoId] ?? EMPTY_COMMITS);
+  const commits = useStore((s) => s.repoGraph[repoId] ?? EMPTY_GRAPH);
+  const refreshGraph = useStore((s) => s.refreshRepoGraph);
   const refreshDiff = useStore((s) => s.refreshRepoDiff);
   const diffEntry = useStore((s) => s.repoDiff[repoId]);
+  const asideWidth = useStore((s) => s.settings.historyAsideWidth);
+  const setAsideWidth = useStore((s) => s.setHistoryAsideWidth);
+  const createBranch = useStore((s) => s.createRepoBranch);
 
   const [selected, setSelected] = useState<string | 'working'>('working');
+  const [filter, setFilter] = useState('');
+  const [menu, setMenu] = useState<{ sha: string; x: number; y: number } | null>(null);
+  const listRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
+    refreshGraph(repoId);
     refreshDiff(repoId, undefined);
     setSelected('working');
-  }, [refreshDiff, repoId]);
+    setFilter('');
+  }, [refreshGraph, refreshDiff, repoId]);
+
+  const filteredCommits = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    if (!q) return commits;
+    return commits.filter(
+      (c) =>
+        c.sha.startsWith(q) ||
+        c.subject.toLowerCase().includes(q) ||
+        c.author.toLowerCase().includes(q) ||
+        c.refs.some((r) => r.toLowerCase().includes(q)),
+    );
+  }, [commits, filter]);
+
+  // Lane geometry is computed from the FULL commit set (not filtered)
+  // so the rail still draws meaningful connectors even when the user
+  // narrows by filter. The rail is wide enough for the visible lanes.
+  const indexBySha = useMemo(() => {
+    const m = new Map<string, number>();
+    filteredCommits.forEach((c, i) => m.set(c.sha, i));
+    return m;
+  }, [filteredCommits]);
+
+  const maxLane = useMemo(
+    () => filteredCommits.reduce((m, c) => Math.max(m, c.lane, ...c.parentLanes), 0),
+    [filteredCommits],
+  );
+  const railWidth = Math.max(RAIL_BASE_WIDTH, PADDING_X * 2 + (maxLane + 1) * LANE_WIDTH);
+
+  const headSha = useMemo(() => {
+    const head = commits.find((c) => c.refs.some((r) => r.startsWith('HEAD')));
+    return head?.sha ?? null;
+  }, [commits]);
 
   const onPickCommit = (sha: string) => {
     setSelected(sha);
     refreshDiff(repoId, sha);
   };
-
   const onPickWorking = () => {
     setSelected('working');
     refreshDiff(repoId, undefined);
   };
 
+  // Keyboard navigation. The list owns focus once the user clicks
+  // anywhere on it; ↑/↓ move selection between rows including the
+  // working-tree entry at the top.
+  const onListKey = (e: React.KeyboardEvent) => {
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    e.preventDefault();
+    const all: ('working' | string)[] = ['working', ...filteredCommits.map((c) => c.sha)];
+    const idx = all.indexOf(selected);
+    const next =
+      e.key === 'ArrowDown'
+        ? Math.min(all.length - 1, idx + 1)
+        : Math.max(0, idx - 1);
+    const target = all[next];
+    if (target === 'working') onPickWorking();
+    else onPickCommit(target);
+  };
+
+  // Drag handle for the aside.
+  const onAsideDragStart = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = asideWidth;
+    const onMove = (ev: MouseEvent) => {
+      const next = Math.max(
+        HISTORY_ASIDE_MIN_WIDTH,
+        Math.min(HISTORY_ASIDE_MAX_WIDTH, startW + (ev.clientX - startX)),
+      );
+      void setAsideWidth(next);
+    };
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  };
+
+  // Right-click on a row → context menu, anchored to the click.
+  const openContextMenu = (e: React.MouseEvent, sha: string) => {
+    e.preventDefault();
+    setSelected(sha);
+    refreshDiff(repoId, sha);
+    setMenu({ sha, x: e.clientX, y: e.clientY });
+  };
+
+  // Per-row vertical offset accounts for the working-tree row at index 0.
+  // SVG draws lines/circles for filtered commits at rows 1..N.
+  const totalHeight = (filteredCommits.length + 1) * ROW_HEIGHT;
+
+  const selectedCommit =
+    selected === 'working' ? null : commits.find((c) => c.sha === selected) ?? null;
+
   return (
-    <div className="grid grid-cols-[280px_1fr] overflow-hidden">
-      <aside className="overflow-y-auto border-r border-card">
-        <button
-          onClick={onPickWorking}
-          className={`w-full text-left px-4 py-2 text-sm border-b border-card ${
-            selected === 'working' ? 'bg-accent text-white' : 'hover:bg-card'
-          }`}
+    <div className="flex overflow-hidden">
+      <aside
+        className="border-r border-card flex-shrink-0 flex flex-col min-h-0"
+        style={{ width: asideWidth }}
+      >
+        {/* Sticky filter at the top of the aside. The clear button
+            appears only when there's something typed. */}
+        <div className="px-3 py-2 border-b border-card flex items-center gap-2 flex-shrink-0">
+          <input
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            placeholder="Filter by subject, sha, author, ref…"
+            className="field flex-1 px-2 py-1 text-[11px]"
+          />
+          {filter && (
+            <button
+              onClick={() => setFilter('')}
+              className="text-[10px] text-ink-muted hover:text-ink px-1.5 py-1 rounded hover:bg-card"
+              title="Clear filter"
+            >
+              ✕
+            </button>
+          )}
+        </div>
+
+        {/* Scroll container. Rows + overlay SVG share this so the
+            graph scrolls with the list. */}
+        <div
+          ref={listRef}
+          tabIndex={0}
+          onKeyDown={onListKey}
+          className="flex-1 min-h-0 overflow-y-auto outline-none"
         >
-          <div className="font-medium">Working tree</div>
-          <div className={`text-xs ${selected === 'working' ? 'text-white/70' : 'text-ink-faint'}`}>
-            staged + unstaged vs HEAD
-          </div>
-        </button>
-        <ul>
-          {commits.map((c) => (
-            <li key={c.sha}>
-              <button
-                onClick={() => onPickCommit(c.sha)}
-                className={`w-full text-left px-4 py-2 text-sm border-b border-card ${
-                  selected === c.sha ? 'bg-accent text-white' : 'hover:bg-card'
+          <div
+            className="relative"
+            style={{ minHeight: ROW_HEIGHT * (filteredCommits.length + 1) }}
+          >
+            {/* Rows render full-width with their own bg. The SVG
+                overlay paints lines + circles on top of the rail
+                strip; pointer-events none so clicks fall through. */}
+            <button
+              onClick={onPickWorking}
+              className={`w-full text-left flex items-center gap-2 text-xs border-b border-card relative z-10 ${
+                selected === 'working' ? 'bg-accent text-white' : 'hover:bg-card'
+              }`}
+              style={{ height: ROW_HEIGHT, paddingLeft: railWidth, paddingRight: 12 }}
+            >
+              <span className="font-medium truncate">Working tree</span>
+              <span
+                className={`text-[10px] truncate ${
+                  selected === 'working' ? 'text-white/70' : 'text-ink-faint'
                 }`}
               >
-                <CommitRow commit={c} active={selected === c.sha} />
-              </button>
-            </li>
-          ))}
-          {commits.length === 0 && (
-            <li className="px-4 py-3 text-xs text-ink-faint">No commits.</li>
-          )}
-        </ul>
+                staged + unstaged vs HEAD
+              </span>
+            </button>
+
+            {filteredCommits.map((c) => {
+              const active = selected === c.sha;
+              const isHead = c.sha === headSha;
+              return (
+                <button
+                  key={c.sha}
+                  onClick={() => onPickCommit(c.sha)}
+                  onContextMenu={(e) => openContextMenu(e, c.sha)}
+                  style={{
+                    height: ROW_HEIGHT,
+                    paddingLeft: railWidth,
+                    paddingRight: 12,
+                  }}
+                  className={`w-full text-left flex items-center gap-2 text-xs border-b border-card relative z-10 ${
+                    active ? 'bg-accent text-white' : 'hover:bg-card'
+                  }`}
+                >
+                  <CommitGraphRow commit={c} active={active} isHead={isHead} />
+                </button>
+              );
+            })}
+            {filteredCommits.length === 0 && commits.length > 0 && (
+              <div
+                className="px-3 py-3 text-[11px] text-ink-faint absolute"
+                style={{ top: ROW_HEIGHT, left: railWidth }}
+              >
+                No commits match.
+              </div>
+            )}
+            {commits.length === 0 && (
+              <div className="px-3 py-3 text-[11px] text-ink-faint">No commits yet.</div>
+            )}
+
+            <svg
+              width={railWidth}
+              height={totalHeight}
+              className="absolute left-0 top-0 pointer-events-none"
+            >
+              {filteredCommits.map((c, i) => (
+                <g key={c.sha}>
+                  {c.parentLanes.map((pLane, idx) => {
+                    const parentIdx = indexBySha.get(c.parents[idx]);
+                    if (parentIdx == null) return null;
+                    const x1 = PADDING_X + c.lane * LANE_WIDTH + LANE_WIDTH / 2;
+                    const y1 = (i + 1) * ROW_HEIGHT + ROW_HEIGHT / 2;
+                    const x2 = PADDING_X + pLane * LANE_WIDTH + LANE_WIDTH / 2;
+                    const y2 = (parentIdx + 1) * ROW_HEIGHT + ROW_HEIGHT / 2;
+                    const cy = y1 + ROW_HEIGHT * 0.6;
+                    const d =
+                      x1 === x2
+                        ? `M${x1},${y1} L${x2},${y2}`
+                        : `M${x1},${y1} Q${x1},${cy} ${(x1 + x2) / 2},${cy} T${x2},${y2}`;
+                    return (
+                      <path
+                        key={`${c.sha}:${idx}`}
+                        d={d}
+                        stroke={laneColor(pLane)}
+                        strokeWidth="1.5"
+                        fill="none"
+                        opacity="0.85"
+                      />
+                    );
+                  })}
+                  {c.sha === headSha && (
+                    // HEAD halo — a wider ring behind the node circle
+                    // so the active commit pops without changing the
+                    // base node size and disturbing the row rhythm.
+                    <circle
+                      cx={PADDING_X + c.lane * LANE_WIDTH + LANE_WIDTH / 2}
+                      cy={(i + 1) * ROW_HEIGHT + ROW_HEIGHT / 2}
+                      r={NODE_RADIUS + 4}
+                      fill="none"
+                      stroke="var(--c-accent)"
+                      strokeWidth="1.5"
+                      opacity="0.85"
+                    />
+                  )}
+                  <circle
+                    cx={PADDING_X + c.lane * LANE_WIDTH + LANE_WIDTH / 2}
+                    cy={(i + 1) * ROW_HEIGHT + ROW_HEIGHT / 2}
+                    r={NODE_RADIUS}
+                    fill={laneColor(c.lane)}
+                  />
+                </g>
+              ))}
+            </svg>
+          </div>
+        </div>
       </aside>
 
-      <section className="overflow-y-auto p-4">
-        <DiffView files={diffEntry?.files ?? []} />
+      {/* Drag handle */}
+      <div
+        role="separator"
+        aria-label="Resize history list"
+        aria-valuenow={asideWidth}
+        aria-valuemin={HISTORY_ASIDE_MIN_WIDTH}
+        aria-valuemax={HISTORY_ASIDE_MAX_WIDTH}
+        onMouseDown={onAsideDragStart}
+        onDoubleClick={() => void setAsideWidth(480)}
+        title="Drag to resize · Double-click to reset"
+        className="w-1 cursor-col-resize hover:bg-accent/40 active:bg-accent/60 transition-colors flex-shrink-0"
+      />
+
+      <section className="flex-1 min-w-0 overflow-hidden">
+        {selected === 'working' ? (
+          <div className="h-full overflow-y-auto p-4">
+            <div className="mb-3 px-1 text-[11px] uppercase tracking-wide text-ink-faint">
+              Working tree · staged + unstaged vs HEAD
+            </div>
+            <DiffView files={diffEntry?.files ?? []} />
+          </div>
+        ) : selectedCommit ? (
+          <CommitDetail commit={selectedCommit} files={diffEntry?.files ?? null} />
+        ) : (
+          <div className="p-4 text-xs text-ink-faint">Loading…</div>
+        )}
       </section>
+
+      {menu && (
+        <CommitContextMenu
+          x={menu.x}
+          y={menu.y}
+          onClose={() => setMenu(null)}
+          onCopySha={() => void navigator.clipboard.writeText(menu.sha)}
+          onCopyShortSha={() => {
+            const c = commits.find((cc) => cc.sha === menu.sha);
+            if (c) void navigator.clipboard.writeText(c.shortSha);
+          }}
+          onCopyMessage={() => {
+            const c = commits.find((cc) => cc.sha === menu.sha);
+            if (!c) return;
+            const text = c.body ? `${c.subject}\n\n${c.body}` : c.subject;
+            void navigator.clipboard.writeText(text);
+          }}
+          onBranchFromHere={async (name) => {
+            const res = await createBranch(repoId, name.trim(), true, menu.sha);
+            if (!res.ok) alert(res.error ?? 'Create failed');
+          }}
+          onCheckout={async () => {
+            if (
+              !window.confirm(
+                'Check out this commit? You will be on a detached HEAD — create a branch first if you plan to make changes.',
+              )
+            )
+              return;
+            const res = await window.overgit.invoke('repo:checkoutCommit', {
+              repoId,
+              sha: menu.sha,
+            });
+            if (!res.ok) alert(res.error ?? 'Checkout failed');
+            else await useStore.getState().refreshRepoStatus(repoId);
+          }}
+        />
+      )}
     </div>
   );
 }
 
-function CommitRow({ commit, active }: { commit: Commit; active: boolean }): JSX.Element {
-  const date = useMemo(() => formatDate(commit.date), [commit.date]);
+function CommitContextMenu({
+  x,
+  y,
+  onClose,
+  onCopySha,
+  onCopyShortSha,
+  onCopyMessage,
+  onBranchFromHere,
+  onCheckout,
+}: {
+  x: number;
+  y: number;
+  onClose: () => void;
+  onCopySha: () => void;
+  onCopyShortSha: () => void;
+  onCopyMessage: () => void;
+  onBranchFromHere: (name: string) => void | Promise<void>;
+  onCheckout: () => void;
+}): JSX.Element {
+  // Two modes: 'list' shows the menu, 'branch' shows an inline branch-
+  // name input. We don't drop into window.prompt because Electron
+  // sandboxed renderers refuse it.
+  const [mode, setMode] = useState<'list' | 'branch'>('list');
+  const [branchName, setBranchName] = useState('');
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (mode === 'branch') inputRef.current?.focus();
+  }, [mode]);
+
+  // Click anywhere outside or hit Esc → dismiss. Mouse-down (not click)
+  // so a quick mousedown-then-click on a menu item still fires before
+  // the dismiss handler tears the menu down.
+  useEffect(() => {
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target?.closest('[data-context-menu]')) return;
+      onClose();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('mousedown', onDown);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('mousedown', onDown);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [onClose]);
+
+  const left = Math.min(x, window.innerWidth - 280);
+  const top = Math.min(y, window.innerHeight - 240);
+
+  return (
+    <div
+      data-context-menu
+      className="fixed z-50 bg-surface-elevated border border-card rounded-md shadow-2xl py-1 min-w-[240px] text-xs"
+      style={{ left, top }}
+    >
+      {mode === 'list' ? (
+        <>
+          <CtxItem
+            label="Copy commit SHA"
+            onClick={() => {
+              onCopySha();
+              onClose();
+            }}
+          />
+          <CtxItem
+            label="Copy short SHA"
+            onClick={() => {
+              onCopyShortSha();
+              onClose();
+            }}
+          />
+          <CtxItem
+            label="Copy commit message"
+            onClick={() => {
+              onCopyMessage();
+              onClose();
+            }}
+          />
+          <div className="my-1 border-t border-card" />
+          <CtxItem
+            label="Create branch from here…"
+            onClick={() => setMode('branch')}
+          />
+          <CtxItem
+            label="Checkout this commit (detached)"
+            onClick={() => {
+              onCheckout();
+              onClose();
+            }}
+            tone="warn"
+          />
+        </>
+      ) : (
+        <div className="px-3 py-2 flex flex-col gap-2">
+          <div className="text-[10px] uppercase tracking-wide text-ink-faint">
+            New branch from this commit
+          </div>
+          <input
+            ref={inputRef}
+            value={branchName}
+            onChange={(e) => setBranchName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && branchName.trim()) {
+                void onBranchFromHere(branchName.trim());
+                onClose();
+              } else if (e.key === 'Escape') {
+                setMode('list');
+              }
+            }}
+            placeholder="feature/your-branch"
+            className="field px-2 py-1 text-xs"
+          />
+          <div className="flex justify-end gap-1">
+            <button
+              onClick={() => setMode('list')}
+              className="text-[11px] px-2 py-1 rounded text-ink-muted hover:bg-card hover:text-ink"
+            >
+              Back
+            </button>
+            <button
+              disabled={!branchName.trim()}
+              onClick={() => {
+                void onBranchFromHere(branchName.trim());
+                onClose();
+              }}
+              className="text-[11px] px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+            >
+              Create &amp; switch
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CtxItem({
+  label,
+  onClick,
+  tone = 'normal',
+}: {
+  label: string;
+  onClick: () => void;
+  tone?: 'normal' | 'warn';
+}): JSX.Element {
+  return (
+    <button
+      onClick={onClick}
+      className={`w-full text-left px-3 py-1.5 hover:bg-accent hover:text-white ${
+        tone === 'warn' ? 'text-amber-300' : 'text-ink'
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
+function laneColor(lane: number): string {
+  return LANE_COLORS[lane % LANE_COLORS.length];
+}
+
+/// Single-line commit row. Read order: HEAD pill → ref badges →
+/// subject (flex) → author (hidden on narrow widths) → relative time.
+/// Short sha is dropped from the row body since the rail node already
+/// carries lane identity and the user can copy the full sha from the
+/// right-click menu — the row reads cleaner without it.
+function CommitGraphRow({
+  commit,
+  active,
+  isHead,
+}: {
+  commit: GraphCommit;
+  active: boolean;
+  isHead: boolean;
+}): JSX.Element {
+  const ago = useMemo(() => relativeOrAbsolute(commit.date), [commit.date]);
+  // Refs minus the bare "HEAD" / "HEAD -> X" entries — those are
+  // represented by the HEAD pill so we don't double-up.
+  const branchRefs = useMemo(
+    () => commit.refs.filter((r) => !r.startsWith('HEAD')),
+    [commit.refs],
+  );
   return (
     <>
-      <div className="font-medium truncate">{commit.subject || '(no subject)'}</div>
-      <div className={`text-xs flex gap-2 ${active ? 'text-white/70' : 'text-ink-faint'}`}>
-        <span className="font-mono">{commit.shortSha}</span>
-        <span className="truncate">{commit.author}</span>
-        <span className="ml-auto">{date}</span>
-      </div>
+      {isHead && (
+        <span
+          className={`text-[9px] font-mono uppercase tracking-wide px-1.5 py-0.5 rounded leading-none flex-shrink-0 ${
+            active
+              ? 'bg-white/20 text-white'
+              : 'bg-accent/25 text-accent border border-accent/40'
+          }`}
+        >
+          HEAD
+        </span>
+      )}
+      {branchRefs.length > 0 && (
+        <RefBadges refs={branchRefs} laneColor={laneColor(commit.lane)} active={active} />
+      )}
+      <span
+        className={`truncate flex-1 min-w-0 ${active ? 'font-medium' : ''}`}
+        title={commit.subject}
+      >
+        {commit.subject || (
+          <span className={active ? 'text-white/70' : 'text-ink-faint'}>(no subject)</span>
+        )}
+      </span>
+      <span
+        className={`truncate hidden md:inline max-w-[110px] flex-shrink-0 ${
+          active ? 'text-white/70' : 'text-ink-faint'
+        }`}
+      >
+        {commit.author}
+      </span>
+      <span
+        className={`whitespace-nowrap text-right tabular-nums w-12 flex-shrink-0 ${
+          active ? 'text-white/70' : 'text-ink-faint'
+        }`}
+      >
+        {ago}
+      </span>
     </>
   );
+}
+
+/// Compact human-readable time. Recent → "now/2m/3h/4d"; older →
+/// "Mar 5" or "Mar 5 '24". Always 4–5 chars wide so the column stays
+/// neat across rows.
+function relativeOrAbsolute(iso: string): string {
+  if (!iso) return '';
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    const diff = Date.now() - d.getTime();
+    const m = Math.round(diff / 60000);
+    if (m < 1) return 'now';
+    if (m < 60) return `${m}m`;
+    const h = Math.round(m / 60);
+    if (h < 24) return `${h}h`;
+    const days = Math.round(h / 24);
+    if (days < 14) return `${days}d`;
+    const today = new Date();
+    const sameYear = d.getFullYear() === today.getFullYear();
+    return d.toLocaleDateString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      year: sameYear ? undefined : '2-digit',
+    });
+  } catch {
+    return iso;
+  }
+}
+
+function RefBadges({
+  refs,
+  laneColor,
+  active,
+}: {
+  refs: string[];
+  laneColor: string;
+  active: boolean;
+}): JSX.Element {
+  return (
+    <div className="flex gap-1 flex-shrink-0">
+      {refs.slice(0, 3).map((r) => {
+        const clean = r.replace(/^HEAD -> /, '');
+        const isHead = r.startsWith('HEAD');
+        return (
+          <span
+            key={r}
+            className="px-1.5 py-0.5 rounded text-[9px] font-mono leading-none"
+            style={{
+              background: active
+                ? 'rgba(255,255,255,0.18)'
+                : `color-mix(in srgb, ${laneColor} 22%, transparent)`,
+              border: `1px solid color-mix(in srgb, ${laneColor} 50%, transparent)`,
+              color: active ? '#fff' : isHead ? laneColor : 'var(--c-ink-muted)',
+              fontWeight: isHead ? 600 : 400,
+            }}
+            title={r}
+          >
+            {clean}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+/// Right-pane commit detail: smaller subject, full body, meta line,
+/// per-file change list with +/- counts, then the unified diff. Counts
+/// are derived client-side from the FileDiff body so we don't need a
+/// follow-up `git show --numstat` round-trip.
+function CommitDetail({
+  commit,
+  files,
+}: {
+  commit: GraphCommit;
+  files: FileDiff[] | null;
+}): JSX.Element {
+  const stats = useMemo(() => {
+    if (!files) return null;
+    let totalAdds = 0;
+    let totalDels = 0;
+    const perFile = files.map((f) => {
+      let adds = 0;
+      let dels = 0;
+      for (const line of f.body.split('\n')) {
+        if (line.startsWith('+') && !line.startsWith('+++')) adds += 1;
+        else if (line.startsWith('-') && !line.startsWith('---')) dels += 1;
+      }
+      totalAdds += adds;
+      totalDels += dels;
+      return { file: f, adds, dels };
+    });
+    return { totalAdds, totalDels, perFile };
+  }, [files]);
+
+  return (
+    <div className="h-full flex flex-col min-h-0">
+      {/* Sticky detail header — stays pinned while the diff body
+          scrolls so the user keeps the commit context in view. */}
+      <header className="flex-shrink-0 px-5 py-4 border-b border-card bg-surface-elevated">
+        <div className="flex items-center gap-2 flex-wrap mb-1">
+          {commit.refs.length > 0 && (
+            <RefBadges refs={commit.refs} laneColor={laneColor(commit.lane)} active={false} />
+          )}
+        </div>
+        <h2 className="text-sm font-semibold leading-snug">
+          {commit.subject || '(no subject)'}
+        </h2>
+        {commit.body && (
+          <pre className="mt-2 text-[12px] leading-relaxed text-ink-muted whitespace-pre-wrap font-sans max-w-prose">
+            {commit.body}
+          </pre>
+        )}
+        <div className="mt-3 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-ink-faint font-mono">
+          <span>{commit.shortSha}</span>
+          <span>{commit.author}</span>
+          {commit.authorEmail && <span>&lt;{commit.authorEmail}&gt;</span>}
+          <span>{formatDate(commit.date)}</span>
+          {commit.parents.length > 1 && (
+            <span title="Merge commit">merge of {commit.parents.length}</span>
+          )}
+          <button
+            onClick={() => navigator.clipboard.writeText(commit.sha)}
+            className="ml-auto text-[10px] text-ink-faint hover:text-ink underline-offset-2 hover:underline"
+            title="Copy full SHA"
+          >
+            Copy SHA
+          </button>
+        </div>
+      </header>
+
+      {stats && (
+        <div className="flex-shrink-0 px-5 py-3 border-b border-card bg-card/30">
+          <div className="flex items-baseline gap-3 mb-2">
+            <span className="text-[11px] uppercase tracking-wide text-ink-faint">
+              {stats.perFile.length}{' '}
+              {stats.perFile.length === 1 ? 'file changed' : 'files changed'}
+            </span>
+            {stats.totalAdds > 0 && (
+              <span className="text-[11px] font-mono text-emerald-400">
+                +{stats.totalAdds}
+              </span>
+            )}
+            {stats.totalDels > 0 && (
+              <span className="text-[11px] font-mono text-red-400">
+                −{stats.totalDels}
+              </span>
+            )}
+          </div>
+          <ul className="flex flex-col gap-0.5 max-h-[180px] overflow-y-auto">
+            {stats.perFile.map(({ file, adds, dels }) => (
+              <li
+                key={`${file.status}:${file.path}`}
+                className="flex items-center gap-2 text-[11px] py-0.5 hover:bg-card rounded px-1"
+              >
+                <FileDiffStatusBadge status={file.status} />
+                <button
+                  onClick={() => {
+                    document
+                      .getElementById(`diff-file-${file.path}`)
+                      ?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                  }}
+                  className="font-mono truncate flex-1 text-left text-ink hover:underline"
+                  title={file.path}
+                >
+                  {file.path}
+                </button>
+                <span className="font-mono text-emerald-400">+{adds}</span>
+                <span className="font-mono text-red-400">−{dels}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* Only this region scrolls so the header above stays sticky. */}
+      <div className="flex-1 min-h-0 overflow-y-auto p-4">
+        <DiffView files={files ?? []} />
+      </div>
+    </div>
+  );
+}
+
+function FileDiffStatusBadge({ status }: { status: FileDiff['status'] }): JSX.Element {
+  const map: Record<FileDiff['status'], string> = {
+    A: 'bg-emerald-500/20 text-emerald-300',
+    M: 'bg-amber-500/20 text-amber-300',
+    D: 'bg-red-500/20 text-red-300',
+    R: 'bg-sky-500/20 text-sky-300',
+    C: 'bg-sky-500/20 text-sky-300',
+    '?': 'bg-card text-ink-muted',
+  };
+  return (
+    <span
+      className={`inline-block px-1 rounded text-[9px] font-mono ${map[status]}`}
+    >
+      {status}
+    </span>
+  );
+}
+
+/// Changes-tab diff pane. Differs from the read-only `DiffView` in that
+/// each hunk gets its own "Stage / Discard" (or "Unstage") action so
+/// the user can commit a clean subset of a messy file. Patch is built
+/// from the file header + selected hunks and piped to `git apply`.
+function ChangesDiffPane({
+  repoId,
+  files,
+  side,
+}: {
+  repoId: UUID;
+  files: FileDiff[];
+  side: 'staged' | 'unstaged';
+}): JSX.Element {
+  const applyPatch = useStore((s) => s.applyPatch);
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  if (files.length === 0) {
+    return <div className="p-4 text-sm text-ink-faint">No changes.</div>;
+  }
+
+  const onHunk = async (
+    file: FileDiff,
+    hunk: ParsedHunk,
+    action: 'stage' | 'unstage' | 'discard',
+  ) => {
+    const key = `${file.path}@${hunk.startLine}:${action}`;
+    setBusyKey(key);
+    setError(null);
+    try {
+      const patch = buildHunkPatch(file, [hunk]);
+      const res = await applyPatch(repoId, patch, action);
+      if (!res.ok) setError(res.error ?? 'Apply failed');
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const onFileAction = async (
+    file: FileDiff,
+    action: 'stage' | 'unstage' | 'discard',
+  ) => {
+    const hunks = parseHunks(file);
+    if (hunks.length === 0) return;
+    const key = `${file.path}@all:${action}`;
+    setBusyKey(key);
+    setError(null);
+    try {
+      const patch = buildHunkPatch(file, hunks);
+      const res = await applyPatch(repoId, patch, action);
+      if (!res.ok) setError(res.error ?? 'Apply failed');
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-4 p-4">
+      {error && (
+        <div className="text-[11px] text-red-300 bg-red-500/10 border border-red-500/30 rounded px-3 py-2 flex items-start gap-2">
+          <span className="font-mono whitespace-pre-wrap flex-1">{error}</span>
+          <button
+            onClick={() => setError(null)}
+            className="text-ink-faint hover:text-ink"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+      {files.map((f) => (
+        <ChangesFileBlock
+          key={`${f.status}:${f.path}`}
+          file={f}
+          side={side}
+          busyKey={busyKey}
+          onHunk={onHunk}
+          onFileAction={onFileAction}
+        />
+      ))}
+    </div>
+  );
+}
+
+function ChangesFileBlock({
+  file,
+  side,
+  busyKey,
+  onHunk,
+  onFileAction,
+}: {
+  file: FileDiff;
+  side: 'staged' | 'unstaged';
+  busyKey: string | null;
+  onHunk: (
+    file: FileDiff,
+    hunk: ParsedHunk,
+    action: 'stage' | 'unstage' | 'discard',
+  ) => void;
+  onFileAction: (file: FileDiff, action: 'stage' | 'unstage' | 'discard') => void;
+}): JSX.Element {
+  const hunks = useMemo(() => parseHunks(file), [file]);
+
+  // Whole-file actions sit in the file header so the user can stage or
+  // discard everything in one click without scrolling. Hunk-level
+  // actions are still available below.
+  const wholeFileActions = side === 'staged' ? (['unstage'] as const) : (['stage', 'discard'] as const);
+
+  return (
+    <div
+      id={`diff-file-${file.path}`}
+      className="rounded border border-card overflow-hidden scroll-mt-4"
+    >
+      <div className="flex items-center gap-2 px-3 py-2 bg-card text-xs border-b border-card">
+        <FileStatusBadge status={file.status} />
+        <span className="font-mono truncate flex-1" title={file.path}>
+          {file.path}
+        </span>
+        <div className="flex gap-1">
+          {wholeFileActions.map((a) => {
+            const k = `${file.path}@all:${a}`;
+            const busy = busyKey === k;
+            const tone =
+              a === 'stage'
+                ? 'bg-accent text-white hover:bg-accent-strong border-accent'
+                : a === 'unstage'
+                  ? 'bg-accent text-white hover:bg-accent-strong border-accent'
+                  : 'border-red-500/40 text-red-300 hover:bg-red-500/10';
+            return (
+              <button
+                key={a}
+                disabled={busy}
+                onClick={() => {
+                  if (a === 'discard' && !window.confirm(`Discard all changes in ${file.path}?`))
+                    return;
+                  onFileAction(file, a);
+                }}
+                className={`text-[10px] uppercase tracking-wide font-mono h-6 px-2 rounded border ${tone} disabled:opacity-50`}
+              >
+                {busy ? '…' : a}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {hunks.length === 0 ? (
+        // Pure binary / rename / mode-change with no hunk body — the
+        // raw diff still has useful header info; render it plainly.
+        <pre className="text-xs leading-snug overflow-x-auto px-3 py-2 font-mono whitespace-pre">
+          {file.body.split('\n').map((line, i) => (
+            <DiffLine key={i} line={line} />
+          ))}
+        </pre>
+      ) : (
+        hunks.map((h) => (
+          <HunkBlock
+            key={`${file.path}@${h.startLine}`}
+            file={file}
+            hunk={h}
+            side={side}
+            busyKey={busyKey}
+            onHunk={onHunk}
+          />
+        ))
+      )}
+    </div>
+  );
+}
+
+function HunkBlock({
+  file,
+  hunk,
+  side,
+  busyKey,
+  onHunk,
+}: {
+  file: FileDiff;
+  hunk: ParsedHunk;
+  side: 'staged' | 'unstaged';
+  busyKey: string | null;
+  onHunk: (
+    file: FileDiff,
+    hunk: ParsedHunk,
+    action: 'stage' | 'unstage' | 'discard',
+  ) => void;
+}): JSX.Element {
+  const actions = side === 'staged' ? (['unstage'] as const) : (['stage', 'discard'] as const);
+  const adds = hunk.lines.filter((l) => l.startsWith('+')).length;
+  const dels = hunk.lines.filter((l) => l.startsWith('-')).length;
+  return (
+    <div className="group">
+      <div className="flex items-center gap-2 px-3 py-1 bg-card/50 border-b border-card text-[11px] font-mono">
+        <span className="text-ink-faint truncate flex-1" title={hunk.header}>
+          {hunk.header.replace(/\s+@@.*$/, ' @@')}
+        </span>
+        {adds > 0 && <span className="text-emerald-400">+{adds}</span>}
+        {dels > 0 && <span className="text-red-400">−{dels}</span>}
+        <div className="flex gap-1 transition-opacity opacity-0 group-hover:opacity-100 focus-within:opacity-100">
+          {actions.map((a) => {
+            const k = `${file.path}@${hunk.startLine}:${a}`;
+            const busy = busyKey === k;
+            const tone =
+              a === 'stage' || a === 'unstage'
+                ? 'bg-accent text-white hover:bg-accent-strong border-accent'
+                : 'border-red-500/40 text-red-300 hover:bg-red-500/10';
+            const label = a === 'stage' ? 'Stage hunk' : a === 'unstage' ? 'Unstage hunk' : 'Discard hunk';
+            return (
+              <button
+                key={a}
+                disabled={busy}
+                onClick={() => {
+                  if (a === 'discard' && !window.confirm('Discard this hunk? This cannot be undone.'))
+                    return;
+                  onHunk(file, hunk, a);
+                }}
+                className={`text-[10px] uppercase tracking-wide font-mono h-6 px-2 rounded border ${tone} disabled:opacity-50`}
+              >
+                {busy ? '…' : label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <pre className="text-xs leading-snug overflow-x-auto px-3 py-2 font-mono whitespace-pre">
+        <DiffLine line={hunk.header} />
+        {hunk.lines.map((line, i) => (
+          <DiffLine key={i} line={line} />
+        ))}
+      </pre>
+    </div>
+  );
+}
+
+interface ParsedHunk {
+  /// The raw `@@ -x,y +a,b @@ ...` header line.
+  header: string;
+  /// All the lines after the header that belong to this hunk
+  /// (' '/'+'/'-'/'\' for "no newline at end of file"). Excludes the
+  /// header itself.
+  lines: string[];
+  /// Index into the file body's line array where this hunk's `@@`
+  /// header lives — used as a stable identity for a hunk within a
+  /// file, since a single file can have several hunks at the same
+  /// line number after edits.
+  startLine: number;
+}
+
+/// Parse a `FileDiff.body` (full diff including the `diff --git`
+/// preamble) into discrete hunks. The preamble before the first `@@`
+/// is the file header and is reused for every constructed sub-patch.
+function parseHunks(file: FileDiff): ParsedHunk[] {
+  const lines = file.body.split('\n');
+  const out: ParsedHunk[] = [];
+  let cur: ParsedHunk | null = null;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (line.startsWith('@@')) {
+      if (cur) out.push(cur);
+      cur = { header: line, lines: [], startLine: i };
+      continue;
+    }
+    // Anything before the first `@@` is the file header — skip when
+    // we don't have a hunk yet. After the first `@@`, capture content
+    // until the next `@@`.
+    if (cur) cur.lines.push(line);
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/// Re-build a syntactically-valid unified-diff patch with the file's
+/// existing header followed by the chosen hunks. We reuse `file.body`'s
+/// preamble verbatim so `index <oldsha>..<newsha>` and the path lines
+/// match what git would expect.
+function buildHunkPatch(file: FileDiff, hunks: ParsedHunk[]): string {
+  const lines = file.body.split('\n');
+  // Find the first `@@` — everything before it is the file header.
+  let firstHunkAt = -1;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (lines[i].startsWith('@@')) {
+      firstHunkAt = i;
+      break;
+    }
+  }
+  const header = (firstHunkAt === -1 ? lines : lines.slice(0, firstHunkAt)).join('\n');
+  const body = hunks
+    .map((h) => [h.header, ...h.lines].join('\n'))
+    .join('\n');
+  return `${header}\n${body}\n`;
 }
 
 function DiffView({ files }: { files: FileDiff[] }): JSX.Element {
@@ -1472,7 +2561,10 @@ function DiffView({ files }: { files: FileDiff[] }): JSX.Element {
 
 function FileDiffBlock({ file }: { file: FileDiff }): JSX.Element {
   return (
-    <div className="rounded border border-card overflow-hidden">
+    <div
+      id={`diff-file-${file.path}`}
+      className="rounded border border-card overflow-hidden scroll-mt-4"
+    >
       <div className="flex items-center gap-2 px-3 py-2 bg-card text-xs border-b border-card">
         <FileStatusBadge status={file.status} />
         <span className="font-mono truncate">{file.path}</span>
