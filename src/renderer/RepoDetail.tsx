@@ -106,11 +106,37 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
     return () => window.removeEventListener('overgit:openBranchPicker', onOpen);
   }, []);
 
+  const setSheet = useStore((s) => s.setSheet);
+
   const onAction = (fn: () => Promise<{ ok: boolean; error?: string }>) => async () => {
     setBusy(true);
     try {
       const res = await fn();
       if (!res.ok) alert(res.error ?? 'Action failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /// Pull is special — its failure mode is often "local changes would
+  /// be overwritten" and our store-side `pullRepo` reports the
+  /// conflicts. Route those into the PullConflictSheet so the user has
+  /// real recovery options instead of just an alert.
+  const onPull = async () => {
+    setBusy(true);
+    try {
+      const res = await pullRepo(repoId);
+      if (res.ok) return;
+      if (res.conflicts && res.conflicts.length > 0) {
+        setSheet({
+          kind: 'pullConflict',
+          repoId,
+          conflicts: res.conflicts,
+          rawError: res.error ?? '',
+        });
+        return;
+      }
+      alert(res.error ?? 'Pull failed');
     } finally {
       setBusy(false);
     }
@@ -151,7 +177,7 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
         </button>
         <button
           disabled={busy || !status?.branch}
-          onClick={onAction(() => pullRepo(repoId))}
+          onClick={onPull}
           className="text-xs px-2.5 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
         >
           Pull{status?.behind ? ` ↓${status.behind}` : ''}
@@ -272,6 +298,36 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
   useEffect(() => {
     setStagedChecked((cur) => pruneChecked(cur, ch?.staged ?? []));
     setUnstagedChecked((cur) => pruneChecked(cur, ch?.unstaged ?? []));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ch?.staged, ch?.unstaged]);
+
+  // Auto-advance the diff preview after a hunk-action drains the
+  // current file. If the selected path is no longer present in its
+  // side (because the user staged / discarded the only remaining
+  // hunk), pick the next file in that side so the user keeps moving
+  // without having to manually click. Falls through to clearing the
+  // selection when the side is empty.
+  useEffect(() => {
+    if (!selected) return;
+    const list = selected.side === 'staged' ? ch?.staged ?? [] : ch?.unstaged ?? [];
+    if (list.some((f) => f.path === selected.path)) return;
+    if (list.length === 0) {
+      // Try the other side before giving up — common case after a
+      // successful "Stage hunk" empties the unstaged list for that
+      // file but the staged side now has it.
+      const other = selected.side === 'staged' ? ch?.unstaged ?? [] : ch?.staged ?? [];
+      if (other.length === 0) {
+        setSelected(null);
+        return;
+      }
+      const fallback = other[0];
+      setSelected({ path: fallback.path, side: selected.side === 'staged' ? 'unstaged' : 'staged' });
+      loadDiff(repoId, fallback.path, selected.side === 'staged' ? 'unstaged' : 'staged');
+      return;
+    }
+    const next = list[0];
+    setSelected({ path: next.path, side: selected.side });
+    loadDiff(repoId, next.path, selected.side);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ch?.staged, ch?.unstaged]);
 
@@ -1345,6 +1401,11 @@ function StashTab({ repoId }: { repoId: UUID }): JSX.Element {
   const applyStash = useStore((s) => s.applyStash);
   const applyStashForce = useStore((s) => s.applyStashForce);
   const dropStash = useStore((s) => s.dropStash);
+  // Note: no `openFile` here on purpose. A stash diff shows the
+  // stashed content, which usually doesn't match what's on disk —
+  // clicking Open would either silently load the wrong version
+  // (working tree) or fail (file deleted). Apply / Pop the stash
+  // first to surface the file in the working tree, then open it.
 
   const [selected, setSelected] = useState<number | null>(null);
   const [files, setFiles] = useState<FileDiff[] | null>(null);
@@ -1478,54 +1539,67 @@ function StashTab({ repoId }: { repoId: UUID }): JSX.Element {
       <aside className="overflow-y-auto border-r border-card">
         {stashes && stashes.length > 0 ? (
           <ul>
-            {stashes.map((s) => (
-              <li key={s.ref}>
-                <button
-                  onClick={() => setSelected(s.index)}
-                  className={`w-full text-left px-4 py-2.5 border-b border-card ${
-                    selected === s.index ? 'bg-accent text-white' : 'hover:bg-card'
-                  }`}
-                >
-                  <div className="flex items-center gap-2 min-w-0">
+            {stashes.map((s) => {
+              const active = selected === s.index;
+              return (
+                <li key={s.ref}>
+                  <button
+                    onClick={() => setSelected(s.index)}
+                    style={{ height: ROW_HEIGHT }}
+                    className={`w-full text-left flex items-center gap-2 px-3 text-xs border-b border-card ${
+                      active ? 'bg-accent text-white' : 'hover:bg-card'
+                    }`}
+                  >
+                    {/* Single-line row, mirrors the History tab so the
+                        two views feel cut from the same cloth. Layout:
+                        index pill → branch tag → subject (flex) →
+                        sha → relative time. */}
                     <span
-                      className={`text-[10px] font-mono ${
-                        selected === s.index ? 'text-white/80' : 'text-ink-faint'
+                      className={`text-[9px] font-mono uppercase tracking-wide px-1 py-0.5 rounded leading-none flex-shrink-0 ${
+                        active
+                          ? 'bg-white/20 text-white'
+                          : 'bg-card text-ink-muted border border-card'
                       }`}
                     >
-                      stash@{'{'}
-                      {s.index}
-                      {'}'}
+                      {`{${s.index}}`}
                     </span>
                     {s.branch && (
                       <span
-                        className={`text-[10px] font-mono ${
-                          selected === s.index ? 'text-white/80' : 'text-sky-300/80'
+                        className={`text-[10px] font-mono flex-shrink-0 ${
+                          active ? 'text-white/80' : 'text-sky-300/80'
                         }`}
                       >
                         on {s.branch}
                       </span>
                     )}
                     <span
-                      className={`text-[10px] ml-auto font-mono ${
-                        selected === s.index ? 'text-white/70' : 'text-ink-faint'
+                      className={`truncate flex-1 min-w-0 ${active ? 'font-medium' : ''}`}
+                      title={s.subject}
+                    >
+                      {s.subject || (
+                        <span className={active ? 'text-white/70' : 'text-ink-faint'}>
+                          (no message)
+                        </span>
+                      )}
+                    </span>
+                    <span
+                      className={`font-mono w-14 truncate text-right flex-shrink-0 ${
+                        active ? 'text-white/70' : 'text-ink-faint'
                       }`}
                     >
-                      {relativeAgo(s.date)}
+                      {s.shortSha}
                     </span>
-                  </div>
-                  <div className="text-xs mt-0.5 truncate" title={s.subject}>
-                    {s.subject || '(no message)'}
-                  </div>
-                  <div
-                    className={`text-[10px] mt-0.5 font-mono ${
-                      selected === s.index ? 'text-white/60' : 'text-ink-faint'
-                    }`}
-                  >
-                    {s.shortSha}
-                  </div>
-                </button>
-              </li>
-            ))}
+                    <span
+                      className={`whitespace-nowrap text-right tabular-nums w-12 flex-shrink-0 ${
+                        active ? 'text-white/70' : 'text-ink-faint'
+                      }`}
+                    >
+                      {relativeOrAbsolute(s.date)}
+                    </span>
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         ) : null}
       </aside>
@@ -1707,6 +1781,18 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
   const asideWidth = useStore((s) => s.settings.historyAsideWidth);
   const setAsideWidth = useStore((s) => s.setHistoryAsideWidth);
   const createBranch = useStore((s) => s.createRepoBranch);
+  const repoPath = useStore((s) => s.repos.find((r) => r.id === repoId)?.path);
+  const openRepoFile = useStore((s) => s.openRepoFile);
+
+  // Shared "Open in editor" handler for every diff rendered in this
+  // tab. Working-tree diff and per-commit detail use the same path —
+  // the file's working-tree state is what the user wants to inspect
+  // even when looking at a historical commit.
+  const openFile = (f: FileDiff) => {
+    if (!repoPath) return;
+    window.dispatchEvent(new CustomEvent('overgit:setRepoTab', { detail: 'files' }));
+    void openRepoFile(repoId, joinRepoPath(repoPath, f.path));
+  };
 
   const [selected, setSelected] = useState<string | 'working'>('working');
   const [filter, setFilter] = useState('');
@@ -1984,10 +2070,14 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
             <div className="mb-3 px-1 text-[11px] uppercase tracking-wide text-ink-faint">
               Working tree · staged + unstaged vs HEAD
             </div>
-            <DiffView files={diffEntry?.files ?? []} />
+            <DiffView files={diffEntry?.files ?? []} onOpenFile={openFile} />
           </div>
         ) : selectedCommit ? (
-          <CommitDetail commit={selectedCommit} files={diffEntry?.files ?? null} />
+          <CommitDetail
+            commit={selectedCommit}
+            files={diffEntry?.files ?? null}
+            onOpenFile={openFile}
+          />
         ) : (
           <div className="p-4 text-xs text-ink-faint">Loading…</div>
         )}
@@ -2332,9 +2422,13 @@ function RefBadges({
 function CommitDetail({
   commit,
   files,
+  onOpenFile,
 }: {
   commit: GraphCommit;
   files: FileDiff[] | null;
+  /// Forwarded to DiffView so each per-file block can render an
+  /// "Open" affordance that lands the file in the Files tab.
+  onOpenFile?: (file: FileDiff) => void;
 }): JSX.Element {
   const stats = useMemo(() => {
     if (!files) return null;
@@ -2436,7 +2530,7 @@ function CommitDetail({
 
       {/* Only this region scrolls so the header above stays sticky. */}
       <div className="flex-1 min-h-0 overflow-y-auto p-4">
-        <DiffView files={files ?? []} />
+        <DiffView files={files ?? []} onOpenFile={onOpenFile} />
       </div>
     </div>
   );
@@ -2751,7 +2845,17 @@ function buildHunkPatch(file: FileDiff, hunks: ParsedHunk[]): string {
   return `${header}\n${body}\n`;
 }
 
-function DiffView({ files }: { files: FileDiff[] }): JSX.Element {
+function DiffView({
+  files,
+  onOpenFile,
+}: {
+  files: FileDiff[];
+  /// Optional "open in editor" callback. When provided, each file
+  /// gets an Open button in its header that hands the path off to the
+  /// caller (typically: navigate to the Files tab and load it). Hidden
+  /// for files git considers deleted — there's nothing on disk.
+  onOpenFile?: (file: FileDiff) => void;
+}): JSX.Element {
   if (files.length === 0) {
     return (
       <div className="text-sm text-ink-faint px-2 py-4">
@@ -2762,21 +2866,39 @@ function DiffView({ files }: { files: FileDiff[] }): JSX.Element {
   return (
     <div className="flex flex-col gap-4">
       {files.map((f) => (
-        <FileDiffBlock key={`${f.status}:${f.path}`} file={f} />
+        <FileDiffBlock key={`${f.status}:${f.path}`} file={f} onOpenFile={onOpenFile} />
       ))}
     </div>
   );
 }
 
-function FileDiffBlock({ file }: { file: FileDiff }): JSX.Element {
+function FileDiffBlock({
+  file,
+  onOpenFile,
+}: {
+  file: FileDiff;
+  onOpenFile?: (file: FileDiff) => void;
+}): JSX.Element {
+  const canOpen = !!onOpenFile && file.status !== 'D';
   return (
     <div
       id={`diff-file-${file.path}`}
-      className="rounded border border-card overflow-hidden scroll-mt-4"
+      className="rounded border border-card overflow-hidden scroll-mt-4 group"
     >
       <div className="flex items-center gap-2 px-3 py-2 bg-card text-xs border-b border-card">
         <FileStatusBadge status={file.status} />
-        <span className="font-mono truncate">{file.path}</span>
+        <span className="font-mono truncate flex-1" title={file.path}>
+          {file.path}
+        </span>
+        {canOpen && (
+          <button
+            onClick={() => onOpenFile?.(file)}
+            title="Open in Files tab"
+            className="text-[10px] uppercase tracking-wide font-mono px-2 h-6 rounded text-ink-muted hover:text-ink hover:bg-surface-elevated transition-opacity opacity-0 group-hover:opacity-100 focus:opacity-100"
+          >
+            Open
+          </button>
+        )}
       </div>
       <pre className="text-xs leading-snug overflow-x-auto px-3 py-2 font-mono whitespace-pre">
         {file.body.split('\n').map((line, i) => (

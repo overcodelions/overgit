@@ -289,6 +289,33 @@ export async function rawDiff(
   return { ok: true, text: res.stdout };
 }
 
+/// Parse the "Your local changes to the following files would be
+/// overwritten by merge" block out of git stderr. Returns the paths
+/// it lists. Empty when the error isn't this shape.
+export function parseLocalChangesBlocked(stderr: string): string[] {
+  if (!/would be overwritten by (merge|checkout)/i.test(stderr)) return [];
+  const paths: string[] = [];
+  const lines = stderr.split('\n');
+  let inBlock = false;
+  for (const line of lines) {
+    if (/Your local changes to the following files would be overwritten/i.test(line)) {
+      inBlock = true;
+      continue;
+    }
+    if (!inBlock) continue;
+    if (/^Please commit your changes/i.test(line) || /^Aborting/i.test(line) || line.trim() === '') {
+      // End of the block — git terminates with "Please commit ..." or
+      // a blank line before the abort message.
+      if (/^Please commit/i.test(line) || /^Aborting/i.test(line)) break;
+      continue;
+    }
+    // The path lines are indented by a tab in git's output. Trim it.
+    const p = line.replace(/^\s+/, '').trim();
+    if (p) paths.push(p);
+  }
+  return paths;
+}
+
 export async function fetch(repoPath: string): Promise<{ ok: boolean; error?: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
   const res = await run(repoPath, ['fetch', '--all', '--prune']);
@@ -1010,15 +1037,82 @@ export async function push(repoPath: string): Promise<{ ok: boolean; error?: str
   return { ok: false, error: res.stderr.trim() || `git push exited ${res.code}` };
 }
 
-export async function pull(repoPath: string): Promise<{ ok: boolean; error?: string }> {
+export async function pull(
+  repoPath: string,
+): Promise<{ ok: boolean; error?: string; conflicts?: string[] }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
-  // Default to merge-pull (`--no-rebase`) so we don't surprise users
-  // whose repos are configured for rebase or fast-forward-only — both
-  // common, and silently doing the other strategy can rewrite history.
-  // Users who want rebase can run it from their shell.
   const res = await run(repoPath, ['pull', '--no-rebase']);
   if (res.ok) return { ok: true };
-  return { ok: false, error: res.stderr.trim() || `git pull exited ${res.code}` };
+  // Detect "would be overwritten" so the renderer can offer recovery
+  // (stash & retry / discard & retry) instead of just dumping git's
+  // wall of text into an alert.
+  const blocked = parseLocalChangesBlocked(res.stderr);
+  return {
+    ok: false,
+    error: res.stderr.trim() || `git pull exited ${res.code}`,
+    conflicts: blocked.length ? blocked : undefined,
+  };
+}
+
+/// Recovery flow when pull is blocked by local changes. Two strategies:
+///   stash    → `git stash push --include-untracked -m "auto: pull" -- <paths>`
+///              then pull. The stash stays around so the user can pop
+///              it later if they want their changes back.
+///   discard  → `git checkout HEAD -- <paths>` then pull. Destructive
+///              (the local changes are gone), so the renderer must
+///              confirm before calling.
+export async function pullForce(
+  repoPath: string,
+  conflicts: string[],
+  strategy: 'stash' | 'discard',
+): Promise<{ ok: boolean; error?: string; stashed?: boolean }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  if (conflicts.length === 0) return { ok: false, error: 'No conflicting paths' };
+  // Validate paths against the repo root the same way applyStashForce
+  // does — defends against ".." escapes in any caller.
+  for (const rel of conflicts) {
+    const full = path.resolve(repoPath, rel);
+    const root = path.resolve(repoPath);
+    if (full !== root && !full.startsWith(root + path.sep)) {
+      return { ok: false, error: `Refusing to act on "${rel}" — escapes the repo.` };
+    }
+  }
+
+  if (strategy === 'stash') {
+    const stash = await run(repoPath, [
+      'stash',
+      'push',
+      '--include-untracked',
+      '-m',
+      'auto: pull',
+      '--',
+      ...conflicts,
+    ]);
+    if (!stash.ok) {
+      return {
+        ok: false,
+        error: stash.stderr.trim() || `git stash exited ${stash.code}`,
+      };
+    }
+  } else {
+    const reset = await run(repoPath, ['checkout', 'HEAD', '--', ...conflicts]);
+    if (!reset.ok) {
+      return {
+        ok: false,
+        error: reset.stderr.trim() || `git checkout exited ${reset.code}`,
+      };
+    }
+  }
+
+  const pullRes = await run(repoPath, ['pull', '--no-rebase']);
+  if (pullRes.ok) {
+    return { ok: true, stashed: strategy === 'stash' };
+  }
+  return {
+    ok: false,
+    error: pullRes.stderr.trim() || `git pull exited ${pullRes.code}`,
+    stashed: strategy === 'stash',
+  };
 }
 
 /// Detach HEAD onto an arbitrary commit SHA. Useful from the History
