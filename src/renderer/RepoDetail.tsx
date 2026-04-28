@@ -166,6 +166,7 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
           <span className="text-[9px] text-ink-faint">▾</span>
         </button>
 
+        {status && <WorktreeDeltaPill status={status} />}
         {status && <TrunkDistancePill status={status} />}
 
         <div className="w-px h-5 bg-card mx-1" />
@@ -209,6 +210,36 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
 /// default, no default configured, or the comparison ref couldn't be
 /// resolved). Tone scales with severity: subtle when in-sync or only
 /// ahead, amber when behind, red+amber when both diverged.
+/// Compact "+47 −12" pill for the working tree's total delta against
+/// HEAD. Hidden when the tree is clean OR when shortstat hasn't
+/// reported anything yet (fresh-clone repos with no commits). The
+/// dirty-files count gets a tooltip so users can see "5 files" without
+/// us claiming a third slot in the header.
+function WorktreeDeltaPill({ status }: { status: RepoStatus }): JSX.Element | null {
+  const adds = status.worktreeAdds;
+  const dels = status.worktreeDels;
+  if (adds === null || dels === null) return null;
+  if (adds === 0 && dels === 0 && status.dirtyCount === 0) return null;
+  const fileWord = status.dirtyCount === 1 ? 'file' : 'files';
+  return (
+    <span
+      className="text-[10px] px-2 h-7 rounded border border-card bg-card/40 inline-flex items-center gap-1.5 leading-none whitespace-nowrap"
+      title={`${status.dirtyCount} ${fileWord} changed · ${adds} insertion${
+        adds === 1 ? '' : 's'
+      }, ${dels} deletion${dels === 1 ? '' : 's'} vs HEAD`}
+    >
+      {adds > 0 && <span className="font-mono text-emerald-400">+{adds}</span>}
+      {dels > 0 && <span className="font-mono text-red-400">−{dels}</span>}
+      {adds === 0 && dels === 0 && (
+        <span className="text-ink-faint">untracked only</span>
+      )}
+      <span className="text-ink-faint">
+        {status.dirtyCount} {fileWord}
+      </span>
+    </span>
+  );
+}
+
 function TrunkDistancePill({ status }: { status: RepoStatus }): JSX.Element | null {
   const { aheadDefault, behindDefault, defaultRef } = status;
   if (
@@ -224,43 +255,53 @@ function TrunkDistancePill({ status }: { status: RepoStatus }): JSX.Element | nu
 
   const tone = inSync
     ? 'border-emerald-500/30 text-emerald-400 bg-emerald-500/5'
-    : onlyBehind
+    : onlyBehind || diverged
       ? 'border-amber-500/40 text-amber-300 bg-amber-500/10'
-      : diverged
-        ? 'border-amber-500/40 text-amber-300 bg-amber-500/10'
-        : 'border-card text-ink-muted bg-card/40';
+      : 'border-card text-ink-muted bg-card/40';
 
-  // When in-sync we still want the user to see the trunk reference —
-  // it's reassuring confirmation, not noise. When they diverge, the
-  // counts speak for themselves.
+  // Drop the path prefix on the trunk ref for the visible label (the
+  // pill stays narrow) while keeping the full ref in the tooltip.
+  // "origin/main" → "main"; "main" → "main".
+  const shortRef = defaultRef.replace(/^[^/]+\//, '');
+
+  // English-first labels. The earlier "↓5 ↑3 vs origin/main" form
+  // crammed three concepts and a preposition into a few characters
+  // and read like glyph soup. New form uses words: "5 behind / 3
+  // ahead of main", or "Up to date with main", with the title carrying
+  // the full ref for users who care which remote they're comparing.
   const title = inSync
-    ? `In sync with ${defaultRef}`
+    ? `Up to date with ${defaultRef}`
     : `${behindDefault} commit${behindDefault === 1 ? '' : 's'} behind, ${aheadDefault} ahead of ${defaultRef}`;
 
   return (
     <span
-      className={`text-[10px] font-mono px-2 h-7 rounded border inline-flex items-center gap-1.5 leading-none ${tone}`}
+      className={`text-[10px] px-2 h-7 rounded border inline-flex items-center gap-1.5 leading-none whitespace-nowrap ${tone}`}
       title={title}
     >
       {inSync ? (
         <>
           <span>✓</span>
-          <span>vs {defaultRef}</span>
+          <span>
+            Up to date with <span className="font-mono">{shortRef}</span>
+          </span>
         </>
       ) : (
         <>
           {behindDefault > 0 && (
             <span>
-              ↓{behindDefault}
+              <span className="font-mono">{behindDefault}</span> behind
             </span>
+          )}
+          {behindDefault > 0 && aheadDefault > 0 && (
+            <span className="text-ink-faint">·</span>
           )}
           {aheadDefault > 0 && (
             <span className={behindDefault > 0 ? '' : 'text-emerald-400'}>
-              ↑{aheadDefault}
+              <span className="font-mono">{aheadDefault}</span> ahead
             </span>
           )}
           <span className={behindDefault > 0 ? 'text-amber-300/80' : 'text-ink-muted'}>
-            vs {defaultRef}
+            of <span className="font-mono">{shortRef}</span>
           </span>
         </>
       )}

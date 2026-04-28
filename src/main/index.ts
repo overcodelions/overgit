@@ -193,6 +193,8 @@ function registerIpc(): void {
         repoId,
         branch: null,
         dirtyCount: 0,
+        worktreeAdds: null,
+        worktreeDels: null,
         ahead: null,
         behind: null,
         aheadDefault: null,
