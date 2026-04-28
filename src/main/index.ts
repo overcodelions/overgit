@@ -189,9 +189,21 @@ function registerIpc(): void {
   ipcMain.handle('repo:status', async (_e, repoId: string) => {
     const repo = Store.load().repos.find((r) => r.id === repoId);
     if (!repo) {
-      return { repoId, branch: null, dirtyCount: 0, ahead: null, behind: null, error: 'Unknown repo' };
+      return {
+        repoId,
+        branch: null,
+        dirtyCount: 0,
+        ahead: null,
+        behind: null,
+        aheadDefault: null,
+        behindDefault: null,
+        defaultRef: null,
+        inProgress: null,
+        conflicts: [],
+        error: 'Unknown repo',
+      };
     }
-    return gitStatus(repo.id, repo.path);
+    return gitStatus(repo.id, repo.path, repo.defaultBranch);
   });
 
   ipcMain.handle('repo:listBranches', async (_e, repoId: string) => {

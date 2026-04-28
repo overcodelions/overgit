@@ -64,7 +64,11 @@ export function looksLikeRepo(repoPath: string): boolean {
   }
 }
 
-export async function status(repoId: UUID, repoPath: string): Promise<RepoStatus> {
+export async function status(
+  repoId: UUID,
+  repoPath: string,
+  defaultBranch?: string,
+): Promise<RepoStatus> {
   if (!looksLikeRepo(repoPath)) {
     return {
       repoId,
@@ -72,6 +76,9 @@ export async function status(repoId: UUID, repoPath: string): Promise<RepoStatus
       dirtyCount: 0,
       ahead: null,
       behind: null,
+      aheadDefault: null,
+      behindDefault: null,
+      defaultRef: null,
       inProgress: null,
       conflicts: [],
       error: 'Not a git repo',
@@ -126,12 +133,56 @@ export async function status(repoId: UUID, repoPath: string): Promise<RepoStatus
     }
   }
 
+  // Distance from the repo's "trunk" (default branch). Compared
+  // against `origin/<default>` when that ref exists — that's the
+  // up-to-date version after a fetch, which is what tells the user
+  // "you're 12 behind main, time to rebase." Falls back to the local
+  // default when origin/* isn't around (e.g. local-only repo). Null
+  // when no default is configured, or when HEAD IS the default
+  // (comparison would be 0/0 forever).
+  let aheadDefault: number | null = null;
+  let behindDefault: number | null = null;
+  let defaultRef: string | null = null;
+  if (defaultBranch && branch && branch !== defaultBranch) {
+    const remoteRef = `refs/remotes/origin/${defaultBranch}`;
+    const localRef = `refs/heads/${defaultBranch}`;
+    const remoteExists = await run(repoPath, ['show-ref', '--verify', '--quiet', remoteRef]);
+    const localExists = await run(repoPath, ['show-ref', '--verify', '--quiet', localRef]);
+    const ref = remoteExists.ok
+      ? `origin/${defaultBranch}`
+      : localExists.ok
+        ? defaultBranch
+        : null;
+    if (ref) {
+      const cmp = await run(repoPath, [
+        'rev-list',
+        '--left-right',
+        '--count',
+        `${ref}...HEAD`,
+      ]);
+      if (cmp.ok) {
+        const [b, a] = cmp.stdout
+          .trim()
+          .split(/\s+/)
+          .map((n) => Number.parseInt(n, 10));
+        if (Number.isFinite(b) && Number.isFinite(a)) {
+          behindDefault = b;
+          aheadDefault = a;
+          defaultRef = ref;
+        }
+      }
+    }
+  }
+
   return {
     repoId,
     branch,
     dirtyCount,
     ahead,
     behind,
+    aheadDefault,
+    behindDefault,
+    defaultRef,
     inProgress: detectInProgress(repoPath),
     conflicts,
   };
