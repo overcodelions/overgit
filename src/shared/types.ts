@@ -44,6 +44,17 @@ export interface RepoStatus {
   /// Commits ahead/behind upstream. null if no upstream is configured.
   ahead: number | null;
   behind: number | null;
+  /// Commits ahead/behind the repo's default branch — `origin/<default>`
+  /// when available, else the local default. The renderer surfaces
+  /// this as a pill so the user knows whether their feature branch is
+  /// drifting from main without having to git fetch + rev-list. null
+  /// when no default branch is configured or the user is currently on
+  /// the default branch (the comparison would be self-vs-self).
+  aheadDefault: number | null;
+  behindDefault: number | null;
+  /// The ref string we compared against (e.g. "origin/main"). null
+  /// matches the null counts; the renderer uses it as a label.
+  defaultRef: string | null;
   /// In-progress operation: merge, rebase, or cherry-pick. Detected by
   /// the presence of MERGE_HEAD / rebase-merge / CHERRY_PICK_HEAD in
   /// the .git directory. null when nothing's pending. The renderer

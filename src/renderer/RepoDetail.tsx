@@ -166,6 +166,8 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
           <span className="text-[9px] text-ink-faint">▾</span>
         </button>
 
+        {status && <TrunkDistancePill status={status} />}
+
         <div className="w-px h-5 bg-card mx-1" />
 
         <button
@@ -199,6 +201,70 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
         />
       )}
     </header>
+  );
+}
+
+/// Compact "how far am I from trunk" pill rendered next to the branch
+/// button. Hidden when comparison isn't meaningful (HEAD is the
+/// default, no default configured, or the comparison ref couldn't be
+/// resolved). Tone scales with severity: subtle when in-sync or only
+/// ahead, amber when behind, red+amber when both diverged.
+function TrunkDistancePill({ status }: { status: RepoStatus }): JSX.Element | null {
+  const { aheadDefault, behindDefault, defaultRef } = status;
+  if (
+    aheadDefault === null ||
+    behindDefault === null ||
+    defaultRef === null
+  ) {
+    return null;
+  }
+  const inSync = aheadDefault === 0 && behindDefault === 0;
+  const onlyBehind = behindDefault > 0 && aheadDefault === 0;
+  const diverged = behindDefault > 0 && aheadDefault > 0;
+
+  const tone = inSync
+    ? 'border-emerald-500/30 text-emerald-400 bg-emerald-500/5'
+    : onlyBehind
+      ? 'border-amber-500/40 text-amber-300 bg-amber-500/10'
+      : diverged
+        ? 'border-amber-500/40 text-amber-300 bg-amber-500/10'
+        : 'border-card text-ink-muted bg-card/40';
+
+  // When in-sync we still want the user to see the trunk reference —
+  // it's reassuring confirmation, not noise. When they diverge, the
+  // counts speak for themselves.
+  const title = inSync
+    ? `In sync with ${defaultRef}`
+    : `${behindDefault} commit${behindDefault === 1 ? '' : 's'} behind, ${aheadDefault} ahead of ${defaultRef}`;
+
+  return (
+    <span
+      className={`text-[10px] font-mono px-2 h-7 rounded border inline-flex items-center gap-1.5 leading-none ${tone}`}
+      title={title}
+    >
+      {inSync ? (
+        <>
+          <span>✓</span>
+          <span>vs {defaultRef}</span>
+        </>
+      ) : (
+        <>
+          {behindDefault > 0 && (
+            <span>
+              ↓{behindDefault}
+            </span>
+          )}
+          {aheadDefault > 0 && (
+            <span className={behindDefault > 0 ? '' : 'text-emerald-400'}>
+              ↑{aheadDefault}
+            </span>
+          )}
+          <span className={behindDefault > 0 ? 'text-amber-300/80' : 'text-ink-muted'}>
+            vs {defaultRef}
+          </span>
+        </>
+      )}
+    </span>
   );
 }
 
@@ -382,16 +448,28 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
   };
 
   const onCommit = async () => {
-    // Amend allows commit with no staged changes (just rewrites the
-    // previous commit's message). Plain commit requires both a message
-    // AND something staged.
-    if (amendMode) {
-      if (!message.trim()) return;
-    } else if (!message.trim() || staged.length === 0) {
-      return;
-    }
+    // Three shapes:
+    //   amend       → rewrites HEAD's message (+ staged set, if any).
+    //                 Allowed even when nothing is staged.
+    //   commit-all  → no staged set, but unstaged exist: stage every
+    //                 unstaged path first, then commit. The button
+    //                 label spells this out as "Commit all (N)" so
+    //                 there's no invisible auto-staging.
+    //   commit      → commit the explicit staged set.
+    if (!message.trim()) return;
+    if (!amendMode && staged.length === 0 && unstaged.length === 0) return;
     setBusy(true);
     try {
+      if (!amendMode && staged.length === 0 && unstaged.length > 0) {
+        const stageRes = await stage(
+          repoId,
+          unstaged.map((f) => f.path),
+        );
+        // `stageFiles` returns void in the store; if it threw, the
+        // store would surface it. Move on to the commit either way —
+        // git commit will fail loudly if nothing landed in the index.
+        void stageRes;
+      }
       const res = amendMode
         ? await amend(repoId, message.trim())
         : await commit(repoId, message.trim());
@@ -552,13 +630,17 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
                 ? `Amend last commit${
                     staged.length > 0 ? ` + ${staged.length} staged` : ''
                   }`
-                : staged.length === 0
-                  ? 'Stage files to commit'
-                  : `Commit message (${staged.length} ${
+                : staged.length > 0
+                  ? `Commit message (${staged.length} ${
                       staged.length === 1 ? 'file' : 'files'
                     } staged)`
+                  : unstaged.length > 0
+                    ? `Commit message (no staged set — all ${unstaged.length} will be staged on Commit)`
+                    : 'Stage files to commit'
             }
-            disabled={!amendMode && staged.length === 0}
+            disabled={
+              !amendMode && staged.length === 0 && unstaged.length === 0
+            }
             className="w-full px-2 py-1.5 rounded bg-surface-elevated border border-card text-sm resize-y min-h-[64px] disabled:opacity-50"
           />
 
@@ -590,7 +672,7 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
             disabled={
               busy ||
               !message.trim() ||
-              (!amendMode && staged.length === 0)
+              (!amendMode && staged.length === 0 && unstaged.length === 0)
             }
             onClick={onCommit}
             className={`text-sm px-3 py-1.5 rounded text-white disabled:opacity-50 ${
@@ -600,13 +682,21 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
             }`}
             title={
               amendMode
-                ? 'Rewrites the previous commit. Only safe if you haven\'t pushed it.'
-                : undefined
+                ? "Rewrites the previous commit. Only safe if you haven't pushed it."
+                : !amendMode && staged.length === 0 && unstaged.length > 0
+                  ? `Stages every changed file, then commits. ${unstaged.length} file${
+                      unstaged.length === 1 ? '' : 's'
+                    } will be staged.`
+                  : undefined
             }
           >
             {amendMode
               ? `Amend${staged.length > 0 ? ` + ${staged.length}` : ''}`
-              : `Commit${staged.length > 0 ? ` ${staged.length}` : ''}`}
+              : staged.length > 0
+                ? `Commit ${staged.length}`
+                : unstaged.length > 0
+                  ? `Commit all (${unstaged.length})`
+                  : 'Commit'}
           </button>
         </div>
       </aside>
@@ -718,6 +808,11 @@ function CommitMessageSuggest({
         <StatusPill status={status} />
       </div>
       {tool ? (
+        // The StatusPill above carries the in-flight state ("Drafting
+        // with claude…") so the button label stays stable here.
+        // Earlier we duplicated that string into the button which made
+        // the row read like the action was happening twice. Keep the
+        // button consistent — just disable it while busy.
         <button
           onClick={onClick}
           disabled={busy || stagedCount === 0}
@@ -729,7 +824,7 @@ function CommitMessageSuggest({
           }
         >
           <span>✨</span>
-          <span>{busy ? `Drafting with ${tool}…` : `Suggest with ${tool}`}</span>
+          <span>Suggest with {tool}</span>
         </button>
       ) : (
         <span

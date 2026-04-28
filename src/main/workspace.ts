@@ -38,7 +38,7 @@ export async function workspaceStatus(
   const members = reposFor(ws, repos);
   // Status calls are independent and read-only — fan them out so
   // workspaces with many repos don't take linear time to refresh.
-  return Promise.all(members.map((r) => gitStatus(r.id, r.path)));
+  return Promise.all(members.map((r) => gitStatus(r.id, r.path, r.defaultBranch)));
 }
 
 export async function workspaceCheckout(
