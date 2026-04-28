@@ -26,9 +26,16 @@ interface RunResult {
   code: number | null;
 }
 
-function run(cwd: string, args: string[]): Promise<RunResult> {
+function run(
+  cwd: string,
+  args: string[],
+  envOverride?: Record<string, string>,
+): Promise<RunResult> {
   return new Promise((resolve) => {
-    const child = spawn('git', args, { cwd, env: process.env });
+    const env = envOverride
+      ? { ...process.env, ...envOverride }
+      : process.env;
+    const child = spawn('git', args, { cwd, env });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (b) => {
@@ -59,14 +66,20 @@ export function looksLikeRepo(repoPath: string): boolean {
 
 export async function status(repoId: UUID, repoPath: string): Promise<RepoStatus> {
   if (!looksLikeRepo(repoPath)) {
-    return { repoId, branch: null, dirtyCount: 0, ahead: null, behind: null, error: 'Not a git repo' };
+    return {
+      repoId,
+      branch: null,
+      dirtyCount: 0,
+      ahead: null,
+      behind: null,
+      inProgress: null,
+      conflicts: [],
+      error: 'Not a git repo',
+    };
   }
 
   const branchRes = await run(repoPath, ['rev-parse', '--abbrev-ref', 'HEAD']);
   const rawBranch = branchRes.stdout.trim();
-  // `rev-parse --abbrev-ref HEAD` prints "HEAD" when the working tree is
-  // detached. Treat that as no branch so the UI doesn't render a
-  // misleading "on branch HEAD".
   const branch = rawBranch && rawBranch !== 'HEAD' ? rawBranch : null;
 
   const porcelainRes = await run(repoPath, ['status', '--porcelain=v1']);
@@ -74,13 +87,30 @@ export async function status(repoId: UUID, repoPath: string): Promise<RepoStatus
     .split('\n')
     .filter((line) => line.trim().length > 0).length;
 
+  // Conflicting paths: porcelain v1 emits `XY <path>` where conflict
+  // states are any of UU AA DD AU UA DU UD. Pull paths out of those
+  // rows so the conflict pane has something to render.
+  const conflicts: string[] = [];
+  for (const line of porcelainRes.stdout.split('\n')) {
+    if (line.length < 4) continue;
+    const xy = line.slice(0, 2);
+    const path = line.slice(3);
+    if (
+      xy === 'UU' ||
+      xy === 'AA' ||
+      xy === 'DD' ||
+      xy === 'AU' ||
+      xy === 'UA' ||
+      xy === 'DU' ||
+      xy === 'UD'
+    ) {
+      conflicts.push(path);
+    }
+  }
+
   let ahead: number | null = null;
   let behind: number | null = null;
   if (branch) {
-    // `rev-list --left-right --count @{u}...HEAD` prints "<behind>\t<ahead>"
-    // when an upstream is configured, and exits non-zero otherwise. The
-    // non-zero case is normal (no upstream tracking) — just leave the
-    // counts null rather than surfacing it as an error.
     const upstreamRes = await run(repoPath, [
       'rev-list',
       '--left-right',
@@ -96,7 +126,45 @@ export async function status(repoId: UUID, repoPath: string): Promise<RepoStatus
     }
   }
 
-  return { repoId, branch, dirtyCount, ahead, behind };
+  return {
+    repoId,
+    branch,
+    dirtyCount,
+    ahead,
+    behind,
+    inProgress: detectInProgress(repoPath),
+    conflicts,
+  };
+}
+
+/// Probe `.git/` for the marker files git creates while a merge,
+/// rebase, or cherry-pick is paused. Cheap — just a few stat calls.
+function detectInProgress(repoPath: string): 'merge' | 'rebase' | 'cherry-pick' | null {
+  const gitDir = path.join(repoPath, '.git');
+  // .git can be a file in worktrees (`gitdir: <path>`); chase it.
+  let resolvedGitDir = gitDir;
+  try {
+    const stat = fs.statSync(gitDir);
+    if (stat.isFile()) {
+      const ref = fs.readFileSync(gitDir, 'utf-8').trim();
+      const m = ref.match(/^gitdir:\s*(.+)$/);
+      if (m) resolvedGitDir = path.resolve(repoPath, m[1].trim());
+    }
+  } catch {
+    return null;
+  }
+  const exists = (rel: string) => {
+    try {
+      fs.accessSync(path.join(resolvedGitDir, rel));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (exists('rebase-merge') || exists('rebase-apply')) return 'rebase';
+  if (exists('MERGE_HEAD')) return 'merge';
+  if (exists('CHERRY_PICK_HEAD')) return 'cherry-pick';
+  return null;
 }
 
 export async function listBranches(
@@ -618,6 +686,148 @@ export async function applyPatch(
       /* close handler will fire */
     }
   });
+}
+
+/// Merge a branch into the current one. The three modes match the
+/// canonical git invocations:
+///   merge   → `git merge --no-ff <branch>` (always create a merge commit)
+///   ff-only → `git merge --ff-only <branch>` (refuse if non-trivial)
+///   squash  → `git merge --squash <branch>` (leaves changes staged
+///             but no commit; the user finishes via the commit form)
+export async function mergeBranch(
+  repoPath: string,
+  branch: string,
+  mode: 'merge' | 'ff-only' | 'squash',
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  if (!branch || /[\s;|`$]/.test(branch)) {
+    return { ok: false, error: `Refusing to merge "${branch}"` };
+  }
+  const flag =
+    mode === 'merge' ? '--no-ff' : mode === 'ff-only' ? '--ff-only' : '--squash';
+  const res = await run(repoPath, ['merge', flag, branch]);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git merge exited ${res.code}` };
+}
+
+export async function abortMerge(
+  repoPath: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  const res = await run(repoPath, ['merge', '--abort']);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git merge --abort exited ${res.code}` };
+}
+
+export async function rebaseOnto(
+  repoPath: string,
+  onto: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  if (!onto || /[\s;|`$]/.test(onto)) {
+    return { ok: false, error: `Refusing to rebase onto "${onto}"` };
+  }
+  const res = await run(repoPath, ['rebase', onto]);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git rebase exited ${res.code}` };
+}
+
+export async function abortRebase(
+  repoPath: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  const res = await run(repoPath, ['rebase', '--abort']);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git rebase --abort exited ${res.code}` };
+}
+
+export async function continueRebase(
+  repoPath: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  // GIT_EDITOR=true: `git rebase --continue` opens an editor when the
+  // user's resolution introduces a new commit message. We don't have
+  // an inline editor here, so we no-op the editor and let git use the
+  // existing message. The renderer surfaces a clearer flow if that
+  // assumption breaks.
+  const res = await run(repoPath, ['rebase', '--continue'], {
+    GIT_EDITOR: 'true',
+  });
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git rebase --continue exited ${res.code}` };
+}
+
+export async function abortCherryPick(
+  repoPath: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  const res = await run(repoPath, ['cherry-pick', '--abort']);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git cherry-pick --abort exited ${res.code}` };
+}
+
+export async function continueCherryPick(
+  repoPath: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  const res = await run(repoPath, ['cherry-pick', '--continue'], {
+    GIT_EDITOR: 'true',
+  });
+  if (res.ok) return { ok: true };
+  return {
+    ok: false,
+    error: res.stderr.trim() || `git cherry-pick --continue exited ${res.code}`,
+  };
+}
+
+export async function markResolved(
+  repoPath: string,
+  paths: string[],
+): Promise<{ ok: boolean; remaining: string[]; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, remaining: [], error: 'Not a git repo' };
+  if (paths.length === 0) {
+    // Nothing to add; just refresh the conflict list.
+    return resolveStatus(repoPath);
+  }
+  const res = await run(repoPath, ['add', '--', ...paths]);
+  if (!res.ok) {
+    return {
+      ok: false,
+      remaining: [],
+      error: res.stderr.trim() || `git add exited ${res.code}`,
+    };
+  }
+  return resolveStatus(repoPath);
+}
+
+async function resolveStatus(
+  repoPath: string,
+): Promise<{ ok: boolean; remaining: string[]; error?: string }> {
+  const porcelain = await run(repoPath, ['status', '--porcelain=v1']);
+  if (!porcelain.ok) {
+    return {
+      ok: true,
+      remaining: [],
+      error: porcelain.stderr.trim() || undefined,
+    };
+  }
+  const remaining: string[] = [];
+  for (const line of porcelain.stdout.split('\n')) {
+    if (line.length < 4) continue;
+    const xy = line.slice(0, 2);
+    const p = line.slice(3);
+    if (
+      xy === 'UU' ||
+      xy === 'AA' ||
+      xy === 'DD' ||
+      xy === 'AU' ||
+      xy === 'UA' ||
+      xy === 'DU' ||
+      xy === 'UD'
+    )
+      remaining.push(p);
+  }
+  return { ok: true, remaining };
 }
 
 /// `git commit --amend`. With a message, replace the previous commit's

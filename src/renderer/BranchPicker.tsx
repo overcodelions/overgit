@@ -110,6 +110,55 @@ export function BranchPicker({ repoId, anchorRef, onClose }: Props): JSX.Element
   };
 
   const pullRepo = useStore((s) => s.pullRepo);
+  const mergeBranchAction = useStore((s) => s.mergeBranch);
+  const rebaseOntoAction = useStore((s) => s.rebaseOnto);
+
+  const onMerge = async (b: BranchSummary) => {
+    const target = b.kind === 'remote' ? b.name : b.shortName;
+    // Default to a regular merge (creates a merge commit). FF-only
+    // and squash can be added as a sub-menu in a future pass — most
+    // common case is just "merge X in", and conflicts get caught by
+    // the in-progress banner in the Changes tab.
+    if (
+      !window.confirm(
+        `Merge ${target} into the current branch?\n\nIf there are conflicts you'll see a banner in the Changes tab with Resolve / Abort options.`,
+      )
+    )
+      return;
+    setBusy(true);
+    try {
+      const res = await mergeBranchAction(repoId, target, 'merge');
+      if (!res.ok) {
+        alert(res.error ?? 'Merge failed');
+      }
+      onClose();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onRebase = async (b: BranchSummary) => {
+    const target = b.kind === 'remote' ? b.name : b.shortName;
+    if (
+      !window.confirm(
+        `Rebase current branch onto ${target}? Your commits will be replayed on top of ${target}.`,
+      )
+    )
+      return;
+    setBusy(true);
+    try {
+      const res = await rebaseOntoAction(repoId, target);
+      if (!res.ok) {
+        alert(
+          (res.error ?? 'Rebase failed') +
+            '\n\nIf there are conflicts, resolve them in the Changes tab — the conflict banner will guide you through Continue / Abort.',
+        );
+      }
+      onClose();
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const onCreate = async (
     name: string,
@@ -187,6 +236,8 @@ export function BranchPicker({ repoId, anchorRef, onClose }: Props): JSX.Element
             setMode({ kind: 'create' });
           }}
           onCherryPickFrom={(b) => setMode({ kind: 'cherryPickFrom', branch: b })}
+          onMerge={onMerge}
+          onRebase={onRebase}
           currentBranchLabel={status?.branch ?? null}
         />
       )}
@@ -223,6 +274,8 @@ function ListMode({
   onSwitch,
   onStartCreate,
   onCherryPickFrom,
+  onMerge,
+  onRebase,
   currentBranchLabel,
 }: {
   inputRef: React.RefObject<HTMLInputElement>;
@@ -236,6 +289,8 @@ function ListMode({
   onSwitch: (b: BranchSummary) => void;
   onStartCreate: () => void;
   onCherryPickFrom: (b: BranchSummary) => void;
+  onMerge: (b: BranchSummary) => void;
+  onRebase: (b: BranchSummary) => void;
   currentBranchLabel: string | null;
 }): JSX.Element {
   const onKey = (e: React.KeyboardEvent) => {
@@ -284,6 +339,8 @@ function ListMode({
                     onSelect={() => onSwitch(b)}
                     onHover={() => setActiveIdx(idx)}
                     onCherryPickFrom={() => onCherryPickFrom(b)}
+                    onMerge={() => onMerge(b)}
+                    onRebase={() => onRebase(b)}
                   />
                 );
               })}
@@ -313,6 +370,8 @@ function BranchRow({
   onSelect,
   onHover,
   onCherryPickFrom,
+  onMerge,
+  onRebase,
 }: {
   branch: BranchSummary;
   active: boolean;
@@ -320,7 +379,14 @@ function BranchRow({
   onSelect: () => void;
   onHover: () => void;
   onCherryPickFrom: () => void;
+  onMerge: () => void;
+  onRebase: () => void;
 }): JSX.Element {
+  // Merge / Rebase only make sense when the row is NOT the current
+  // branch — git refuses to merge a branch into itself, and rebase-onto
+  // self is always a no-op. We hide both actions for the current row
+  // so the affordance stays meaningful.
+  const showMergeRebase = !branch.isCurrent;
   return (
     <div
       onMouseEnter={onHover}
@@ -357,18 +423,46 @@ function BranchRow({
           <span className="ml-auto whitespace-nowrap">{relativeTime(branch.date)}</span>
         </div>
       </button>
-      <button
-        onClick={(e) => {
-          e.stopPropagation();
-          onCherryPickFrom();
-        }}
-        className={`text-[10px] px-1.5 py-1 rounded border border-card hover:bg-card transition-opacity ${
+      <div
+        className={`flex gap-1 transition-opacity ${
           active ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
         }`}
-        title={`Cherry-pick commits from ${branch.shortName}`}
       >
-        ⋯
-      </button>
+        {showMergeRebase && (
+          <>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onMerge();
+              }}
+              className="text-[10px] px-1.5 py-1 rounded border border-card hover:bg-card"
+              title={`Merge ${branch.shortName} into current branch`}
+            >
+              Merge
+            </button>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onRebase();
+              }}
+              className="text-[10px] px-1.5 py-1 rounded border border-card hover:bg-card"
+              title={`Rebase current branch onto ${branch.shortName}`}
+            >
+              Rebase
+            </button>
+          </>
+        )}
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onCherryPickFrom();
+          }}
+          className="text-[10px] px-1.5 py-1 rounded border border-card hover:bg-card"
+          title={`Cherry-pick commits from ${branch.shortName}`}
+        >
+          ⋯
+        </button>
+      </div>
     </div>
   );
 }

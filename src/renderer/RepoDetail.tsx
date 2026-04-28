@@ -218,6 +218,7 @@ function Tabs({ tab, onChange }: { tab: Tab; onChange: (t: Tab) => void }): JSX.
 
 function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
   const ch = useStore((s) => s.repoChanges[repoId]);
+  const repoStatus = useStore((s) => s.repoStatus[repoId]);
   const repoPath = useStore((s) => s.repos.find((r) => r.id === repoId)?.path);
   const stage = useStore((s) => s.stageFiles);
   const unstage = useStore((s) => s.unstageFiles);
@@ -360,8 +361,13 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
   };
 
   return (
-    <div className="grid grid-cols-[360px_1fr] overflow-hidden">
-      <aside className="border-r border-card overflow-y-auto flex flex-col">
+    <div className="grid grid-cols-[360px_1fr] grid-rows-[auto_1fr] overflow-hidden">
+      {repoStatus?.inProgress && (
+        <div className="col-span-2 row-start-1">
+          <ConflictBanner repoId={repoId} status={repoStatus} />
+        </div>
+      )}
+      <aside className="border-r border-card overflow-y-auto flex flex-col col-start-1 row-start-2">
         <div className="flex items-center gap-1 px-3 py-2 border-b border-card flex-wrap">
           <button
             disabled={unstaged.length === 0}
@@ -549,7 +555,7 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
         </div>
       </aside>
 
-      <section className="overflow-y-auto">
+      <section className="overflow-y-auto col-start-2 row-start-2">
         {selected ? (
           <ChangesDiffPane
             repoId={repoId}
@@ -757,6 +763,209 @@ interface BulkAction {
   /// `kind: 'with-message'`.
   messagePlaceholder?: string;
   onAction: (paths: string[], message?: string) => void;
+}
+
+/// Banner that appears at the top of the Changes tab whenever git
+/// reports an in-progress merge / rebase / cherry-pick. The user gets
+/// a path forward (continue / abort) without having to drop to a
+/// terminal, plus a one-click "mark all resolved" when every conflict
+/// is squared away.
+function ConflictBanner({
+  repoId,
+  status,
+}: {
+  repoId: UUID;
+  status: RepoStatus;
+}): JSX.Element {
+  const op = status.inProgress!;
+  const conflicts = status.conflicts;
+  const stage = useStore((s) => s.stageFiles);
+  const abortMerge = useStore((s) => s.abortMerge);
+  const abortRebase = useStore((s) => s.abortRebase);
+  const continueRebase = useStore((s) => s.continueRebase);
+  const abortCherryPick = useStore((s) => s.abortCherryPick);
+  const continueCherryPick = useStore((s) => s.continueCherryPick);
+  const markResolved = useStore((s) => s.markResolved);
+  const refreshStatus = useStore((s) => s.refreshRepoStatus);
+  const refreshChanges = useStore((s) => s.refreshRepoChanges);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const remaining = conflicts.length;
+  const allResolved = remaining === 0;
+
+  const onAbort = async () => {
+    if (
+      !window.confirm(
+        `Abort the in-progress ${op}? This rolls the working tree back to before it started.`,
+      )
+    )
+      return;
+    setBusy(true);
+    setError(null);
+    try {
+      const fn =
+        op === 'merge' ? abortMerge : op === 'rebase' ? abortRebase : abortCherryPick;
+      const res = await fn(repoId);
+      if (!res.ok) setError(res.error ?? 'Abort failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onContinue = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      // Merge has no `--continue`: once conflicts are resolved, the
+      // user makes a regular commit which finalizes the merge. We
+      // surface that by linking to the commit form.
+      if (op === 'merge') {
+        setError(
+          'Merge: stage the resolved files (or use "Mark all resolved"), then commit from the message box below to finalize.',
+        );
+        return;
+      }
+      const fn = op === 'rebase' ? continueRebase : continueCherryPick;
+      const res = await fn(repoId);
+      if (!res.ok) setError(res.error ?? 'Continue failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onMarkAll = async () => {
+    if (conflicts.length === 0) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await markResolved(repoId, conflicts);
+      if (!res.ok) setError(res.error ?? 'Mark resolved failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onMarkOne = async (path: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await markResolved(repoId, [path]);
+      if (!res.ok) setError(res.error ?? 'Mark resolved failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const opLabel =
+    op === 'merge' ? 'Merge in progress' : op === 'rebase' ? 'Rebase in progress' : 'Cherry-pick in progress';
+
+  return (
+    <div
+      className={`px-4 py-3 border-b ${
+        allResolved
+          ? 'bg-emerald-500/10 border-emerald-500/30'
+          : 'bg-amber-500/10 border-amber-500/30'
+      }`}
+    >
+      <div className="flex items-center gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="text-[12px] font-semibold flex items-center gap-2">
+            <span
+              className={
+                allResolved ? 'text-emerald-300' : 'text-amber-300'
+              }
+            >
+              {opLabel}
+            </span>
+            <span className="text-[10px] uppercase tracking-wide text-ink-faint">
+              {allResolved
+                ? 'all conflicts resolved · ready to continue'
+                : `${remaining} ${remaining === 1 ? 'file' : 'files'} unresolved`}
+            </span>
+          </div>
+          {!allResolved && (
+            <div className="text-[11px] text-ink-muted mt-0.5">
+              Open each file in your editor, fix the {'<<<<<<<'} / {'>>>>>>>'} markers, then mark resolved.
+            </div>
+          )}
+        </div>
+        <div className="flex items-center gap-1 flex-shrink-0">
+          {!allResolved && conflicts.length > 0 && (
+            <button
+              disabled={busy}
+              onClick={onMarkAll}
+              className="text-[11px] h-7 px-2.5 rounded border border-card hover:bg-card disabled:opacity-50"
+              title="git add — marks every conflicted file as resolved"
+            >
+              Mark all resolved
+            </button>
+          )}
+          {allResolved && op !== 'merge' && (
+            <button
+              disabled={busy}
+              onClick={onContinue}
+              className="text-[11px] h-7 px-2.5 rounded bg-accent text-white hover:bg-accent-strong border border-accent disabled:opacity-50"
+            >
+              Continue
+            </button>
+          )}
+          <button
+            disabled={busy}
+            onClick={onAbort}
+            className="text-[11px] h-7 px-2.5 rounded border border-red-500/40 text-red-300 hover:bg-red-500/10 disabled:opacity-50"
+          >
+            Abort
+          </button>
+          <button
+            onClick={() => {
+              void refreshStatus(repoId);
+              void refreshChanges(repoId);
+            }}
+            className="text-[11px] h-7 px-2 rounded text-ink-faint hover:text-ink hover:bg-card"
+            title="Re-check git status"
+          >
+            ↻
+          </button>
+        </div>
+      </div>
+
+      {!allResolved && conflicts.length > 0 && (
+        <ul className="mt-3 flex flex-col gap-0.5 max-h-[160px] overflow-y-auto">
+          {conflicts.map((p) => (
+            <li
+              key={p}
+              className="flex items-center gap-2 text-[11px] py-0.5 hover:bg-amber-500/10 rounded px-1"
+            >
+              <span className="font-mono truncate flex-1" title={p}>
+                {p}
+              </span>
+              <button
+                disabled={busy}
+                onClick={() => onMarkOne(p)}
+                className="text-[10px] uppercase tracking-wide text-amber-300 hover:text-emerald-300 px-1.5"
+                title="git add this path"
+              >
+                Resolve
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {error && (
+        <div className="mt-2 text-[11px] text-red-300 bg-red-500/10 border border-red-500/30 rounded px-2 py-1.5 flex items-start gap-2">
+          <span className="flex-1 whitespace-pre-wrap">{error}</span>
+          <button
+            onClick={() => setError(null)}
+            className="text-ink-faint hover:text-ink"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function FileGroup({
