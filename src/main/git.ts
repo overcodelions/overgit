@@ -1408,7 +1408,11 @@ const GRAPH_FORMAT = '%H%x1f%h%x1f%P%x1f%s%x1f%an%x1f%ae%x1f%aI%x1f%D%x1f%b%x1e'
 /// Build a small commit graph for the branch visualization. Pulls
 /// `git log --all --topo-order` and lays the commits onto vertical lanes
 /// so the UI can draw a left-rail graph with branch labels.
-export async function commitGraph(repoPath: string, limit = 200): Promise<GraphCommit[]> {
+export async function commitGraph(
+  repoPath: string,
+  limit = 200,
+  defaultBranch?: string,
+): Promise<GraphCommit[]> {
   if (!looksLikeRepo(repoPath)) return [];
   const res = await run(repoPath, [
     'log',
@@ -1444,29 +1448,89 @@ export async function commitGraph(repoPath: string, limit = 200): Promise<GraphC
     });
   }
 
-  // Standard graph layout: walk commits child-first (the order git
-  // emits) so when we see a child we can claim a lane for each of its
-  // parents; when the parent itself shows up later we look it up in
-  // `active` and inherit that reserved lane. The earlier version walked
-  // parents-first which broke linear histories — every commit grabbed a
-  // brand-new lane because no future child had reserved one yet.
+  // Build the trunk-set: SHAs along the default branch's first-parent
+  // chain. We pin them to lane 0 so the trunk runs as a continuous
+  // line down the leftmost lane regardless of which feature branch
+  // happened to commit most recently. Falls through silently when no
+  // default is configured or the trunk ref doesn't resolve — without
+  // a trunk-set the allocator behaves exactly as before.
+  const trunkSet = new Set<string>();
+  if (defaultBranch) {
+    const remoteCheck = await run(repoPath, [
+      'show-ref',
+      '--verify',
+      '--quiet',
+      `refs/remotes/origin/${defaultBranch}`,
+    ]);
+    const localCheck = await run(repoPath, [
+      'show-ref',
+      '--verify',
+      '--quiet',
+      `refs/heads/${defaultBranch}`,
+    ]);
+    const trunkRef = remoteCheck.ok
+      ? `origin/${defaultBranch}`
+      : localCheck.ok
+        ? defaultBranch
+        : null;
+    if (trunkRef) {
+      const chain = await run(repoPath, [
+        'rev-list',
+        '--first-parent',
+        trunkRef,
+      ]);
+      if (chain.ok) {
+        for (const line of chain.stdout.split('\n')) {
+          const sha = line.trim();
+          if (sha) trunkSet.add(sha);
+        }
+      }
+    }
+  }
+  const haveTrunk = trunkSet.size > 0;
+
+  // Lane allocator. Standard greedy walk child-first, with one twist:
+  // when a `defaultBranch` is configured and its first-parent chain
+  // resolves, we pin those commits to lane 0 and skip lane 0 for
+  // every other commit's allocation. Net effect: trunk is always a
+  // straight purple line down the left edge, feature branches fan to
+  // the right. Matches what SourceTree/GitKraken do.
   //
-  // Sibling-merge semantics: if multiple children point at the same
-  // parent (a fork that re-merges), the FIRST child to declare it wins
-  // the lane; later children share that lane via the `findIndex` lookup
-  // before allocating a new one. That keeps merges from spuriously
-  // multiplying lanes.
+  // When `haveTrunk` is false we fall back to the original behavior —
+  // first-allocated commit wins lane 0 — so repos without a
+  // configured default still get a sensible graph.
   const out: GraphCommit[] = [];
   const active: (string | null)[] = [];
+
+  // Search-from offset: for non-trunk commits we always start the
+  // "leftmost free" search at lane 1 when haveTrunk is true. Helper
+  // captures the bias.
+  const findLane = (predicate: (s: string | null, idx: number) => boolean, skipZero: boolean) =>
+    active.findIndex((s, idx) => (skipZero ? idx > 0 : true) && predicate(s, idx));
+  const ensureLane = (lane: number) => {
+    while (active.length <= lane) active.push(null);
+  };
+
   for (let i = 0; i < parsed.length; i += 1) {
     const c = parsed[i];
+    const isTrunk = haveTrunk && trunkSet.has(c.sha);
 
-    let lane = active.findIndex((s) => s === c.sha);
-    if (lane === -1) {
-      lane = active.findIndex((s) => s === null);
+    let lane: number;
+    if (isTrunk) {
+      lane = 0;
+      ensureLane(0);
+    } else {
+      // Look for a lane that an earlier child reserved for us. Skip
+      // lane 0 — even if some earlier non-trunk allocation strayed
+      // there in the no-trunk fallback path, when haveTrunk we treat
+      // 0 as off-limits to non-trunk.
+      lane = findLane((s) => s === c.sha, haveTrunk);
       if (lane === -1) {
-        lane = active.length;
-        active.push(null);
+        lane = findLane((s) => s === null, haveTrunk);
+        if (lane === -1) {
+          lane = haveTrunk ? Math.max(active.length, 1) : active.length;
+          ensureLane(lane);
+        }
       }
     }
     active[lane] = null;
@@ -1474,18 +1538,28 @@ export async function commitGraph(repoPath: string, limit = 200): Promise<GraphC
     const parentLanes: number[] = [];
     for (let pi = 0; pi < c.parents.length; pi += 1) {
       const parent = c.parents[pi];
+      const parentIsTrunk = haveTrunk && trunkSet.has(parent);
 
-      let pLane = active.findIndex((s) => s === parent);
-      if (pLane === -1) {
-        if (pi === 0) {
-          // First parent inherits this commit's lane — keeps the trunk
-          // running straight down through linear history.
-          pLane = lane;
-        } else {
-          pLane = active.findIndex((s) => s === null);
-          if (pLane === -1) {
-            pLane = active.length;
-            active.push(null);
+      let pLane: number;
+      if (parentIsTrunk) {
+        pLane = 0;
+        ensureLane(0);
+      } else {
+        pLane = findLane((s) => s === parent, haveTrunk);
+        if (pLane === -1) {
+          if (pi === 0 && lane !== 0) {
+            // First parent inherits this commit's lane — keeps a
+            // non-trunk feature branch running straight on its lane.
+            // Skip when lane === 0 (commit was trunk but parent isn't —
+            // shouldn't happen because trunk-set is closed under
+            // first-parent, but defensive).
+            pLane = lane;
+          } else {
+            pLane = findLane((s) => s === null, haveTrunk);
+            if (pLane === -1) {
+              pLane = haveTrunk ? Math.max(active.length, 1) : active.length;
+              ensureLane(pLane);
+            }
           }
         }
       }

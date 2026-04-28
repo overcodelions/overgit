@@ -459,7 +459,7 @@ function registerIpc(): void {
   ipcMain.handle('repo:graph', async (_e, args: { repoId: string; limit?: number }) => {
     const repo = repoFromArg(args);
     if (!repo) return [];
-    return commitGraph(repo.path, args.limit ?? 200);
+    return commitGraph(repo.path, args.limit ?? 200, repo.defaultBranch);
   });
 
   ipcMain.handle('repo:listStashes', async (_e, repoId: string) => {
