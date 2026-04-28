@@ -339,7 +339,13 @@ export const useStore = create<UiState>((set, get) => ({
     });
     const outcomes = last.outcomes.map((o) => (o.repoId === id ? outcome : o));
     set({ lastCheckout: { ...last, outcomes } });
-    await get().refreshWorkspaceStatus(last.workspaceId);
+    // Branch-summary cache must follow a successful retry too — same
+    // staleness story as `checkoutRepo`.
+    await Promise.all([
+      get().refreshWorkspaceStatus(last.workspaceId),
+      get().refreshRepoStatus(id),
+      get().refreshRepoBranchSummaries(id),
+    ]);
   },
 
   refreshRepoChanges: async (id) => {
@@ -456,10 +462,18 @@ export const useStore = create<UiState>((set, get) => ({
       createIfMissing,
     });
     if (outcome.result === 'switched' || outcome.result === 'already-on-branch') {
+      // Branch summaries carry the `isCurrent` flag the picker uses to
+      // render the "ON" badge — without refreshing them here, the
+      // picker keeps showing the old branch as current after a switch
+      // until the user manually re-fetches. Same logic for branches +
+      // graph (HEAD pill / lane assignments are branch-dependent).
       await Promise.all([
         get().refreshRepoStatus(id),
         get().refreshRepoChanges(id),
         get().refreshRepoLog(id),
+        get().refreshRepoBranches(id),
+        get().refreshRepoBranchSummaries(id),
+        get().refreshRepoGraph(id),
       ]);
     }
     return outcome;

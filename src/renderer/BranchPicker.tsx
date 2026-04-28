@@ -41,9 +41,13 @@ export function BranchPicker({ repoId, anchorRef, onClose }: Props): JSX.Element
   const inputRef = useRef<HTMLInputElement | null>(null);
   const anchorRect = useAnchorRect(anchorRef);
 
+  // Re-fetch summaries every time the picker mounts — the cache can
+  // be stale right after a checkout (other UI may have advanced HEAD
+  // without updating summaries) and we want the "ON" badge to track
+  // the actual current branch. Cheap call; one IPC per picker open.
   useEffect(() => {
-    if (summaries == null) refresh(repoId);
-  }, [summaries, refresh, repoId]);
+    refresh(repoId);
+  }, [refresh, repoId]);
 
   // Outside-click + Esc dismiss. We special-case the trigger element so
   // clicking it again closes (the parent-button toggle), not a re-open.
