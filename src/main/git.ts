@@ -12,6 +12,7 @@ import {
   CheckoutOutcome,
   Commit,
   FileDiff,
+  GraphCommit,
   RepoChanges,
   RepoStatus,
   Stash,
@@ -231,7 +232,11 @@ export async function fetch(repoPath: string): Promise<{ ok: boolean; error?: st
 /// record-separator (\x1e) as the line delimiter so commit subjects with
 /// commas or pipes don't corrupt the parse. Both are forbidden in author
 /// names/emails per RFC 5322 norms and don't appear in real subjects.
-const LOG_FORMAT = '%H%x1f%h%x1f%P%x1f%s%x1f%an%x1f%ae%x1f%aI%x1e';
+// `%b` is the body (everything after the subject line) and carries
+// embedded newlines. We put it last so the field count after splitting
+// on \x1f stays predictable even when the body contains the field
+// separator (it shouldn't, but `%b` is the only multi-line field).
+const LOG_FORMAT = '%H%x1f%h%x1f%P%x1f%s%x1f%an%x1f%ae%x1f%aI%x1f%b%x1e';
 
 export async function log(repoPath: string, limit = 50): Promise<Commit[]> {
   if (!looksLikeRepo(repoPath)) return [];
@@ -243,9 +248,13 @@ export async function log(repoPath: string, limit = 50): Promise<Commit[]> {
   if (!res.ok) return [];
   const out: Commit[] = [];
   for (const record of res.stdout.split('\x1e')) {
-    const trimmed = record.trim();
+    // %b can be empty; preserve its leading newline-delimiters by
+    // trimming only the record's outer whitespace, not internal
+    // whitespace inside fields.
+    const trimmed = record.replace(/^\s+|\s+$/g, '');
     if (!trimmed) continue;
-    const [sha, shortSha, parents, subject, author, authorEmail, date] = trimmed.split('\x1f');
+    const [sha, shortSha, parents, subject, author, authorEmail, date, body] =
+      trimmed.split('\x1f');
     if (!sha) continue;
     out.push({
       sha,
@@ -255,6 +264,7 @@ export async function log(repoPath: string, limit = 50): Promise<Commit[]> {
       author: author ?? '',
       authorEmail: authorEmail ?? '',
       date: date ?? '',
+      body: (body ?? '').trim(),
     });
   }
   return out;
@@ -560,6 +570,74 @@ export async function stashDiff(repoPath: string, index: number): Promise<FileDi
   return splitDiff(res.stdout).map(parseFileBlock);
 }
 
+/// Apply a unified-diff patch to the repo. The three modes:
+///   stage    → `git apply --cached -` (worktree unchanged, index updated)
+///   unstage  → `git apply --cached --reverse -` (reverses staged hunk)
+///   discard  → `git apply --reverse -` (reverses worktree changes)
+///
+/// We pass the patch via stdin rather than a temp file so we never
+/// touch disk for content we'll throw away. `--unidiff-zero` is NOT
+/// passed because our patches always carry standard 3-line context;
+/// adding it would make `git apply` reject any patch with non-zero
+/// context. The `--whitespace=nowarn` flag silences benign warnings
+/// about trailing whitespace which would otherwise count as a non-zero
+/// exit on some git versions.
+export async function applyPatch(
+  repoPath: string,
+  patch: string,
+  mode: 'stage' | 'unstage' | 'discard',
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  if (!patch.trim()) return { ok: false, error: 'Empty patch' };
+  const args = ['apply', '--whitespace=nowarn'];
+  if (mode === 'stage') args.push('--cached');
+  if (mode === 'unstage') args.push('--cached', '--reverse');
+  if (mode === 'discard') args.push('--reverse');
+  args.push('-');
+  return new Promise((resolve) => {
+    const child = spawn('git', args, { cwd: repoPath, env: process.env });
+    let stderr = '';
+    child.stderr.on('data', (b) => {
+      stderr += b.toString('utf8');
+    });
+    child.on('close', (code) => {
+      if (code === 0) resolve({ ok: true });
+      else
+        resolve({
+          ok: false,
+          error: stderr.trim() || `git apply exited ${code}`,
+        });
+    });
+    child.on('error', (err) => {
+      resolve({ ok: false, error: String(err) });
+    });
+    try {
+      child.stdin.write(patch.endsWith('\n') ? patch : patch + '\n');
+      child.stdin.end();
+    } catch {
+      /* close handler will fire */
+    }
+  });
+}
+
+/// `git commit --amend`. With a message, replace the previous commit's
+/// subject + body. With `message: null`, fold the currently staged
+/// changes onto the previous commit, keeping the message. We never
+/// touch unstaged changes — the user stages first, then amends.
+export async function amendCommit(
+  repoPath: string,
+  message: string | null,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  const args = ['commit', '--amend'];
+  if (message === null) args.push('--no-edit');
+  else if (!message.trim()) return { ok: false, error: 'Commit message required' };
+  else args.push('-m', message.trim());
+  const res = await run(repoPath, args);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git commit --amend exited ${res.code}` };
+}
+
 export async function commitAll(
   repoPath: string,
   message: string,
@@ -733,14 +811,41 @@ export async function pull(repoPath: string): Promise<{ ok: boolean; error?: str
   return { ok: false, error: res.stderr.trim() || `git pull exited ${res.code}` };
 }
 
+/// Detach HEAD onto an arbitrary commit SHA. Useful from the History
+/// view's right-click context menu. We accept SHAs with the usual
+/// sha-shape regex so the caller can't smuggle flags.
+export async function checkoutCommit(
+  repoPath: string,
+  sha: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  if (!/^[0-9a-fA-F]{4,64}$/.test(sha)) {
+    return { ok: false, error: `Refusing to checkout non-sha "${sha}"` };
+  }
+  const res = await run(repoPath, ['checkout', sha]);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git checkout exited ${res.code}` };
+}
+
 export async function createBranch(
   repoPath: string,
   name: string,
   checkoutAfter: boolean,
+  from?: string,
 ): Promise<{ ok: boolean; error?: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
   if (!name.trim()) return { ok: false, error: 'Branch name required' };
-  const args = checkoutAfter ? ['checkout', '-b', name.trim()] : ['branch', name.trim()];
+  // Optional starting ref. We allow only sha-like values here; a
+  // branch name would also be a valid git ref, but this codepath is
+  // currently only called from the history "Branch from here" flow,
+  // which always passes a sha. Keeping it strict avoids accidental
+  // arg-injection through a commit subject that looks like a flag.
+  if (from !== undefined && !/^[0-9a-fA-F]{4,64}$/.test(from)) {
+    return { ok: false, error: `Invalid base ref "${from}"` };
+  }
+  const args = checkoutAfter
+    ? ['checkout', '-b', name.trim(), ...(from ? [from] : [])]
+    : ['branch', name.trim(), ...(from ? [from] : [])];
   const res = await run(repoPath, args);
   if (res.ok) return { ok: true };
   return { ok: false, error: res.stderr.trim() || `git exited ${res.code}` };
@@ -884,9 +989,10 @@ export async function listBranchCommits(
   if (!res.ok) return [];
   const out: Commit[] = [];
   for (const record of res.stdout.split('\x1e')) {
-    const t = record.trim();
+    const t = record.replace(/^\s+|\s+$/g, '');
     if (!t) continue;
-    const [sha, shortSha, parents, subject, author, authorEmail, date] = t.split('\x1f');
+    const [sha, shortSha, parents, subject, author, authorEmail, date, body] =
+      t.split('\x1f');
     if (!sha) continue;
     out.push({
       sha,
@@ -896,6 +1002,7 @@ export async function listBranchCommits(
       author: author ?? '',
       authorEmail: authorEmail ?? '',
       date: date ?? '',
+      body: (body ?? '').trim(),
     });
   }
   return out;
@@ -938,28 +1045,10 @@ export async function deleteBranch(
   return { ok: false, error: res.stderr.trim() || `git branch exited ${res.code}` };
 }
 
-/// One commit row in the rendered branch graph.
-export interface GraphCommit {
-  sha: string;
-  shortSha: string;
-  parents: string[];
-  subject: string;
-  author: string;
-  date: string;
-  /// Refs decorating this commit ("main", "origin/main", "HEAD -> feat/x").
-  /// Already split apart and trimmed; the renderer pins them as labels.
-  refs: string[];
-  /// Lane index (0-based) we lay this commit on. Computed by a tiny
-  /// stripe-allocator that walks the commits in topological order and
-  /// assigns lanes greedily — good enough for typical history shapes
-  /// (linear, occasional merges) without pulling in a full DAG layout.
-  lane: number;
-  /// Lane indices of this commit's parents at the moment we placed
-  /// them. Used by the renderer to draw connecting lines.
-  parentLanes: number[];
-}
+// GraphCommit lives in shared/types.ts so renderer + main share the
+// same shape. Re-imported below where it's needed.
 
-const GRAPH_FORMAT = '%H%x1f%h%x1f%P%x1f%s%x1f%an%x1f%aI%x1f%D%x1e';
+const GRAPH_FORMAT = '%H%x1f%h%x1f%P%x1f%s%x1f%an%x1f%ae%x1f%aI%x1f%D%x1f%b%x1e';
 
 /// Build a small commit graph for the branch visualization. Pulls
 /// `git log --all --topo-order` and lays the commits onto vertical lanes
@@ -977,9 +1066,10 @@ export async function commitGraph(repoPath: string, limit = 200): Promise<GraphC
 
   const parsed: Omit<GraphCommit, 'lane' | 'parentLanes'>[] = [];
   for (const record of res.stdout.split('\x1e')) {
-    const t = record.trim();
+    const t = record.replace(/^\s+|\s+$/g, '');
     if (!t) continue;
-    const [sha, shortSha, parents, subject, author, date, refs] = t.split('\x1f');
+    const [sha, shortSha, parents, subject, author, authorEmail, date, refs, body] =
+      t.split('\x1f');
     if (!sha) continue;
     parsed.push({
       sha,
@@ -987,7 +1077,9 @@ export async function commitGraph(repoPath: string, limit = 200): Promise<GraphC
       parents: parents ? parents.split(' ').filter(Boolean) : [],
       subject: subject ?? '',
       author: author ?? '',
+      authorEmail: authorEmail ?? '',
       date: date ?? '',
+      body: (body ?? '').trim(),
       refs: refs
         ? refs
             .split(',')

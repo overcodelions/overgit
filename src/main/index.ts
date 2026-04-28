@@ -7,11 +7,14 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Store } from './store';
 import {
+  amendCommit,
+  applyPatch,
   applyStash,
   applyStashForce,
   branchSummaries,
   changes as gitChanges,
   checkoutBranch,
+  checkoutCommit,
   cherryPick,
   commitAll,
   commitGraph,
@@ -298,10 +301,43 @@ function registerIpc(): void {
 
   ipcMain.handle(
     'repo:createBranch',
-    async (_e, args: { repoId: string; name: string; checkout: boolean }) => {
+    async (
+      _e,
+      args: { repoId: string; name: string; checkout: boolean; from?: string },
+    ) => {
       const repo = repoFromArg(args);
       if (!repo) return { ok: false, error: 'Unknown repo' };
-      return createBranch(repo.path, args.name, args.checkout);
+      return createBranch(repo.path, args.name, args.checkout, args.from);
+    },
+  );
+
+  ipcMain.handle(
+    'repo:checkoutCommit',
+    async (_e, args: { repoId: string; sha: string }) => {
+      const repo = repoFromArg(args);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return checkoutCommit(repo.path, args.sha);
+    },
+  );
+
+  ipcMain.handle(
+    'repo:applyPatch',
+    async (
+      _e,
+      args: { repoId: string; patch: string; mode: 'stage' | 'unstage' | 'discard' },
+    ) => {
+      const repo = repoFromArg(args);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return applyPatch(repo.path, args.patch, args.mode);
+    },
+  );
+
+  ipcMain.handle(
+    'repo:amendCommit',
+    async (_e, args: { repoId: string; message: string | null }) => {
+      const repo = repoFromArg(args);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return amendCommit(repo.path, args.message);
     },
   );
 

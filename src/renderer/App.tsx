@@ -187,7 +187,7 @@ function useGlobalShortcuts(): void {
       // doesn't require lifting tab state into the global store.
       if (selectedRepoId && /^[1-4]$/.test(e.key)) {
         e.preventDefault();
-        const tabs = ['changes', 'history', 'files', 'graph'] as const;
+        const tabs = ['changes', 'history', 'files', 'stash'] as const;
         window.dispatchEvent(
           new CustomEvent('overgit:setRepoTab', {
             detail: tabs[Number.parseInt(e.key, 10) - 1],
