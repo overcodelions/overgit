@@ -120,6 +120,21 @@ interface UiState {
     mode: 'stage' | 'unstage' | 'discard',
   ) => Promise<{ ok: boolean; error?: string }>;
   amendCommit: (id: UUID, message: string | null) => Promise<{ ok: boolean; error?: string }>;
+  mergeBranch: (
+    id: UUID,
+    branch: string,
+    mode: 'merge' | 'ff-only' | 'squash',
+  ) => Promise<{ ok: boolean; error?: string }>;
+  abortMerge: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
+  rebaseOnto: (id: UUID, onto: string) => Promise<{ ok: boolean; error?: string }>;
+  abortRebase: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
+  continueRebase: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
+  abortCherryPick: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
+  continueCherryPick: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
+  markResolved: (
+    id: UUID,
+    paths: string[],
+  ) => Promise<{ ok: boolean; remaining: string[]; error?: string }>;
   setRepoDefaultBranch: (id: UUID, branch: string | null) => Promise<void>;
   stageFiles: (id: UUID, paths: string[]) => Promise<void>;
   unstageFiles: (id: UUID, paths: string[]) => Promise<void>;
@@ -527,6 +542,88 @@ export const useStore = create<UiState>((set, get) => ({
         get().refreshRepoStatus(id),
       ]);
     }
+    return res;
+  },
+
+  mergeBranch: async (id, branch, mode) => {
+    const res = await window.overgit.invoke('repo:merge', { repoId: id, branch, mode });
+    // Whether merge succeeded or not, status changed (conflict marker
+    // files dropped, or a new commit landed). Always refresh.
+    await Promise.all([
+      get().refreshRepoStatus(id),
+      get().refreshRepoChanges(id),
+      get().refreshRepoLog(id),
+      get().refreshRepoGraph(id),
+    ]);
+    return res;
+  },
+
+  abortMerge: async (id) => {
+    const res = await window.overgit.invoke('repo:abortMerge', id);
+    await Promise.all([
+      get().refreshRepoStatus(id),
+      get().refreshRepoChanges(id),
+    ]);
+    return res;
+  },
+
+  rebaseOnto: async (id, onto) => {
+    const res = await window.overgit.invoke('repo:rebase', { repoId: id, onto });
+    await Promise.all([
+      get().refreshRepoStatus(id),
+      get().refreshRepoChanges(id),
+      get().refreshRepoLog(id),
+      get().refreshRepoGraph(id),
+    ]);
+    return res;
+  },
+
+  abortRebase: async (id) => {
+    const res = await window.overgit.invoke('repo:abortRebase', id);
+    await Promise.all([
+      get().refreshRepoStatus(id),
+      get().refreshRepoChanges(id),
+    ]);
+    return res;
+  },
+
+  continueRebase: async (id) => {
+    const res = await window.overgit.invoke('repo:continueRebase', id);
+    await Promise.all([
+      get().refreshRepoStatus(id),
+      get().refreshRepoChanges(id),
+      get().refreshRepoLog(id),
+      get().refreshRepoGraph(id),
+    ]);
+    return res;
+  },
+
+  abortCherryPick: async (id) => {
+    const res = await window.overgit.invoke('repo:abortCherryPick', id);
+    await Promise.all([
+      get().refreshRepoStatus(id),
+      get().refreshRepoChanges(id),
+    ]);
+    return res;
+  },
+
+  continueCherryPick: async (id) => {
+    const res = await window.overgit.invoke('repo:continueCherryPick', id);
+    await Promise.all([
+      get().refreshRepoStatus(id),
+      get().refreshRepoChanges(id),
+      get().refreshRepoLog(id),
+      get().refreshRepoGraph(id),
+    ]);
+    return res;
+  },
+
+  markResolved: async (id, paths) => {
+    const res = await window.overgit.invoke('repo:markResolved', { repoId: id, paths });
+    await Promise.all([
+      get().refreshRepoStatus(id),
+      get().refreshRepoChanges(id),
+    ]);
     return res;
   },
 

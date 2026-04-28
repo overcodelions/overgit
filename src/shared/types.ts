@@ -44,9 +44,20 @@ export interface RepoStatus {
   /// Commits ahead/behind upstream. null if no upstream is configured.
   ahead: number | null;
   behind: number | null;
+  /// In-progress operation: merge, rebase, or cherry-pick. Detected by
+  /// the presence of MERGE_HEAD / rebase-merge / CHERRY_PICK_HEAD in
+  /// the .git directory. null when nothing's pending. The renderer
+  /// surfaces a conflict banner so the user has somewhere to land:
+  /// abort, continue, or manually resolve.
+  inProgress: InProgressOp | null;
+  /// Conflicting paths from `git status --porcelain` (entries marked
+  /// `UU`, `AA`, `DU`, `UD`, etc.). Empty when there are no conflicts.
+  conflicts: string[];
   /// Most recent error from git on this repo, if any.
   error?: string;
 }
+
+export type InProgressOp = 'merge' | 'rebase' | 'cherry-pick';
 
 /// Result of a workspace-wide branch checkout. We attempt every repo and
 /// report each outcome rather than aborting on the first failure — the
@@ -349,6 +360,33 @@ export interface IPCInvokeMap {
     repoId: UUID;
     message: string | null;
   }) => { ok: boolean; error?: string };
+  /// Merge a branch into the current one. Modes mirror git's:
+  ///   merge   → create a merge commit (--no-ff)
+  ///   ff-only → fast-forward only (--ff-only); refuses if a merge
+  ///             commit would be needed
+  ///   squash  → squash the branch into a single index entry; the
+  ///             user still has to commit (we leave the squash staged)
+  'repo:merge': (args: {
+    repoId: UUID;
+    branch: string;
+    mode: 'merge' | 'ff-only' | 'squash';
+  }) => { ok: boolean; error?: string };
+  'repo:abortMerge': (repoId: UUID) => { ok: boolean; error?: string };
+  /// `git rebase <onto>`. Starts the rebase; if conflicts arise the
+  /// renderer surfaces them via the in-progress + conflicts fields on
+  /// repo:status, and the user resolves + calls continueRebase.
+  'repo:rebase': (args: { repoId: UUID; onto: string }) => { ok: boolean; error?: string };
+  'repo:abortRebase': (repoId: UUID) => { ok: boolean; error?: string };
+  'repo:continueRebase': (repoId: UUID) => { ok: boolean; error?: string };
+  'repo:abortCherryPick': (repoId: UUID) => { ok: boolean; error?: string };
+  'repo:continueCherryPick': (repoId: UUID) => { ok: boolean; error?: string };
+  /// Mark conflicted paths as resolved by `git add`-ing them. Returns
+  /// the still-conflicted set (if any) so the renderer can show
+  /// progress as the user works through them.
+  'repo:markResolved': (args: {
+    repoId: UUID;
+    paths: string[];
+  }) => { ok: boolean; remaining: string[]; error?: string };
   'repo:detectDefaultBranch': (repoId: UUID) => string | null;
   'repo:setDefaultBranch': (args: { repoId: UUID; branch: string | null }) => void;
 

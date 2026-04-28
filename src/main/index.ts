@@ -7,11 +7,16 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Store } from './store';
 import {
+  abortCherryPick,
+  abortMerge,
+  abortRebase,
   amendCommit,
   applyPatch,
   applyStash,
   applyStashForce,
   branchSummaries,
+  continueCherryPick,
+  continueRebase,
   changes as gitChanges,
   checkoutBranch,
   checkoutCommit,
@@ -32,9 +37,12 @@ import {
   listStashes,
   log as gitLog,
   looksLikeRepo,
+  markResolved,
+  mergeBranch,
   pull as gitPull,
   push as gitPush,
   rawDiff,
+  rebaseOnto,
   stageFiles,
   stash as gitStash,
   stashDiff,
@@ -338,6 +346,63 @@ function registerIpc(): void {
       const repo = repoFromArg(args);
       if (!repo) return { ok: false, error: 'Unknown repo' };
       return amendCommit(repo.path, args.message);
+    },
+  );
+
+  ipcMain.handle(
+    'repo:merge',
+    async (
+      _e,
+      args: { repoId: string; branch: string; mode: 'merge' | 'ff-only' | 'squash' },
+    ) => {
+      const repo = repoFromArg(args);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return mergeBranch(repo.path, args.branch, args.mode);
+    },
+  );
+
+  ipcMain.handle('repo:abortMerge', async (_e, repoId: string) => {
+    const repo = repoFromArg(repoId);
+    if (!repo) return { ok: false, error: 'Unknown repo' };
+    return abortMerge(repo.path);
+  });
+
+  ipcMain.handle('repo:rebase', async (_e, args: { repoId: string; onto: string }) => {
+    const repo = repoFromArg(args);
+    if (!repo) return { ok: false, error: 'Unknown repo' };
+    return rebaseOnto(repo.path, args.onto);
+  });
+
+  ipcMain.handle('repo:abortRebase', async (_e, repoId: string) => {
+    const repo = repoFromArg(repoId);
+    if (!repo) return { ok: false, error: 'Unknown repo' };
+    return abortRebase(repo.path);
+  });
+
+  ipcMain.handle('repo:continueRebase', async (_e, repoId: string) => {
+    const repo = repoFromArg(repoId);
+    if (!repo) return { ok: false, error: 'Unknown repo' };
+    return continueRebase(repo.path);
+  });
+
+  ipcMain.handle('repo:abortCherryPick', async (_e, repoId: string) => {
+    const repo = repoFromArg(repoId);
+    if (!repo) return { ok: false, error: 'Unknown repo' };
+    return abortCherryPick(repo.path);
+  });
+
+  ipcMain.handle('repo:continueCherryPick', async (_e, repoId: string) => {
+    const repo = repoFromArg(repoId);
+    if (!repo) return { ok: false, error: 'Unknown repo' };
+    return continueCherryPick(repo.path);
+  });
+
+  ipcMain.handle(
+    'repo:markResolved',
+    async (_e, args: { repoId: string; paths: string[] }) => {
+      const repo = repoFromArg(args);
+      if (!repo) return { ok: false, remaining: [], error: 'Unknown repo' };
+      return markResolved(repo.path, args.paths);
     },
   );
 
