@@ -491,6 +491,13 @@ export interface IPCInvokeMap {
     strategy: 'stash' | 'discard';
   }) => { ok: boolean; error?: string; stashed?: boolean };
   'repo:detectDefaultBranch': (repoId: UUID) => string | null;
+  /// History of one file (`git log --follow`). `path` is repo-relative.
+  /// Used by the in-app history sheet — the diff for any commit is
+  /// available via the existing `repo:diff` call.
+  'repo:fileLog': (args: { repoId: UUID; path: string; limit?: number }) => FileLogCommit[];
+  /// `git blame --porcelain` for one file. `path` is repo-relative.
+  /// Returns one BlameLine per line of the file at HEAD.
+  'repo:fileBlame': (args: { repoId: UUID; path: string }) => BlameLine[];
   'repo:setDefaultBranch': (args: { repoId: UUID; branch: string | null }) => void;
   'repo:worktrees': (repoId: UUID) => Worktree[];
   /// Move a linked worktree's branch into the main checkout. Removes
@@ -620,6 +627,41 @@ export interface WorkspaceDiffTruncation {
   repoName: string;
   /// Original diff size in bytes before substitution.
   originalBytes: number;
+}
+
+/// One commit in a file's history (`git log --follow -- <path>`).
+/// Includes the path the file had at the commit, since `--follow`
+/// surfaces renames; rendering "old/path → new/path" in the row makes
+/// the rename history readable instead of pretending the file always
+/// lived at one location.
+export interface FileLogCommit {
+  sha: string;
+  shortSha: string;
+  author: string;
+  authorEmail: string;
+  /// ISO 8601 author date.
+  authorDate: string;
+  subject: string;
+  /// Path the file had at this commit. Same as the requested path for
+  /// commits that didn't rename it; older path for commits before a
+  /// rename was introduced (only set when --follow detected the move).
+  pathAtCommit: string;
+}
+
+/// One contiguous line of `git blame --porcelain` output, attributed
+/// to its originating commit. We render the gutter as `<shortSha>
+/// <author>` and the content alongside.
+export interface BlameLine {
+  /// 1-based line number in the file at HEAD.
+  lineNumber: number;
+  content: string;
+  sha: string;
+  shortSha: string;
+  author: string;
+  authorEmail: string;
+  /// ISO 8601 author date.
+  authorDate: string;
+  summary: string;
 }
 
 export interface StoreSnapshot {

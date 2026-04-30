@@ -15,6 +15,7 @@ import {
   applyPatch,
   applyStash,
   applyStashForce,
+  blameFile,
   branchSummaries,
   continueCherryPick,
   continueRebase,
@@ -33,6 +34,7 @@ import {
   discardFiles,
   dropStash,
   fetch as gitFetch,
+  fileLog as gitFileLog,
   listBranches,
   listBranchCommits,
   listStashes,
@@ -544,6 +546,24 @@ function registerIpc(): void {
     if (!repo) return null;
     return detectDefaultBranch(repo.path);
   });
+
+  ipcMain.handle(
+    'repo:fileLog',
+    async (_e, args: { repoId: string; path: string; limit?: number }) => {
+      const repo = repoFromArg(args.repoId);
+      if (!repo) return [];
+      return gitFileLog(repo.path, args.path, args.limit);
+    },
+  );
+
+  ipcMain.handle(
+    'repo:fileBlame',
+    async (_e, args: { repoId: string; path: string }) => {
+      const repo = repoFromArg(args.repoId);
+      if (!repo) return [];
+      return blameFile(repo.path, args.path);
+    },
+  );
 
   ipcMain.handle(
     'repo:setDefaultBranch',

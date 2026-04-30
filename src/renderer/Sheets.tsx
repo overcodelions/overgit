@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useStore } from './store';
 import type {
+  BlameLine,
   CommitAllOutcome,
+  FileLogCommit,
   LlmTool,
   Repo,
   ReviewResult,
@@ -46,7 +48,9 @@ export function SheetHost(): JSX.Element | null {
                 ? 'w-[760px] max-w-[92vw] h-[80vh]'
                 : sheet.kind === 'pullConflict'
                   ? 'w-[680px] max-w-[92vw] max-h-[80vh]'
-                  : 'w-[640px] max-w-[90vw] max-h-[80vh]'
+                  : sheet.kind === 'fileHistory'
+                    ? 'w-[860px] max-w-[94vw] h-[82vh]'
+                    : 'w-[640px] max-w-[90vw] max-h-[80vh]'
         }`}
       >
         {sheet.kind === 'settings' && <SettingsSheet />}
@@ -69,6 +73,13 @@ export function SheetHost(): JSX.Element | null {
         )}
         {sheet.kind === 'openPRsInWorkspace' && (
           <WorkspaceOpenPRsSheet workspaceId={sheet.workspaceId} />
+        )}
+        {sheet.kind === 'fileHistory' && (
+          <FileHistorySheet
+            repoId={sheet.repoId}
+            path={sheet.path}
+            initialTab={sheet.tab}
+          />
         )}
         {sheet.kind === 'pullConflict' && (
           <PullConflictSheet
@@ -2352,6 +2363,243 @@ function OpenPROutcomeBadge({
   };
   const { label, cls } = map[result];
   return <span className={`font-mono ${cls}`}>{label}</span>;
+}
+
+/// Per-file history + blame. Two tabs because the same `path` plus
+/// the same opened sheet covers the two related questions a developer
+/// usually has when poking at a file: "how did this file get to look
+/// like this?" (history) and "who wrote this line?" (blame). Sharing a
+/// sheet keeps the "switch view" cost low.
+function FileHistorySheet({
+  repoId,
+  path,
+  initialTab,
+}: {
+  repoId: UUID;
+  path: string;
+  initialTab: 'history' | 'blame';
+}): JSX.Element {
+  const setSheet = useStore((s) => s.setSheet);
+  const [tab, setTab] = useState<'history' | 'blame'>(initialTab);
+  const [log, setLog] = useState<FileLogCommit[] | null>(null);
+  const [blame, setBlame] = useState<BlameLine[] | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  // Lazy-load each tab's data the first time it's viewed. Re-fetching
+  // when the user toggles back is wasteful — file history doesn't
+  // change unless they ran a git operation, which already invalidates
+  // it elsewhere via store refreshes.
+  useEffect(() => {
+    let cancelled = false;
+    if (tab === 'history' && log === null) {
+      setLoading(true);
+      window.overgit
+        .invoke('repo:fileLog', { repoId, path, limit: 200 })
+        .then((rows) => {
+          if (!cancelled) setLog(rows);
+        })
+        .finally(() => {
+          if (!cancelled) setLoading(false);
+        });
+    } else if (tab === 'blame' && blame === null) {
+      setLoading(true);
+      window.overgit
+        .invoke('repo:fileBlame', { repoId, path })
+        .then((rows) => {
+          if (!cancelled) setBlame(rows);
+        })
+        .finally(() => {
+          if (!cancelled) setLoading(false);
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [tab, log, blame, repoId, path]);
+
+  return (
+    <>
+      <SheetHeader title={`File history · ${path}`} onClose={() => setSheet(null)} />
+      <div className="flex-shrink-0 px-5 border-b border-card flex gap-2">
+        <FileHistoryTab label="History" active={tab === 'history'} onClick={() => setTab('history')} />
+        <FileHistoryTab label="Blame" active={tab === 'blame'} onClick={() => setTab('blame')} />
+      </div>
+      <div className="flex-1 min-h-0 overflow-hidden flex">
+        {tab === 'history' ? (
+          <FileHistoryList commits={log} loading={loading} />
+        ) : (
+          <FileBlameList lines={blame} loading={loading} />
+        )}
+      </div>
+    </>
+  );
+}
+
+function FileHistoryTab({
+  label,
+  active,
+  onClick,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}): JSX.Element {
+  return (
+    <button
+      onClick={onClick}
+      className={`text-xs px-3 py-2 border-b-2 -mb-px transition-colors ${
+        active
+          ? 'border-accent text-ink'
+          : 'border-transparent text-ink-faint hover:text-ink'
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
+function FileHistoryList({
+  commits,
+  loading,
+}: {
+  commits: FileLogCommit[] | null;
+  loading: boolean;
+}): JSX.Element {
+  if (loading && commits === null) {
+    return (
+      <div className="flex-1 p-6 text-xs text-ink-faint">Loading history…</div>
+    );
+  }
+  if (!commits || commits.length === 0) {
+    return (
+      <div className="flex-1 p-6 text-xs text-ink-faint">
+        No commits found for this file.
+      </div>
+    );
+  }
+  return (
+    <ul className="flex-1 overflow-y-auto p-3 flex flex-col gap-1">
+      {commits.map((c) => (
+        <li
+          key={c.sha}
+          className="px-3 py-2 rounded border border-card bg-card hover:bg-card/70"
+        >
+          <div className="flex items-baseline gap-2">
+            <span className="font-mono text-[11px] text-ink-faint shrink-0">
+              {c.shortSha}
+            </span>
+            <span className="text-sm font-medium truncate flex-1" title={c.subject}>
+              {c.subject}
+            </span>
+            <span className="text-[10px] text-ink-faint shrink-0">
+              {formatDateShort(c.authorDate)}
+            </span>
+          </div>
+          <div className="text-[11px] text-ink-faint mt-0.5 flex items-baseline gap-2">
+            <span className="truncate">{c.author}</span>
+            <span className="font-mono text-[10px]" title={c.pathAtCommit}>
+              · {c.pathAtCommit}
+            </span>
+          </div>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function FileBlameList({
+  lines,
+  loading,
+}: {
+  lines: BlameLine[] | null;
+  loading: boolean;
+}): JSX.Element {
+  if (loading && lines === null) {
+    return (
+      <div className="flex-1 p-6 text-xs text-ink-faint">Running blame…</div>
+    );
+  }
+  if (!lines || lines.length === 0) {
+    return (
+      <div className="flex-1 p-6 text-xs text-ink-faint">
+        No blame data — the file may be untracked or empty.
+      </div>
+    );
+  }
+  // Group consecutive lines that share a sha so the gutter only
+  // displays the metadata once per group. Greatly improves scanability
+  // — without grouping the gutter dominates the view.
+  type Group = { sha: string; shortSha: string; author: string; date: string; lines: BlameLine[] };
+  const groups: Group[] = [];
+  for (const line of lines) {
+    const last = groups[groups.length - 1];
+    if (last && last.sha === line.sha) {
+      last.lines.push(line);
+    } else {
+      groups.push({
+        sha: line.sha,
+        shortSha: line.shortSha,
+        author: line.author,
+        date: formatDateShort(line.authorDate),
+        lines: [line],
+      });
+    }
+  }
+  return (
+    <div className="flex-1 overflow-auto font-mono text-[12px] leading-snug">
+      <div className="grid" style={{ gridTemplateColumns: 'auto 1fr' }}>
+        {groups.map((g) => (
+          <FileBlameGroup key={`${g.sha}:${g.lines[0].lineNumber}`} group={g} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function FileBlameGroup({
+  group,
+}: {
+  group: {
+    sha: string;
+    shortSha: string;
+    author: string;
+    date: string;
+    lines: BlameLine[];
+  };
+}): JSX.Element {
+  return (
+    <>
+      <div
+        className="border-r border-card px-2 py-1 bg-surface-muted text-[11px] text-ink-faint sticky top-0 self-start"
+        title={`${group.sha}\n${group.author}\n${group.date}`}
+      >
+        <div className="flex items-baseline gap-1.5">
+          <span className="text-ink">{group.shortSha}</span>
+          <span className="truncate max-w-[110px]" title={group.author}>
+            {group.author}
+          </span>
+        </div>
+        <div className="text-[10px]">{group.date}</div>
+      </div>
+      <pre className="px-2 py-1 m-0 whitespace-pre">
+        {group.lines.map((l) => (
+          <div key={l.lineNumber} className="flex gap-3">
+            <span className="text-ink-faint select-none w-8 text-right shrink-0">
+              {l.lineNumber}
+            </span>
+            <span className="flex-1">{l.content}</span>
+          </div>
+        ))}
+      </pre>
+    </>
+  );
+}
+
+function formatDateShort(iso: string): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toISOString().slice(0, 10);
 }
 
 function RepoPickRow({
