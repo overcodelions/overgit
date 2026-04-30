@@ -475,8 +475,18 @@ export const useStore = create<UiState>((set, get) => ({
   pushAllWorkspace: async (id) => {
     const outcomes = await window.overgit.invoke('workspace:pushAll', id);
     // After a push, ahead counters drop and upstream may have just been
-    // set — refresh status so the workspace overview is accurate.
+    // set — refresh status so the workspace overview is accurate. If
+    // a single repo is also open, refresh its log + graph too so the
+    // History tab's ref labels track the new upstream.
     await get().refreshWorkspaceStatus(id);
+    const selectedRepoId = get().selectedRepoId;
+    if (selectedRepoId) {
+      await Promise.all([
+        get().refreshRepoLog(selectedRepoId),
+        get().refreshRepoGraph(selectedRepoId),
+        get().refreshRepoBranchSummaries(selectedRepoId),
+      ]);
+    }
     return outcomes;
   },
 
@@ -616,7 +626,17 @@ export const useStore = create<UiState>((set, get) => ({
 
   pushRepo: async (id) => {
     const res = await window.overgit.invoke('repo:push', id);
-    if (res.ok) await get().refreshRepoStatus(id);
+    if (res.ok) {
+      // Push moves the upstream ref (and may set tracking on first
+      // push), so the History tab's ref labels and ahead/behind line
+      // are stale until log + graph + branch summaries refresh too.
+      await Promise.all([
+        get().refreshRepoStatus(id),
+        get().refreshRepoLog(id),
+        get().refreshRepoGraph(id),
+        get().refreshRepoBranchSummaries(id),
+      ]);
+    }
     return res;
   },
 
