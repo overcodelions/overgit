@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useStore } from './store';
 import { RepoDetail } from './RepoDetail';
 import { TitleBar } from './TitleBar';
@@ -331,7 +331,14 @@ function Sidebar(): JSX.Element {
   const requestConfirm = useStore((s) => s.requestConfirm);
 
   const [search, setSearch] = useState('');
+  const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set());
   const query = search.trim().toLowerCase();
+  const navRef = useRef<HTMLElement | null>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  /// Active row index for keyboard nav. -1 means "no active row" — we
+  /// jump to 0 on the first arrow press from the search box, so users
+  /// who type → arrow get the obvious behavior.
+  const [activeIdx, setActiveIdx] = useState<number>(-1);
 
   const visibleRepos = useMemo(
     () =>
@@ -353,18 +360,102 @@ function Sidebar(): JSX.Element {
     [workspaces, query],
   );
 
+  // Implicit folder grouping. When the user has a non-trivial number
+  // of repos that span multiple parent directories, group the repo list
+  // by parent directory. Cheap heuristic — no schema changes — and
+  // avoids design-debt of true folders. Filtering disables grouping
+  // (the user already narrowed the list).
+  const repoGroups = useMemo(
+    () => groupReposByParentDir(visibleRepos, query.length > 0),
+    [visibleRepos, query],
+  );
+
+  // Flat list of focusable rows in render order. Used by keyboard nav
+  // to map `activeIdx` to "what's currently highlighted." We rebuild
+  // it whenever the rendered structure changes (search, collapse
+  // toggles), and clamp the activeIdx if it falls off the end.
+  const flatRows = useMemo(() => {
+    const rows: Array<
+      | { kind: 'repo'; id: UUID }
+      | { kind: 'workspace'; id: UUID }
+    > = [];
+    for (const g of repoGroups) {
+      if (g.kind === 'flat') {
+        for (const r of g.repos) rows.push({ kind: 'repo', id: r.id });
+      } else if (!collapsedFolders.has(g.label)) {
+        for (const r of g.repos) rows.push({ kind: 'repo', id: r.id });
+      }
+    }
+    for (const w of visibleWorkspaces) rows.push({ kind: 'workspace', id: w.id });
+    return rows;
+  }, [repoGroups, visibleWorkspaces, collapsedFolders]);
+
+  useEffect(() => {
+    if (activeIdx >= flatRows.length) setActiveIdx(flatRows.length - 1);
+  }, [flatRows.length, activeIdx]);
+
+  // Sidebar-scoped keyboard nav. Catches ArrowUp/Down/Enter while
+  // focus is anywhere inside the sidebar. The search input gets the
+  // first arrow press too — that lets users type, then ↓, then Enter
+  // without ever taking their hands off the keyboard.
+  const onSidebarKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setActiveIdx((i) => Math.min(flatRows.length - 1, (i < 0 ? -1 : i) + 1));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setActiveIdx((i) => Math.max(0, i - 1));
+    } else if (e.key === 'Enter') {
+      const row = flatRows[activeIdx];
+      if (!row) return;
+      e.preventDefault();
+      if (row.kind === 'repo') selectRepo(row.id);
+      else selectWs(row.id);
+    } else if (e.key === '/' && document.activeElement !== inputRef.current) {
+      e.preventDefault();
+      inputRef.current?.focus();
+    }
+  };
+
+  const toggleFolder = (label: string) => {
+    setCollapsedFolders((cur) => {
+      const next = new Set(cur);
+      if (next.has(label)) next.delete(label);
+      else next.add(label);
+      return next;
+    });
+  };
+
+  // Map of repoId → flatRows index. Lets RepoRow know whether it's the
+  // keyboard-active row in O(1) without re-scanning flatRows per row.
+  const rowIndex = useMemo(() => {
+    const m = new Map<string, number>();
+    for (let i = 0; i < flatRows.length; i++) {
+      const r = flatRows[i];
+      m.set(`${r.kind}:${r.id}`, i);
+    }
+    return m;
+  }, [flatRows]);
+
   return (
-    <aside className="flex-1 min-w-0 flex flex-col border-r border-card bg-surface-muted">
+    <aside
+      className="flex-1 min-w-0 flex flex-col border-r border-card bg-surface-muted"
+      onKeyDown={onSidebarKeyDown}
+    >
       <div className="px-2 pt-2 pb-1">
         <input
+          ref={inputRef}
           value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          placeholder="Search"
+          onChange={(e) => {
+            setSearch(e.target.value);
+            setActiveIdx(-1);
+          }}
+          placeholder="Search · / to focus"
           className="field w-full px-2 py-1 text-xs"
         />
       </div>
 
-      <nav className="flex-1 min-h-0 overflow-y-auto px-1 pb-2">
+      <nav ref={navRef} className="flex-1 min-h-0 overflow-y-auto px-1 pb-2">
         {/* Repos on top — that's where users start. */}
         <SectionHeader label="Repos" count={visibleRepos.length} />
         {visibleRepos.length === 0 ? (
@@ -372,22 +463,66 @@ function Sidebar(): JSX.Element {
             text={query ? 'No repos match.' : 'Add a local git repo to start.'}
           />
         ) : (
-          visibleRepos.map((r) => (
-            <RepoRow
-              key={r.id}
-              repo={r}
-              selected={selectedRepo === r.id}
-              onSelect={() => selectRepo(r.id)}
-              onRemove={async () => {
-                const ok = await requestConfirm({
-                  title: `Remove ${r.name}?`,
-                  body: `Remove "${r.name}" from overgit? The repo on disk is left alone.`,
-                  confirmLabel: 'Remove',
-                });
-                if (ok) void removeRepo(r.id);
-              }}
-            />
-          ))
+          repoGroups.map((g) => {
+            if (g.kind === 'flat') {
+              return g.repos.map((r) => {
+                const idx = rowIndex.get(`repo:${r.id}`) ?? -1;
+                return (
+                  <RepoRow
+                    key={r.id}
+                    repo={r}
+                    selected={selectedRepo === r.id}
+                    keyboardActive={idx === activeIdx}
+                    onSelect={() => selectRepo(r.id)}
+                    onRemove={async () => {
+                      const ok = await requestConfirm({
+                        title: `Remove ${r.name}?`,
+                        body: `Remove "${r.name}" from overgit? The repo on disk is left alone.`,
+                        confirmLabel: 'Remove',
+                      });
+                      if (ok) void removeRepo(r.id);
+                    }}
+                  />
+                );
+              });
+            }
+            const collapsed = collapsedFolders.has(g.label);
+            return (
+              <div key={g.label}>
+                <button
+                  onClick={() => toggleFolder(g.label)}
+                  className="w-full px-2 py-1 mt-1 flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-ink-faint hover:text-ink"
+                  title={g.label}
+                >
+                  <span className="font-mono">{collapsed ? '▸' : '▾'}</span>
+                  <span className="truncate">{shortenPath(g.label)}</span>
+                  <span className="ml-auto">{g.repos.length}</span>
+                </button>
+                {!collapsed &&
+                  g.repos.map((r) => {
+                    const idx = rowIndex.get(`repo:${r.id}`) ?? -1;
+                    return (
+                      <RepoRow
+                        key={r.id}
+                        repo={r}
+                        selected={selectedRepo === r.id}
+                        keyboardActive={idx === activeIdx}
+                        indent
+                        onSelect={() => selectRepo(r.id)}
+                        onRemove={async () => {
+                          const ok = await requestConfirm({
+                            title: `Remove ${r.name}?`,
+                            body: `Remove "${r.name}" from overgit? The repo on disk is left alone.`,
+                            confirmLabel: 'Remove',
+                          });
+                          if (ok) void removeRepo(r.id);
+                        }}
+                      />
+                    );
+                  })}
+              </div>
+            );
+          })
         )}
 
         <SectionHeader label="Workspaces" count={visibleWorkspaces.length} />
@@ -400,23 +535,27 @@ function Sidebar(): JSX.Element {
             }
           />
         ) : (
-          visibleWorkspaces.map((w) => (
-            <WorkspaceRow
-              key={w.id}
-              workspace={w}
-              selected={selectedWs === w.id && !selectedRepo}
-              onSelect={() => selectWs(w.id)}
-              onEdit={() => setSheet({ kind: 'editWorkspace', workspaceId: w.id })}
-              onRemove={async () => {
-                const ok = await requestConfirm({
-                  title: `Remove workspace?`,
-                  body: `Remove workspace "${w.name}"?`,
-                  confirmLabel: 'Remove',
-                });
-                if (ok) void removeWorkspace(w.id);
-              }}
-            />
-          ))
+          visibleWorkspaces.map((w) => {
+            const idx = rowIndex.get(`workspace:${w.id}`) ?? -1;
+            return (
+              <WorkspaceRow
+                key={w.id}
+                workspace={w}
+                selected={selectedWs === w.id && !selectedRepo}
+                keyboardActive={idx === activeIdx}
+                onSelect={() => selectWs(w.id)}
+                onEdit={() => setSheet({ kind: 'editWorkspace', workspaceId: w.id })}
+                onRemove={async () => {
+                  const ok = await requestConfirm({
+                    title: `Remove workspace?`,
+                    body: `Remove workspace "${w.name}"?`,
+                    confirmLabel: 'Remove',
+                  });
+                  if (ok) void removeWorkspace(w.id);
+                }}
+              />
+            );
+          })
         )}
       </nav>
 
@@ -439,6 +578,62 @@ function Sidebar(): JSX.Element {
   );
 }
 
+/// Group repos by their parent directory ("auto-folders"). Returns a
+/// flat list when grouping isn't worth it (filtered, too few repos, or
+/// a single shared parent — no signal in that case). Threshold tuned
+/// empirically: at 6+ repos with 2+ parents, the directory column is a
+/// readable shorthand for ownership; under that, a flat list scans
+/// faster. Schema-free — we never persist this; it's pure rendering.
+function groupReposByParentDir(
+  repos: Repo[],
+  filtering: boolean,
+):
+  | Array<{ kind: 'flat'; repos: Repo[] }>
+  | Array<
+      | { kind: 'flat'; repos: Repo[] }
+      | { kind: 'group'; label: string; repos: Repo[] }
+    > {
+  if (filtering || repos.length < 6) return [{ kind: 'flat', repos }];
+  const byDir = new Map<string, Repo[]>();
+  for (const r of repos) {
+    const dir = parentDir(r.path);
+    const list = byDir.get(dir) ?? [];
+    list.push(r);
+    byDir.set(dir, list);
+  }
+  if (byDir.size < 2) return [{ kind: 'flat', repos }];
+  // Sort groups by name; keep singletons as a synthetic "Other" flat
+  // section so the sidebar isn't dominated by one-row folders.
+  const groups: Array<{ kind: 'group'; label: string; repos: Repo[] }> = [];
+  const orphans: Repo[] = [];
+  for (const [dir, list] of byDir) {
+    if (list.length === 1) {
+      orphans.push(list[0]);
+    } else {
+      groups.push({ kind: 'group', label: dir, repos: list });
+    }
+  }
+  groups.sort((a, b) => a.label.localeCompare(b.label));
+  if (orphans.length === 0) return groups;
+  return [...groups, { kind: 'flat', repos: orphans }];
+}
+
+function parentDir(p: string): string {
+  const sep = p.includes('\\') ? '\\' : '/';
+  const idx = p.lastIndexOf(sep);
+  return idx > 0 ? p.slice(0, idx) : p;
+}
+
+/// Trim a directory path for sidebar display: keep the last 2 segments
+/// so common prefixes (~/code, /Users/foo/git-services/...) collapse
+/// without losing the bit that distinguishes one folder from another.
+function shortenPath(p: string): string {
+  const sep = p.includes('\\') ? '\\' : '/';
+  const parts = p.split(sep).filter(Boolean);
+  if (parts.length <= 2) return p;
+  return '…' + sep + parts.slice(-2).join(sep);
+}
+
 function SectionHeader({ label, count }: { label: string; count: number }): JSX.Element {
   return (
     <div className="mt-3 first:mt-1 px-2 py-1 flex items-center gap-2">
@@ -455,23 +650,41 @@ function EmptyHint({ text }: { text: string }): JSX.Element {
 function RepoRow({
   repo,
   selected,
+  keyboardActive = false,
+  indent = false,
   onSelect,
   onRemove,
 }: {
   repo: Repo;
   selected: boolean;
+  keyboardActive?: boolean;
+  indent?: boolean;
   onSelect: () => void;
   onRemove: () => void;
 }): JSX.Element {
+  const ref = useRef<HTMLDivElement | null>(null);
+  // Keep the keyboard-active row in view as the cursor moves through
+  // a long list. `nearest` avoids jumpy auto-scrolls when the row is
+  // already visible.
+  useEffect(() => {
+    if (keyboardActive) ref.current?.scrollIntoView({ block: 'nearest' });
+  }, [keyboardActive]);
   return (
     <div
+      ref={ref}
       className={`sidebar-row group flex items-center gap-1.5 rounded text-xs ${
-        selected ? 'sidebar-row-selected text-ink' : 'text-ink-muted hover:bg-card hover:text-ink'
+        selected
+          ? 'sidebar-row-selected text-ink'
+          : keyboardActive
+            ? 'bg-card text-ink ring-1 ring-accent/40'
+            : 'text-ink-muted hover:bg-card hover:text-ink'
       }`}
     >
       <button
         onClick={onSelect}
-        className="flex items-center gap-1.5 flex-1 min-w-0 text-left px-2 py-1"
+        className={`flex items-center gap-1.5 flex-1 min-w-0 text-left py-1 ${
+          indent ? 'pl-5 pr-2' : 'px-2'
+        }`}
         title={repo.path}
       >
         <RepoIcon />
@@ -491,20 +704,31 @@ function RepoRow({
 function WorkspaceRow({
   workspace,
   selected,
+  keyboardActive = false,
   onSelect,
   onEdit,
   onRemove,
 }: {
   workspace: Workspace;
   selected: boolean;
+  keyboardActive?: boolean;
   onSelect: () => void;
   onEdit: () => void;
   onRemove: () => void;
 }): JSX.Element {
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (keyboardActive) ref.current?.scrollIntoView({ block: 'nearest' });
+  }, [keyboardActive]);
   return (
     <div
+      ref={ref}
       className={`sidebar-row group flex items-center gap-1.5 rounded text-xs ${
-        selected ? 'sidebar-row-selected text-ink' : 'text-ink-muted hover:bg-card hover:text-ink'
+        selected
+          ? 'sidebar-row-selected text-ink'
+          : keyboardActive
+            ? 'bg-card text-ink ring-1 ring-accent/40'
+            : 'text-ink-muted hover:bg-card hover:text-ink'
       }`}
     >
       <button
