@@ -340,6 +340,11 @@ export interface AppSettings {
   /// usually wider than the app sidebar (it carries the lane rail +
   /// ref badges + subject + meta on one row).
   historyAsideWidth: number;
+  /// Per-workspace "last seen" timestamps (ISO 8601). Used by the
+  /// activity feed to mark commits / PRs that arrived since the user
+  /// last opened the workspace pane. Wiped when a workspace is
+  /// removed; never written for repos (workspace-scoped only).
+  workspaceLastSeen?: Record<UUID, string>;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -347,6 +352,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   sidebarVisible: true,
   sidebarWidth: 288,
   historyAsideWidth: 480,
+  workspaceLastSeen: {},
 };
 
 export const SIDEBAR_MIN_WIDTH = 200;
@@ -560,6 +566,17 @@ export interface IPCInvokeMap {
   /// Aggregate `git worktree list` across the workspace's repos so the
   /// renderer can show siblings per repo without N round-trips.
   'workspace:worktrees': (workspaceId: UUID) => { repoId: UUID; worktrees: Worktree[] }[];
+  /// Aggregated "what happened recently" across the workspace. Walks
+  /// `git log` on the current branch of each repo (capped per-repo and
+  /// in total) and merges in the gh PR list. Returned items are sorted
+  /// newest-first; the renderer marks any newer than `lastSeen` as new.
+  'workspace:activity': (args: {
+    workspaceId: UUID;
+    /// Per-repo log limit (default 25). Total across the workspace is
+    /// implicitly capped at members × this.
+    perRepo?: number;
+  }) => WorkspaceActivity[];
+
   /// `git push` every workspace repo whose branch is ahead of its
   /// upstream. Repos in detached HEAD are skipped. Repos with no
   /// upstream get `git push -u origin HEAD` so the first push wires up
@@ -628,6 +645,37 @@ export interface WorkspaceDiffTruncation {
   /// Original diff size in bytes before substitution.
   originalBytes: number;
 }
+
+/// One row in the workspace activity feed. We model commits and PR
+/// events under one type so the renderer can sort them together by
+/// `at` descending — the user thinks of "what happened recently" as
+/// a single timeline, not two separate lists.
+export type WorkspaceActivity =
+  | {
+      kind: 'commit';
+      repoId: UUID;
+      repoName: string;
+      sha: string;
+      shortSha: string;
+      branch: string;
+      subject: string;
+      author: string;
+      /// ISO 8601 author date — sortable lexicographically.
+      at: string;
+    }
+  | {
+      kind: 'pr';
+      repoId: UUID;
+      repoName: string;
+      number: number;
+      title: string;
+      url: string;
+      state: 'OPEN' | 'MERGED' | 'CLOSED';
+      author: string;
+      /// PR `updatedAt` from gh — covers both open events and state
+      /// transitions in one timestamp.
+      at: string;
+    };
 
 /// One commit in a file's history (`git log --follow -- <path>`).
 /// Includes the path the file had at the commit, since `--follow`

@@ -13,6 +13,7 @@ import {
   SyncAndBranchOutcome,
   UUID,
   Workspace,
+  WorkspaceActivity,
   WorkspaceDiffTruncation,
   WorkspaceOpenPROutcome,
   WorkspacePushOutcome,
@@ -26,6 +27,7 @@ import {
   fetch as gitFetch,
   hasUpstream,
   listWorktrees,
+  log as gitLog,
   pull as gitPull,
   push as gitPush,
   rawDiff,
@@ -461,6 +463,78 @@ export async function workspaceOpenPRs(
       });
     }
   }
+  return out;
+}
+
+/// Aggregated workspace timeline: recent commits across all repos
+/// (current branch only — per-branch tracking is a future-pass thing)
+/// merged with the workspace's open PR list. Sorted newest-first.
+/// Read-only and best-effort: a repo we can't reach (missing on disk,
+/// git not in PATH for that path, etc.) just contributes no items.
+export async function workspaceActivity(
+  workspaceId: UUID,
+  perRepo: number,
+  workspaces: Workspace[],
+  repos: Repo[],
+): Promise<WorkspaceActivity[]> {
+  const ws = workspaces.find((w) => w.id === workspaceId);
+  if (!ws) return [];
+  const members = reposFor(ws, repos);
+  const out: WorkspaceActivity[] = [];
+
+  // Commits — fan out, every repo is independent. We use the repo's
+  // current branch as the source; a future pass could walk every
+  // tracked branch but that's overkill for a "what's new" surface.
+  const commitFanout = await Promise.all(
+    members.map(async (r) => {
+      const st = await gitStatus(r.id, r.path, r.defaultBranch);
+      const branch = st.branch ?? '(detached)';
+      const commits = await gitLog(r.path, perRepo);
+      return { repo: r, branch, commits };
+    }),
+  );
+  for (const { repo, branch, commits } of commitFanout) {
+    for (const c of commits) {
+      out.push({
+        kind: 'commit',
+        repoId: repo.id,
+        repoName: repo.name,
+        sha: c.sha,
+        shortSha: c.shortSha,
+        branch,
+        subject: c.subject,
+        author: c.author,
+        at: c.date,
+      });
+    }
+  }
+
+  // PRs — listOpenPRs already gates on `gh` being installed and
+  // returns null when there's no GitHub remote. Skip null results
+  // silently; we surface gh-presence in the dedicated PR UI.
+  const prFanout = await Promise.all(
+    members.map(async (r) => ({ repo: r, prs: (await listOpenPRs(r.path)).prs })),
+  );
+  for (const { repo, prs } of prFanout) {
+    if (!prs) continue;
+    for (const pr of prs) {
+      out.push({
+        kind: 'pr',
+        repoId: repo.id,
+        repoName: repo.name,
+        number: pr.number,
+        title: pr.title,
+        url: pr.url,
+        state: pr.state,
+        author: pr.author,
+        at: pr.updatedAt,
+      });
+    }
+  }
+
+  // Newest first. Lexicographic sort on ISO 8601 happens to coincide
+  // with chronological order, so no Date construction needed.
+  out.sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0));
   return out;
 }
 

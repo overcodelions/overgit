@@ -22,6 +22,7 @@ import type {
   StoreSnapshot,
   UUID,
   Workspace,
+  WorkspaceActivity,
   WorkspaceOpenPROutcome,
   WorkspacePushOutcome,
   Worktree,
@@ -85,6 +86,11 @@ interface UiState {
   selectedRepoId: UUID | null;
   workspaceStatuses: Record<UUID, RepoStatus[]>;
   workspacePRs: Record<UUID, RepoPRs[]>;
+  /// Activity-feed cache per workspace. Each refresh replaces the full
+  /// list; we don't paginate or merge historical fetches because the
+  /// "what's new since I last looked" model only needs the most recent
+  /// snapshot.
+  workspaceActivity: Record<UUID, WorkspaceActivity[]>;
   /// Cached `git worktree list` output per repo. Keyed by repoId, not
   /// workspaceId, because worktrees belong to repos and the same repo
   /// can appear in multiple workspaces — caching by workspace would
@@ -137,6 +143,11 @@ interface UiState {
   refreshWorkspaceStatus: (id: UUID) => Promise<void>;
   refreshWorkspacePRs: (id: UUID) => Promise<void>;
   refreshWorkspaceWorktrees: (id: UUID) => Promise<void>;
+  refreshWorkspaceActivity: (id: UUID) => Promise<void>;
+  /// Stamp the workspace's `lastSeen` to "now". Called when the user
+  /// opens the workspace pane so the activity feed's "new since" pip
+  /// shifts forward — and on explicit "Mark all read" too.
+  markWorkspaceSeen: (id: UUID) => Promise<void>;
   refreshRepoWorktrees: (id: UUID) => Promise<void>;
   adoptWorktreeBranch: (
     id: UUID,
@@ -283,6 +294,7 @@ export const useStore = create<UiState>((set, get) => ({
   selectedRepoId: null,
   workspaceStatuses: {},
   workspacePRs: {},
+  workspaceActivity: {},
   workspaceWorktrees: {},
   repoLog: {},
   repoDiff: {},
@@ -384,6 +396,26 @@ export const useStore = create<UiState>((set, get) => ({
     const next = { ...get().workspaceWorktrees };
     for (const row of rows) next[row.repoId] = row.worktrees;
     set({ workspaceWorktrees: next });
+  },
+
+  refreshWorkspaceActivity: async (id) => {
+    const items = await window.overgit.invoke('workspace:activity', {
+      workspaceId: id,
+    });
+    set({ workspaceActivity: { ...get().workspaceActivity, [id]: items } });
+  },
+
+  markWorkspaceSeen: async (id) => {
+    const settings = get().settings;
+    const next: AppSettings = {
+      ...settings,
+      workspaceLastSeen: {
+        ...(settings.workspaceLastSeen ?? {}),
+        [id]: new Date().toISOString(),
+      },
+    };
+    set({ settings: next });
+    await window.overgit.invoke('store:saveSettings', next);
   },
 
   refreshRepoWorktrees: async (id) => {

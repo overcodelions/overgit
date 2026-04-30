@@ -13,6 +13,7 @@ import type {
   RepoStatus,
   UUID,
   Workspace,
+  WorkspaceActivity,
   Worktree,
 } from '@shared/types';
 import { SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH } from '@shared/types';
@@ -26,6 +27,7 @@ import { SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH } from '@shared/types';
 const EMPTY_STATUSES: RepoStatus[] = [];
 const EMPTY_PRS: RepoPRs[] = [];
 const EMPTY_WORKTREES: Worktree[] = [];
+const EMPTY_ACTIVITY: WorkspaceActivity[] = [];
 
 export function App(): JSX.Element {
   const { loaded, hydrate } = useStore();
@@ -608,11 +610,17 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
   const repos = useStore((s) => s.repos);
   const statuses = useStore((s) => s.workspaceStatuses[workspaceId] ?? EMPTY_STATUSES);
   const prs = useStore((s) => s.workspacePRs[workspaceId] ?? EMPTY_PRS);
+  const activity = useStore((s) => s.workspaceActivity[workspaceId] ?? EMPTY_ACTIVITY);
+  const lastSeen = useStore(
+    (s) => s.settings.workspaceLastSeen?.[workspaceId] ?? null,
+  );
   const lastCheckout = useStore((s) => s.lastCheckout);
   const cli = useStore((s) => s.cliPresence);
   const refresh = useStore((s) => s.refreshWorkspaceStatus);
   const refreshPRs = useStore((s) => s.refreshWorkspacePRs);
   const refreshWorktrees = useStore((s) => s.refreshWorkspaceWorktrees);
+  const refreshActivity = useStore((s) => s.refreshWorkspaceActivity);
+  const markSeen = useStore((s) => s.markWorkspaceSeen);
   const fetchWs = useStore((s) => s.fetchWorkspace);
   const checkout = useStore((s) => s.checkoutWorkspaceBranch);
   const selectRepo = useStore((s) => s.selectRepo);
@@ -621,12 +629,27 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
   const [branch, setBranch] = useState('');
   const [createIfMissing, setCreateIfMissing] = useState(false);
   const [busy, setBusy] = useState(false);
+  /// `seenAtOpen` freezes the lastSeen value at mount so the "new
+  /// since" pip remains visible while the user is on the pane. Without
+  /// this, marking-seen on open would immediately wipe the indicators
+  /// the user just came in to look at. We mark-seen on unmount instead
+  /// (or on explicit dismiss).
+  const [seenAtOpen] = useState<string | null>(lastSeen);
 
   useEffect(() => {
     refresh(workspaceId);
     refreshPRs(workspaceId);
     refreshWorktrees(workspaceId);
-  }, [refresh, refreshPRs, refreshWorktrees, workspaceId]);
+    refreshActivity(workspaceId);
+  }, [refresh, refreshPRs, refreshWorktrees, refreshActivity, workspaceId]);
+
+  // On unmount (or workspace switch), advance lastSeen so the next
+  // visit only highlights things that landed after this one.
+  useEffect(() => {
+    return () => {
+      void markSeen(workspaceId);
+    };
+  }, [markSeen, workspaceId]);
 
   // Overview tiles, computed BEFORE any early return so React's hook
   // order stays stable. The previous version put this useMemo after
@@ -850,6 +873,13 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
       </section>
 
       {prs.length > 0 && <PRSection prs={prs} reposById={reposById} cli={cli} />}
+
+      <ActivitySection
+        items={activity}
+        reposById={reposById}
+        seenAtOpen={seenAtOpen}
+        onSelectRepo={selectRepo}
+      />
 
       <section>
         <h2 className="text-[10px] uppercase tracking-wide text-ink-faint mb-2">Status</h2>
@@ -1089,6 +1119,136 @@ function PRSection({
       )}
     </section>
   );
+}
+
+/// "Recent" feed across the workspace. Merges commits and PR events
+/// into one timeline (see WorkspaceActivity in shared/types.ts) and
+/// flags rows newer than the user's last visit with a small dot. We
+/// don't paginate — the backend caps the per-repo log length, which
+/// already keeps the list short for the workspace sizes overgit
+/// targets.
+function ActivitySection({
+  items,
+  reposById,
+  seenAtOpen,
+  onSelectRepo,
+}: {
+  items: WorkspaceActivity[];
+  reposById: Map<UUID, Repo>;
+  seenAtOpen: string | null;
+  onSelectRepo: (id: UUID) => void;
+}): JSX.Element | null {
+  if (items.length === 0) return null;
+  // Cap rendered rows. The backend can return up to N×perRepo commits
+  // plus PRs, which is a lot of DOM if a workspace has 20 repos.
+  const MAX = 60;
+  const visible = items.slice(0, MAX);
+  const newSinceLast = seenAtOpen
+    ? items.filter((it) => it.at > seenAtOpen).length
+    : items.length;
+
+  return (
+    <section className="mb-6">
+      <h2 className="text-[10px] uppercase tracking-wide text-ink-faint mb-2 flex items-center gap-2">
+        <span>Recent</span>
+        {newSinceLast > 0 && (
+          <span
+            className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-accent/20 text-accent"
+            title={
+              seenAtOpen
+                ? `Since you last looked (${formatDateRelative(seenAtOpen)})`
+                : 'Since first opening this workspace'
+            }
+          >
+            {newSinceLast} new
+          </span>
+        )}
+      </h2>
+      <ul className="flex flex-col gap-1">
+        {visible.map((it) => (
+          <li
+            key={
+              it.kind === 'commit'
+                ? `c:${it.repoId}:${it.sha}`
+                : `p:${it.repoId}:${it.number}`
+            }
+            className="flex items-center gap-3 px-3 py-1.5 rounded border border-card bg-card text-xs"
+          >
+            <span
+              className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                seenAtOpen && it.at > seenAtOpen ? 'bg-accent' : 'bg-transparent'
+              }`}
+              aria-hidden
+            />
+            <button
+              onClick={() => onSelectRepo(it.repoId)}
+              className="text-ink-faint w-32 truncate text-left hover:text-ink"
+              title={reposById.get(it.repoId)?.path ?? ''}
+            >
+              {it.repoName}
+            </button>
+            {it.kind === 'commit' ? (
+              <>
+                <span className="font-mono text-[10px] text-ink-faint shrink-0">
+                  {it.shortSha}
+                </span>
+                <span className="truncate flex-1" title={it.subject}>
+                  {it.subject}
+                </span>
+                <span className="text-[10px] text-ink-faint shrink-0 truncate max-w-[160px]">
+                  {it.author}
+                </span>
+              </>
+            ) : (
+              <>
+                <span className="font-mono text-[10px] text-ink-faint shrink-0">
+                  PR #{it.number}
+                </span>
+                <a
+                  href={it.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="truncate flex-1 hover:underline"
+                  title={it.title}
+                >
+                  {it.title}
+                </a>
+                <span className="text-[10px] font-mono shrink-0 text-ink-faint">
+                  {it.state.toLowerCase()}
+                </span>
+              </>
+            )}
+            <span className="text-[10px] text-ink-faint shrink-0 w-16 text-right">
+              {formatDateRelative(it.at)}
+            </span>
+          </li>
+        ))}
+      </ul>
+      {items.length > visible.length && (
+        <p className="text-[10px] text-ink-faint mt-1">
+          {items.length - visible.length} older items hidden.
+        </p>
+      )}
+    </section>
+  );
+}
+
+/// Tiny relative-time helper, scoped to this file. Avoids pulling in
+/// dayjs/date-fns just for one row format.
+function formatDateRelative(iso: string): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const diffMs = Date.now() - d.getTime();
+  const sec = Math.floor(diffMs / 1000);
+  if (sec < 60) return 'just now';
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 7) return `${day}d ago`;
+  return d.toISOString().slice(0, 10);
 }
 
 /// Inline list of *additional* git worktrees for a repo. Hidden when

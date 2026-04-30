@@ -60,6 +60,7 @@ import {
 import { listFilesUnder, readFileUnderRoot, writeFileUnderRoot } from './fs';
 import {
   aggregateWorkspaceDirtyDiff,
+  workspaceActivity,
   workspaceCheckout,
   workspaceCommitAll,
   workspaceFetch,
@@ -663,6 +664,19 @@ function registerIpc(): void {
     const { workspaces, repos } = Store.load();
     return workspacePushAll(workspaceId, workspaces, repos);
   });
+
+  ipcMain.handle(
+    'workspace:activity',
+    async (_e, args: { workspaceId: string; perRepo?: number }) => {
+      const { workspaces, repos } = Store.load();
+      return workspaceActivity(
+        args.workspaceId,
+        args.perRepo ?? 25,
+        workspaces,
+        repos,
+      );
+    },
+  );
 
   ipcMain.handle(
     'workspace:openPRs',
