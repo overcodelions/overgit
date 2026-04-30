@@ -539,13 +539,22 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
     const dirty = statuses.filter((s) => s.dirtyCount > 0).length;
     const ahead = statuses.filter((s) => (s.ahead ?? 0) > 0).length;
     const behind = statuses.filter((s) => (s.behind ?? 0) > 0).length;
+    // Repos in the middle of a merge / rebase / cherry-pick. Surfaced
+    // in the overview because a workspace-wide op (rebase the workspace
+    // onto main) can leave several repos paused on conflicts at once;
+    // burying that in the per-row status cell makes it easy to miss.
+    const inProgress = statuses.filter((s) => s.inProgress !== null).length;
+    const conflictedFiles = statuses.reduce(
+      (acc, s) => acc + (s.conflicts?.length ?? 0),
+      0,
+    );
     const branchTally = new Map<string, number>();
     for (const s of statuses) {
       const b = s.branch ?? '(detached)';
       branchTally.set(b, (branchTally.get(b) ?? 0) + 1);
     }
     const sortedBranches = [...branchTally.entries()].sort((a, b) => b[1] - a[1]);
-    return { total, loaded, dirty, ahead, behind, sortedBranches };
+    return { total, loaded, dirty, ahead, behind, inProgress, conflictedFiles, sortedBranches };
   }, [ws?.repoIds.length, statuses]);
 
   if (!ws) return <main className="flex-1" />;
@@ -660,22 +669,37 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
           hint="vs upstream"
           tone={summary.ahead + summary.behind > 0 ? 'warn' : 'muted'}
         />
-        <OverviewTile
-          label="Branch spread"
-          value={
-            summary.sortedBranches.length === 0
-              ? '—'
-              : summary.sortedBranches[0][0]
-          }
-          hint={
-            summary.sortedBranches.length <= 1
-              ? `${summary.sortedBranches[0]?.[1] ?? 0} ${
-                  (summary.sortedBranches[0]?.[1] ?? 0) === 1 ? 'repo' : 'repos'
-                }`
-              : `${summary.sortedBranches.length} different branches`
-          }
-          tone={summary.sortedBranches.length > 1 ? 'warn' : 'muted'}
-        />
+        {summary.inProgress > 0 ? (
+          <OverviewTile
+            label="In progress"
+            value={summary.inProgress.toString()}
+            hint={
+              summary.conflictedFiles > 0
+                ? `${summary.conflictedFiles} conflicted ${
+                    summary.conflictedFiles === 1 ? 'file' : 'files'
+                  }`
+                : 'no conflicts'
+            }
+            tone="warn"
+          />
+        ) : (
+          <OverviewTile
+            label="Branch spread"
+            value={
+              summary.sortedBranches.length === 0
+                ? '—'
+                : summary.sortedBranches[0][0]
+            }
+            hint={
+              summary.sortedBranches.length <= 1
+                ? `${summary.sortedBranches[0]?.[1] ?? 0} ${
+                    (summary.sortedBranches[0]?.[1] ?? 0) === 1 ? 'repo' : 'repos'
+                  }`
+                : `${summary.sortedBranches.length} different branches`
+            }
+            tone={summary.sortedBranches.length > 1 ? 'warn' : 'muted'}
+          />
+        )}
       </section>
 
       <section className="mb-6 p-3 rounded-lg bg-card border border-card">
@@ -1017,6 +1041,21 @@ function StatusCell({ status }: { status?: RepoStatus }): JSX.Element {
   return (
     <div className="flex items-center gap-3 text-[11px]">
       <span className="font-mono">{status.branch ?? '(detached)'}</span>
+      {status.inProgress && (
+        <span
+          className="text-amber-300 font-mono"
+          title={`${status.inProgress} in progress${
+            status.conflicts.length > 0
+              ? ` · ${status.conflicts.length} conflicted ${
+                  status.conflicts.length === 1 ? 'file' : 'files'
+                }`
+              : ''
+          }`}
+        >
+          {status.inProgress}
+          {status.conflicts.length > 0 ? ` · ${status.conflicts.length}⚠` : ''}
+        </span>
+      )}
       {status.dirtyCount > 0 && (
         <span className="text-amber-400">{status.dirtyCount} dirty</span>
       )}
