@@ -6,19 +6,26 @@
 
 import {
   CheckoutOutcome,
+  CommitAllOutcome,
   Repo,
   RepoPRs,
   RepoStatus,
   SyncAndBranchOutcome,
   UUID,
   Workspace,
+  WorkspaceDiffTruncation,
+  Worktree,
 } from '../shared/types';
 import {
   checkoutBranch,
+  commitAll as gitCommitAll,
   createBranch,
   detectDefaultBranch,
   fetch as gitFetch,
+  listWorktrees,
   pull as gitPull,
+  rawDiff,
+  diffStat,
   status as gitStatus,
 } from './git';
 import { listOpenPRs } from './cli';
@@ -172,6 +179,119 @@ export async function workspaceSyncAndBranch(
     }
   }
   return out;
+}
+
+/// Stage and commit every dirty repo with a shared message. Detached-
+/// HEAD repos are skipped — committing onto detached HEAD orphans the
+/// commit, which is rarely what someone clicking "Commit all" means.
+/// Clean repos come back as `clean` so the result table is symmetric
+/// (matches the user's mental model of "I just ran this on N repos").
+/// Sequential, like syncAndBranch — one repo's commit failure should
+/// be readable in context, not interleaved with others.
+export async function workspaceCommitAll(
+  workspaceId: UUID,
+  message: string,
+  workspaces: Workspace[],
+  repos: Repo[],
+): Promise<CommitAllOutcome[]> {
+  const ws = workspaces.find((w) => w.id === workspaceId);
+  if (!ws) return [];
+  const members = reposFor(ws, repos);
+  const out: CommitAllOutcome[] = [];
+  for (const r of members) {
+    const st = await gitStatus(r.id, r.path, r.defaultBranch);
+    if (st.branch === null) {
+      out.push({ repoId: r.id, result: 'detached', message: 'Detached HEAD — skipped' });
+      continue;
+    }
+    if (st.dirtyCount === 0) {
+      out.push({ repoId: r.id, result: 'clean' });
+      continue;
+    }
+    const res = await gitCommitAll(r.path, message);
+    if (res.ok) out.push({ repoId: r.id, result: 'committed' });
+    else out.push({ repoId: r.id, result: 'commit-failed', message: res.error });
+  }
+  return out;
+}
+
+/// Default byte budget for the concatenated workspace diff sent to LLM
+/// CLIs. Sized to comfortably fit inside Claude/Codex/Gemini one-shot
+/// context windows after the prompt header. Repos whose diff would push
+/// the total past this cap are replaced with their `--stat` summary.
+const WORKSPACE_DIFF_BYTE_CAP = 200_000;
+
+/// Concatenate every dirty on-branch repo's working-tree diff into one
+/// blob with `=== <repo name> ===` headers, capped at WORKSPACE_DIFF_BYTE_CAP.
+/// Repos whose diff would overflow are replaced with their shortstat
+/// summary and reported in `truncated`. Detached-HEAD and clean repos
+/// are excluded — they'd be skipped by `commitAll` anyway, so reviewing
+/// or summarizing them would mislead the model about what's about to
+/// land.
+export async function aggregateWorkspaceDirtyDiff(
+  workspaceId: UUID,
+  workspaces: Workspace[],
+  repos: Repo[],
+): Promise<{ text: string; truncated: WorkspaceDiffTruncation[] }> {
+  const ws = workspaces.find((w) => w.id === workspaceId);
+  if (!ws) return { text: '', truncated: [] };
+  const members = reposFor(ws, repos);
+
+  // Filter to repos that commit-all would actually touch. Status calls
+  // are read-only — fan them out.
+  const statuses = await Promise.all(
+    members.map(async (r) => ({
+      repo: r,
+      status: await gitStatus(r.id, r.path, r.defaultBranch),
+    })),
+  );
+  const eligible = statuses.filter(
+    ({ status }) => status.dirtyCount > 0 && status.branch !== null,
+  );
+
+  const parts: string[] = [];
+  const truncated: WorkspaceDiffTruncation[] = [];
+  let used = 0;
+
+  for (const { repo } of eligible) {
+    const diff = await rawDiff(repo.path, 'working');
+    if (!diff.ok || !diff.text) continue;
+
+    const header = `=== ${repo.name} ===\n`;
+    const headerCost = Buffer.byteLength(header, 'utf8');
+    const diffCost = Buffer.byteLength(diff.text, 'utf8');
+
+    if (used + headerCost + diffCost <= WORKSPACE_DIFF_BYTE_CAP) {
+      parts.push(header + diff.text);
+      used += headerCost + diffCost;
+      continue;
+    }
+
+    // Doesn't fit — fall back to a stat summary so the model still sees
+    // the repo exists in this commit and what files moved.
+    const stat = await diffStat(repo.path);
+    const summary =
+      `(diff truncated — ${diffCost.toLocaleString()} bytes; showing --stat instead)\n` +
+      (stat.ok ? stat.text : '(could not read --stat)\n');
+    parts.push(header + summary);
+    used += headerCost + Buffer.byteLength(summary, 'utf8');
+    truncated.push({ repoId: repo.id, repoName: repo.name, originalBytes: diffCost });
+  }
+
+  return { text: parts.join('\n'), truncated };
+}
+
+export async function workspaceWorktrees(
+  workspaceId: UUID,
+  workspaces: Workspace[],
+  repos: Repo[],
+): Promise<{ repoId: UUID; worktrees: Worktree[] }[]> {
+  const ws = workspaces.find((w) => w.id === workspaceId);
+  if (!ws) return [];
+  const members = reposFor(ws, repos);
+  return Promise.all(
+    members.map(async (r) => ({ repoId: r.id, worktrees: await listWorktrees(r.path) })),
+  );
 }
 
 export async function workspaceListPRs(

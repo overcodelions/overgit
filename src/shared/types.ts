@@ -89,6 +89,39 @@ export interface CheckoutOutcome {
   message?: string;
 }
 
+/// One linked working tree from `git worktree list --porcelain`. Overgit
+/// uses the main worktree (the one that holds .git/) as the canonical
+/// "repo" but surfaces siblings here so the user can see, at a glance,
+/// every checkout of the same repo. Detached worktrees come back with
+/// `branch: null` and `head` set; missing-on-disk worktrees come back
+/// with `prunable: true`.
+export interface Worktree {
+  /// Absolute path of the worktree's working directory.
+  path: string;
+  /// HEAD sha. null only for an unborn branch (very rare).
+  head: string | null;
+  /// Branch name without refs/heads/, or null in detached HEAD.
+  branch: string | null;
+  /// True for the worktree that owns the .git directory (the original
+  /// clone). The renderer pins this one to the top of the list.
+  isMain: boolean;
+  /// User has run `git worktree lock`. We don't try to unlock here;
+  /// it's just informational so the user knows why a stale entry
+  /// hasn't been pruned.
+  locked: boolean;
+  /// `git worktree list` flagged this entry as missing on disk.
+  prunable: boolean;
+}
+
+/// Per-repo result of the workspace-wide commit-all action. Mirrors
+/// SyncAndBranchOutcome's shape so the renderer can reuse the same
+/// per-repo result row.
+export interface CommitAllOutcome {
+  repoId: UUID;
+  result: 'committed' | 'detached' | 'clean' | 'commit-failed';
+  message?: string;
+}
+
 /// Per-repo result of the "sync default branch and create new branch"
 /// workflow. Each repo can succeed at any point in the chain; the step
 /// names tell the renderer how far we got so a partial failure is
@@ -418,6 +451,30 @@ export interface IPCInvokeMap {
   }) => { ok: boolean; error?: string; stashed?: boolean };
   'repo:detectDefaultBranch': (repoId: UUID) => string | null;
   'repo:setDefaultBranch': (args: { repoId: UUID; branch: string | null }) => void;
+  'repo:worktrees': (repoId: UUID) => Worktree[];
+  /// Move a linked worktree's branch into the main checkout. Removes
+  /// the worktree at `worktreePath` first (with `--force` if
+  /// `forceRemove`), then `git switch <branch>` in the main repo. Step
+  /// names tell the renderer how far we got so a partial failure is
+  /// recoverable ("removed but couldn't switch — branch is dangling").
+  'repo:adoptWorktreeBranch': (args: {
+    repoId: UUID;
+    worktreePath: string;
+    branch: string;
+    forceRemove: boolean;
+    /// If set, run `git add -A && git commit -m <commitMessage>` inside
+    /// the worktree before removing it. Lets the user keep work that's
+    /// dirty in the linked checkout instead of having to discard it.
+    commitMessage?: string;
+  }) =>
+    | { ok: true }
+    | { ok: false; step: 'precheck' | 'commit' | 'remove' | 'checkout'; error: string };
+  'repo:removeWorktree': (args: {
+    repoId: UUID;
+    worktreePath: string;
+    force: boolean;
+  }) => { ok: boolean; error?: string };
+  'repo:pruneWorktrees': (repoId: UUID) => { ok: boolean; error?: string; output?: string };
 
   'fs:listFiles': (repoId: UUID) => string[];
   'fs:readFile': (args: {
@@ -444,6 +501,17 @@ export interface IPCInvokeMap {
     syncDefault: boolean;
     pullBeforeBranch: boolean;
   }) => SyncAndBranchOutcome[];
+  /// Stage and commit every dirty repo in the workspace with a shared
+  /// message. Repos in detached-HEAD state are skipped (returned as
+  /// `detached`) — committing onto a detached HEAD orphans the commit.
+  /// Clean repos come back as `clean` so the result table is symmetric.
+  'workspace:commitAll': (args: {
+    workspaceId: UUID;
+    message: string;
+  }) => CommitAllOutcome[];
+  /// Aggregate `git worktree list` across the workspace's repos so the
+  /// renderer can show siblings per repo without N round-trips.
+  'workspace:worktrees': (workspaceId: UUID) => { repoId: UUID; worktrees: Worktree[] }[];
 
   'cli:detect': () => CliPresence;
   'cli:reviewChanges': (args: {
@@ -455,6 +523,44 @@ export interface IPCInvokeMap {
     repoId: UUID;
     tool: LlmTool;
   }) => { ok: true; message: string; tool: LlmTool } | { ok: false; error: string; tool: LlmTool };
+
+  /// Run an LLM CLI review across every dirty on-branch repo in the
+  /// workspace. Diffs are concatenated under `=== <repo name> ===`
+  /// headers and capped at a byte budget; repos that overflow are
+  /// replaced with their `git diff --stat HEAD` summary and listed in
+  /// `truncated` so the renderer can warn the user.
+  'workspace:reviewChanges': (args: {
+    workspaceId: UUID;
+    tool: LlmTool;
+  }) => ReviewResult & { truncated: WorkspaceDiffTruncation[] };
+  /// Same shape as `workspace:reviewChanges` but drafts a single shared
+  /// commit message from the aggregated diff.
+  'workspace:suggestCommitMessage': (args: {
+    workspaceId: UUID;
+    tool: LlmTool;
+  }) =>
+    | {
+        ok: true;
+        message: string;
+        tool: LlmTool;
+        truncated: WorkspaceDiffTruncation[];
+      }
+    | {
+        ok: false;
+        error: string;
+        tool: LlmTool;
+        truncated: WorkspaceDiffTruncation[];
+      };
+}
+
+/// One repo whose working-tree diff exceeded the workspace-aggregate
+/// byte cap and was replaced with a shortstat summary in the prompt
+/// sent to the LLM.
+export interface WorkspaceDiffTruncation {
+  repoId: UUID;
+  repoName: string;
+  /// Original diff size in bytes before substitution.
+  originalBytes: number;
 }
 
 export interface StoreSnapshot {

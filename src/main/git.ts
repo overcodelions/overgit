@@ -17,6 +17,7 @@ import {
   RepoStatus,
   Stash,
   UUID,
+  Worktree,
 } from '../shared/types';
 
 interface RunResult {
@@ -245,6 +246,73 @@ function detectInProgress(repoPath: string): 'merge' | 'rebase' | 'cherry-pick' 
   return null;
 }
 
+/// Parse `git worktree list --porcelain` into structured rows. Output
+/// is a sequence of stanzas separated by blank lines, where each stanza
+/// looks like:
+///
+///   worktree /abs/path
+///   HEAD <sha>
+///   branch refs/heads/<name>     // present only when on a branch
+///   bare                         // present for the bare main worktree
+///   detached                     // present in detached-HEAD state
+///   locked [reason…]             // optional
+///   prunable [reason…]           // optional
+///
+/// We deliberately skip `bare` worktrees: overgit assumes a working
+/// tree, and showing a bare repo in the per-repo worktree list would be
+/// misleading.
+export async function listWorktrees(repoPath: string): Promise<Worktree[]> {
+  if (!looksLikeRepo(repoPath)) return [];
+  const res = await run(repoPath, ['worktree', 'list', '--porcelain']);
+  if (!res.ok) return [];
+  const stanzas = res.stdout.split(/\n\n+/);
+  const out: Worktree[] = [];
+  for (const stanza of stanzas) {
+    if (!stanza.trim()) continue;
+    let path = '';
+    let head: string | null = null;
+    let branch: string | null = null;
+    let bare = false;
+    let locked = false;
+    let prunable = false;
+    for (const line of stanza.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      if (trimmed.startsWith('worktree ')) path = trimmed.slice('worktree '.length);
+      else if (trimmed.startsWith('HEAD ')) head = trimmed.slice('HEAD '.length).trim() || null;
+      else if (trimmed.startsWith('branch ')) {
+        const ref = trimmed.slice('branch '.length).trim();
+        branch = ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : ref;
+      } else if (trimmed === 'bare') bare = true;
+      else if (trimmed === 'detached') branch = null;
+      else if (trimmed === 'locked' || trimmed.startsWith('locked ')) locked = true;
+      else if (trimmed === 'prunable' || trimmed.startsWith('prunable ')) prunable = true;
+    }
+    if (!path || bare) continue;
+    out.push({
+      path,
+      head,
+      branch,
+      // The main worktree is the one with the same path as the repo we
+      // queried — git always lists it first, but we infer it from the
+      // path so the call site works for any repoPath that resolves to
+      // the same canonical location.
+      isMain: pathsEqual(path, repoPath),
+      locked,
+      prunable,
+    });
+  }
+  return out;
+}
+
+function pathsEqual(a: string, b: string): boolean {
+  try {
+    return fs.realpathSync(a) === fs.realpathSync(b);
+  } catch {
+    return path.resolve(a) === path.resolve(b);
+  }
+}
+
 export async function listBranches(
   repoPath: string,
 ): Promise<{ local: string[]; remote: string[] }> {
@@ -332,6 +400,138 @@ export async function checkoutBranch(
   return classifyFailure(repoId, branch, switchRes);
 }
 
+/// Move a linked worktree's branch into the main checkout. Optionally
+/// commits whatever's dirty inside the linked worktree first, so the
+/// user doesn't have to choose between losing work and aborting the
+/// switch. Then removes the linked worktree (because git refuses to
+/// check out a branch that's already in use) and runs `git switch` in
+/// the main repo.
+///
+/// Refuses to touch a dirty main checkout — silently stashing the
+/// user's working tree on a button click is too easy to mistake for
+/// "nothing happened." For the *worktree* side, the user picks one of:
+///   - `commitMessage` set → `git add -A && git commit` runs in the
+///     worktree before remove (so the changes survive as a real
+///     commit on the worktree's branch).
+///   - `forceRemove` true → `git worktree remove --force` discards any
+///     uncommitted changes in the worktree directory.
+///   - Neither → assume the worktree is clean; remove will fail loudly
+///     if it isn't.
+export async function adoptWorktreeBranch(
+  repoPath: string,
+  worktreePath: string,
+  branch: string,
+  forceRemove: boolean,
+  commitMessage?: string,
+): Promise<
+  { ok: true } | { ok: false; step: 'precheck' | 'commit' | 'remove' | 'checkout'; error: string }
+> {
+  if (!looksLikeRepo(repoPath)) {
+    return { ok: false, step: 'precheck', error: 'Not a git repo' };
+  }
+  // Refuse to clobber the main checkout. The user's `git status` output
+  // is a better place to see what they need to commit/stash than this
+  // dialog box.
+  const mainStatus = await run(repoPath, ['status', '--porcelain=v1']);
+  if (mainStatus.ok && mainStatus.stdout.trim().length > 0) {
+    return {
+      ok: false,
+      step: 'precheck',
+      error:
+        'Main checkout has uncommitted changes. Commit, stash, or discard them in the Changes tab first.',
+    };
+  }
+  // Sanity-check that the path we're about to remove is actually one of
+  // this repo's worktrees — protects against a stale store entry being
+  // passed in.
+  const list = await run(repoPath, ['worktree', 'list', '--porcelain']);
+  if (!list.ok) {
+    return { ok: false, step: 'precheck', error: list.stderr.trim() || 'Could not list worktrees' };
+  }
+  const known = list.stdout
+    .split('\n')
+    .filter((l) => l.startsWith('worktree '))
+    .map((l) => l.slice('worktree '.length).trim());
+  if (!known.includes(worktreePath)) {
+    return {
+      ok: false,
+      step: 'precheck',
+      error: `Worktree not found at ${worktreePath}. Refresh and retry.`,
+    };
+  }
+  if (commitMessage !== undefined) {
+    if (!commitMessage.trim()) {
+      return { ok: false, step: 'precheck', error: 'Commit message required' };
+    }
+    // Check whether the worktree actually has changes. A commit with
+    // nothing staged would fail with "nothing to commit" — we want
+    // that to be a no-op, not an error, since the user's intent
+    // ("commit anything dirty, then switch") is satisfied either way.
+    const wtStatus = await run(worktreePath, ['status', '--porcelain=v1']);
+    const dirty = wtStatus.ok && wtStatus.stdout.trim().length > 0;
+    if (dirty) {
+      const commitRes = await commitAll(worktreePath, commitMessage.trim());
+      if (!commitRes.ok) {
+        return {
+          ok: false,
+          step: 'commit',
+          error: commitRes.error ?? 'Commit in worktree failed',
+        };
+      }
+    }
+  }
+  const removeArgs = ['worktree', 'remove', worktreePath];
+  if (forceRemove) removeArgs.push('--force');
+  const remove = await run(repoPath, removeArgs);
+  if (!remove.ok) {
+    return {
+      ok: false,
+      step: 'remove',
+      error: remove.stderr.trim() || `git worktree remove exited ${remove.code}`,
+    };
+  }
+  const switchRes = await run(repoPath, ['switch', branch]);
+  if (!switchRes.ok) {
+    return {
+      ok: false,
+      step: 'checkout',
+      error:
+        switchRes.stderr.trim() ||
+        `git switch exited ${switchRes.code}. The worktree was removed; ${branch} is the dangling local branch.`,
+    };
+  }
+  return { ok: true };
+}
+
+/// `git worktree remove <path>`. Refuses without --force if the
+/// worktree is dirty or has unpushed commits, so the renderer surfaces
+/// the failure inline and offers a force option rather than silently
+/// destroying work.
+export async function removeWorktree(
+  repoPath: string,
+  worktreePath: string,
+  force: boolean,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  const args = ['worktree', 'remove'];
+  if (force) args.push('--force');
+  args.push(worktreePath);
+  const res = await run(repoPath, args);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git worktree remove exited ${res.code}` };
+}
+
+/// `git worktree prune`. Cleans up administrative entries for
+/// worktrees whose directories were deleted out from under git.
+export async function pruneWorktrees(
+  repoPath: string,
+): Promise<{ ok: boolean; error?: string; output?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  const res = await run(repoPath, ['worktree', 'prune', '--verbose']);
+  if (res.ok) return { ok: true, output: res.stdout.trim() };
+  return { ok: false, error: res.stderr.trim() || `git worktree prune exited ${res.code}` };
+}
+
 function classifyFailure(repoId: UUID, branch: string, r: RunResult): CheckoutOutcome {
   const text = `${r.stdout}\n${r.stderr}`.toLowerCase();
   // Git's "would be overwritten by checkout" / "local changes" messages
@@ -361,6 +561,22 @@ export async function rawDiff(
     ? ['diff', '--cached', '--no-color']
     : ['diff', '--no-color', 'HEAD'];
   const res = await run(repoPath, args);
+  if (!res.ok) {
+    return { ok: false, text: '', error: res.stderr.trim() || `git exited ${res.code}` };
+  }
+  return { ok: true, text: res.stdout };
+}
+
+/// Shortstat summary of working-tree changes — used as a fallback when
+/// a full diff is too large to send to an LLM CLI. Returns the raw
+/// `<files> changed, <ins> insertions(+), <dels> deletions(-)` line plus
+/// the per-file stat block, which together still give the model useful
+/// signal about scope.
+export async function diffStat(
+  repoPath: string,
+): Promise<{ ok: boolean; text: string; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, text: '', error: 'Not a git repo' };
+  const res = await run(repoPath, ['diff', '--stat', '--no-color', 'HEAD']);
   if (!res.ok) {
     return { ok: false, text: '', error: res.stderr.trim() || `git exited ${res.code}` };
   }

@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useStore } from './store';
 import type {
+  CommitAllOutcome,
   LlmTool,
   Repo,
   ReviewResult,
   SyncAndBranchOutcome,
   UUID,
+  WorkspaceDiffTruncation,
 } from '@shared/types';
 
 /// Top-level sheet host. Picks which sheet (modal) to render based on
@@ -56,6 +58,9 @@ export function SheetHost(): JSX.Element | null {
         )}
         {sheet.kind === 'newBranchInWorkspace' && (
           <WorkspaceBranchSheet workspaceId={sheet.workspaceId} />
+        )}
+        {sheet.kind === 'commitAllInWorkspace' && (
+          <WorkspaceCommitAllSheet workspaceId={sheet.workspaceId} />
         )}
         {sheet.kind === 'pullConflict' && (
           <PullConflictSheet
@@ -1291,17 +1296,29 @@ function ActionCard({
 /// `workspace:syncAndBranch`, then render per-repo outcomes inline so a
 /// partial failure (one repo dirty, one repo's pull conflicted) is
 /// readable and recoverable.
+type DirtyResolution = 'stash' | 'commit' | 'skip';
+
 function WorkspaceBranchSheet({ workspaceId }: { workspaceId: UUID }): JSX.Element {
   const ws = useStore((s) => s.workspaces.find((w) => w.id === workspaceId));
   const repos = useStore((s) => s.repos);
+  const statuses = useStore((s) => s.workspaceStatuses[workspaceId] ?? []);
   const refreshStatus = useStore((s) => s.refreshWorkspaceStatus);
+  const stashRepo = useStore((s) => s.stashRepo);
+  const commitAllWorkspace = useStore((s) => s.commitAllWorkspace);
   const setSheet = useStore((s) => s.setSheet);
 
   const [branch, setBranch] = useState('');
   const [syncDefault, setSyncDefault] = useState(true);
   const [pullBefore, setPullBefore] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [busyLabel, setBusyLabel] = useState<string | null>(null);
   const [outcomes, setOutcomes] = useState<SyncAndBranchOutcome[] | null>(null);
+  // Dirty-resolution preflight. Default to stash because it's the
+  // safest reversible option — any work survives even if the branch
+  // creation fails halfway through.
+  const [dirtyAction, setDirtyAction] = useState<DirtyResolution>('stash');
+  const [commitMessage, setCommitMessage] = useState('');
+  const [preflightError, setPreflightError] = useState<string | null>(null);
 
   const reposById = useMemo(() => new Map(repos.map((r) => [r.id, r])), [repos]);
   const memberRepos = useMemo(
@@ -1309,11 +1326,61 @@ function WorkspaceBranchSheet({ workspaceId }: { workspaceId: UUID }): JSX.Eleme
     [ws?.repoIds, reposById],
   );
 
+  // Pull a fresh status when the sheet mounts so the dirty list isn't
+  // stale from before the user opened the sheet.
+  useEffect(() => {
+    void refreshStatus(workspaceId);
+  }, [refreshStatus, workspaceId]);
+
+  const dirtyRepos = useMemo(
+    () => statuses.filter((s) => s.dirtyCount > 0),
+    [statuses],
+  );
+
   const onRun = async () => {
     if (!branch.trim()) return;
     setBusy(true);
     setOutcomes(null);
+    setPreflightError(null);
     try {
+      // Preflight: if any repos are dirty, resolve them first per the
+      // user's choice. We do this BEFORE syncAndBranch so a "stash" or
+      // "commit" doesn't have to be undone if the branch creation
+      // succeeds — and so a "dirty" outcome from syncAndBranch becomes
+      // exceptional, not the common case it is today.
+      if (dirtyRepos.length > 0) {
+        if (dirtyAction === 'commit') {
+          if (!commitMessage.trim()) {
+            setPreflightError('Commit message required');
+            return;
+          }
+          setBusyLabel('Committing dirty repos…');
+          const commitOutcomes = await commitAllWorkspace(workspaceId, commitMessage.trim());
+          const failed = commitOutcomes.filter((o) => o.result === 'commit-failed');
+          if (failed.length > 0) {
+            setPreflightError(
+              `Commit failed in ${failed.length} repo${failed.length === 1 ? '' : 's'}: ${failed
+                .map((f) => reposById.get(f.repoId)?.name ?? f.repoId)
+                .join(', ')}`,
+            );
+            return;
+          }
+        } else if (dirtyAction === 'stash') {
+          setBusyLabel('Stashing dirty repos…');
+          const stashFails: string[] = [];
+          for (const st of dirtyRepos) {
+            const res = await stashRepo(st.repoId);
+            if (!res.ok) stashFails.push(reposById.get(st.repoId)?.name ?? st.repoId);
+          }
+          if (stashFails.length > 0) {
+            setPreflightError(`Stash failed in: ${stashFails.join(', ')}`);
+            return;
+          }
+        }
+        // 'skip' → fall through and let syncAndBranch's per-repo
+        // 'dirty' outcome surface, which is the legacy behavior.
+      }
+      setBusyLabel('Creating branch…');
       const res = await window.overgit.invoke('workspace:syncAndBranch', {
         workspaceId,
         branch: branch.trim(),
@@ -1324,6 +1391,7 @@ function WorkspaceBranchSheet({ workspaceId }: { workspaceId: UUID }): JSX.Eleme
       await refreshStatus(workspaceId);
     } finally {
       setBusy(false);
+      setBusyLabel(null);
     }
   };
 
@@ -1370,6 +1438,47 @@ function WorkspaceBranchSheet({ workspaceId }: { workspaceId: UUID }): JSX.Eleme
             onChange={setPullBefore}
           />
         </fieldset>
+
+        {dirtyRepos.length > 0 && (
+          <fieldset className="flex flex-col gap-2 p-3 rounded border border-amber-700/40 bg-amber-500/[0.04]">
+            <legend className="text-[10px] uppercase tracking-wide text-amber-300 px-1">
+              {dirtyRepos.length} {dirtyRepos.length === 1 ? 'repo has' : 'repos have'} uncommitted
+              changes
+            </legend>
+            <ul className="text-[11px] text-ink-faint mb-1 max-h-24 overflow-y-auto">
+              {dirtyRepos.map((s) => (
+                <li key={s.repoId} className="flex justify-between gap-2">
+                  <span className="truncate">
+                    {reposById.get(s.repoId)?.name ?? s.repoId}
+                  </span>
+                  <span className="font-mono">
+                    {s.dirtyCount} {s.dirtyCount === 1 ? 'file' : 'files'}
+                  </span>
+                </li>
+              ))}
+            </ul>
+            <DirtyChoice
+              value={dirtyAction}
+              onChange={setDirtyAction}
+              disabled={busy}
+            />
+            {dirtyAction === 'commit' && (
+              <input
+                value={commitMessage}
+                onChange={(e) => setCommitMessage(e.target.value)}
+                disabled={busy}
+                placeholder="Commit message for all dirty repos"
+                className="field px-2 py-1.5 text-xs"
+              />
+            )}
+          </fieldset>
+        )}
+
+        {preflightError && (
+          <div className="text-[11px] text-red-400 bg-red-500/10 border border-red-500/30 rounded px-3 py-2">
+            {preflightError}
+          </div>
+        )}
 
         <div>
           <div className="text-[10px] uppercase tracking-wide text-ink-faint mb-1">
@@ -1422,7 +1531,7 @@ function WorkspaceBranchSheet({ workspaceId }: { workspaceId: UUID }): JSX.Eleme
           className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
         >
           {busy
-            ? 'Running…'
+            ? busyLabel ?? 'Running…'
             : outcomes
               ? `Run again`
               : `Create on ${memberRepos.length} ${
@@ -1462,6 +1571,391 @@ function Switch({
       </div>
     </label>
   );
+}
+
+function DirtyChoice({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: DirtyResolution;
+  onChange: (v: DirtyResolution) => void;
+  disabled?: boolean;
+}): JSX.Element {
+  // Three radio rows. We use plain <label> wrappers rather than a
+  // fancy radio-card component because this only ever shows up
+  // contextually, in two places, and one row of clickable text matches
+  // the surrounding sheet density.
+  const opts: { value: DirtyResolution; label: string; sub: string }[] = [
+    {
+      value: 'stash',
+      label: 'Stash before continuing',
+      sub: 'Reversible — pop the stash later from the Stash tab.',
+    },
+    {
+      value: 'commit',
+      label: 'Commit all with shared message',
+      sub: 'Stages everything (incl. untracked) and commits in each dirty repo.',
+    },
+    {
+      value: 'skip',
+      label: 'Continue anyway',
+      sub: 'Dirty repos will fail the switch and need manual cleanup.',
+    },
+  ];
+  return (
+    <div className="flex flex-col gap-1.5">
+      {opts.map((o) => (
+        <label
+          key={o.value}
+          className={`flex items-start gap-2 cursor-pointer ${
+            disabled ? 'opacity-60 cursor-not-allowed' : ''
+          }`}
+        >
+          <input
+            type="radio"
+            checked={value === o.value}
+            disabled={disabled}
+            onChange={() => onChange(o.value)}
+            className="mt-0.5"
+          />
+          <div className="flex-1 min-w-0">
+            <div className="text-xs">{o.label}</div>
+            <div className="text-[10px] text-ink-faint">{o.sub}</div>
+          </div>
+        </label>
+      ))}
+    </div>
+  );
+}
+
+/// Workspace-wide commit-all. Stages everything in every dirty repo and
+/// commits with a shared message, skipping detached-HEAD repos. Mirrors
+/// WorkspaceBranchSheet's per-repo outcome list so success and failure
+/// share a layout.
+function WorkspaceCommitAllSheet({ workspaceId }: { workspaceId: UUID }): JSX.Element {
+  const ws = useStore((s) => s.workspaces.find((w) => w.id === workspaceId));
+  const repos = useStore((s) => s.repos);
+  const statuses = useStore((s) => s.workspaceStatuses[workspaceId] ?? []);
+  const refreshStatus = useStore((s) => s.refreshWorkspaceStatus);
+  const commitAllWorkspace = useStore((s) => s.commitAllWorkspace);
+  const cli = useStore((s) => s.cliPresence);
+  const setSheet = useStore((s) => s.setSheet);
+
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [outcomes, setOutcomes] = useState<CommitAllOutcome[] | null>(null);
+
+  const availableTools: LlmTool[] = useMemo(() => {
+    const out: LlmTool[] = [];
+    if (cli?.claude) out.push('claude');
+    if (cli?.codex) out.push('codex');
+    if (cli?.gemini) out.push('gemini');
+    return out;
+  }, [cli]);
+  const [tool, setTool] = useState<LlmTool | null>(availableTools[0] ?? null);
+  useEffect(() => {
+    if (!tool && availableTools.length > 0) setTool(availableTools[0]);
+  }, [tool, availableTools]);
+
+  type CliStatus =
+    | { kind: 'idle' }
+    | { kind: 'drafting'; tool: LlmTool }
+    | { kind: 'reviewing'; tool: LlmTool }
+    | { kind: 'drafted'; tool: LlmTool }
+    | { kind: 'err'; message: string };
+  const [cliStatus, setCliStatus] = useState<CliStatus>({ kind: 'idle' });
+  const [review, setReview] = useState<ReviewResult | null>(null);
+  const [truncated, setTruncated] = useState<WorkspaceDiffTruncation[]>([]);
+
+  const reposById = useMemo(() => new Map(repos.map((r) => [r.id, r])), [repos]);
+
+  useEffect(() => {
+    void refreshStatus(workspaceId);
+  }, [refreshStatus, workspaceId]);
+
+  const dirtyOnBranch = useMemo(
+    () => statuses.filter((s) => s.dirtyCount > 0 && s.branch !== null),
+    [statuses],
+  );
+  const dirtyDetached = useMemo(
+    () => statuses.filter((s) => s.dirtyCount > 0 && s.branch === null),
+    [statuses],
+  );
+
+  const cliBusy =
+    cliStatus.kind === 'drafting' || cliStatus.kind === 'reviewing';
+
+  const onDraft = async () => {
+    if (!tool || dirtyOnBranch.length === 0) return;
+    setCliStatus({ kind: 'drafting', tool });
+    try {
+      const res = await window.overgit.invoke('workspace:suggestCommitMessage', {
+        workspaceId,
+        tool,
+      });
+      setTruncated(res.truncated);
+      if (!res.ok) {
+        setCliStatus({ kind: 'err', message: res.error });
+        return;
+      }
+      setMessage(res.message);
+      setCliStatus({ kind: 'drafted', tool: res.tool });
+    } catch (err: unknown) {
+      setCliStatus({ kind: 'err', message: String(err) });
+    }
+  };
+
+  const onReview = async () => {
+    if (!tool || dirtyOnBranch.length === 0) return;
+    setReview(null);
+    setCliStatus({ kind: 'reviewing', tool });
+    try {
+      const res = await window.overgit.invoke('workspace:reviewChanges', {
+        workspaceId,
+        tool,
+      });
+      setTruncated(res.truncated);
+      setReview(res);
+      setCliStatus({ kind: 'idle' });
+    } catch (err: unknown) {
+      setCliStatus({ kind: 'err', message: String(err) });
+    }
+  };
+
+  // Auto-clear "drafted" pill after a couple of seconds so the row
+  // settles and the user can re-draft without a stale ✓.
+  useEffect(() => {
+    if (cliStatus.kind !== 'drafted') return;
+    const t = setTimeout(() => setCliStatus({ kind: 'idle' }), 2500);
+    return () => clearTimeout(t);
+  }, [cliStatus]);
+
+  const onRun = async () => {
+    if (!message.trim() || dirtyOnBranch.length === 0) return;
+    setBusy(true);
+    setOutcomes(null);
+    try {
+      const res = await commitAllWorkspace(workspaceId, message.trim());
+      setOutcomes(res);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const allDone =
+    outcomes !== null &&
+    outcomes.every((o) => o.result === 'committed' || o.result === 'clean' || o.result === 'detached');
+
+  return (
+    <>
+      <SheetHeader
+        title={`Commit all · ${ws?.name ?? ''}`}
+        onClose={() => setSheet(null)}
+      />
+      <div className="flex-1 min-h-0 p-5 flex flex-col gap-4 text-sm overflow-y-auto">
+        <label className="flex flex-col gap-1">
+          <div className="flex items-center justify-between text-[10px]">
+            <span className="uppercase tracking-wide text-ink-faint">
+              Commit message
+            </span>
+            {cliStatus.kind === 'drafting' && (
+              <span className="text-ink-faint">
+                Drafting with <span className="font-mono">{cliStatus.tool}</span>…
+              </span>
+            )}
+            {cliStatus.kind === 'reviewing' && (
+              <span className="text-ink-faint">
+                Reviewing with <span className="font-mono">{cliStatus.tool}</span>…
+              </span>
+            )}
+            {cliStatus.kind === 'drafted' && (
+              <span className="text-emerald-400">
+                ✓ drafted with <span className="font-mono">{cliStatus.tool}</span>
+              </span>
+            )}
+            {cliStatus.kind === 'err' && (
+              <span className="text-red-400 truncate" title={cliStatus.message}>
+                {cliStatus.message}
+              </span>
+            )}
+          </div>
+          <textarea
+            autoFocus
+            value={message}
+            onChange={(e) => setMessage(e.target.value)}
+            disabled={busy}
+            placeholder="Shared commit message — applied to every dirty repo on a branch"
+            rows={3}
+            className="field px-2 py-1.5 text-sm resize-none"
+          />
+        </label>
+
+        {availableTools.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2 text-[11px]">
+            <span className="text-[10px] uppercase tracking-wide text-ink-faint">
+              CLI
+            </span>
+            <div className="flex gap-1">
+              {availableTools.map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setTool(t)}
+                  disabled={cliBusy}
+                  className={`text-[11px] font-mono px-2 py-0.5 rounded border ${
+                    tool === t
+                      ? 'bg-accent text-white border-accent'
+                      : 'border-card hover:bg-card'
+                  } disabled:opacity-50`}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={onDraft}
+              disabled={cliBusy || !tool || dirtyOnBranch.length === 0}
+              className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-card disabled:opacity-50"
+              title="Draft a shared commit message from the aggregated workspace diff"
+            >
+              ✨ Draft message
+            </button>
+            <button
+              onClick={onReview}
+              disabled={cliBusy || !tool || dirtyOnBranch.length === 0}
+              className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-card disabled:opacity-50"
+              title="Pipe the aggregated workspace diff to the CLI for review"
+            >
+              Review changes
+            </button>
+            <span className="ml-auto text-[10px] text-ink-faint">
+              Aggregates dirty diffs across {dirtyOnBranch.length}{' '}
+              {dirtyOnBranch.length === 1 ? 'repo' : 'repos'} into one prompt.
+            </span>
+          </div>
+        )}
+
+        {truncated.length > 0 && (
+          <div className="text-[11px] text-amber-400 bg-amber-500/[0.06] border border-amber-700/40 rounded px-3 py-2">
+            Diff too large for {truncated.length}{' '}
+            {truncated.length === 1 ? 'repo' : 'repos'} — sent shortstat summary
+            instead of full diff:{' '}
+            {truncated
+              .map((t) => `${t.repoName} (${formatBytes(t.originalBytes)})`)
+              .join(', ')}
+            .
+          </div>
+        )}
+
+        {review && (
+          <div className="border border-card rounded p-3 bg-card/40">
+            <ReviewBody result={review} />
+          </div>
+        )}
+
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-ink-faint mb-1">
+            Will commit on {dirtyOnBranch.length}{' '}
+            {dirtyOnBranch.length === 1 ? 'repo' : 'repos'}
+          </div>
+          {dirtyOnBranch.length === 0 ? (
+            <div className="text-[11px] text-ink-faint">
+              Nothing to commit — every repo in this workspace is either clean or in
+              detached HEAD.
+            </div>
+          ) : (
+            <ul className="text-[11px] text-ink-faint flex flex-col gap-0.5">
+              {dirtyOnBranch.map((s) => (
+                <li key={s.repoId} className="flex justify-between gap-2">
+                  <span className="truncate">
+                    {reposById.get(s.repoId)?.name ?? s.repoId}
+                  </span>
+                  <span className="font-mono">
+                    {s.branch} · {s.dirtyCount}{' '}
+                    {s.dirtyCount === 1 ? 'file' : 'files'}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        {dirtyDetached.length > 0 && (
+          <div className="text-[11px] text-amber-400 bg-amber-500/[0.06] border border-amber-700/40 rounded px-3 py-2">
+            Skipping {dirtyDetached.length} detached-HEAD{' '}
+            {dirtyDetached.length === 1 ? 'repo' : 'repos'} —{' '}
+            {dirtyDetached
+              .map((s) => reposById.get(s.repoId)?.name ?? s.repoId)
+              .join(', ')}
+            . Committing onto detached HEAD orphans the commit; resolve manually.
+          </div>
+        )}
+
+        {outcomes && (
+          <ul className="flex flex-col gap-1 text-[11px]">
+            {outcomes.map((o) => (
+              <li
+                key={o.repoId}
+                className="flex items-center gap-2 px-2 py-1 rounded border border-card bg-card"
+              >
+                <span className="w-32 truncate">
+                  {reposById.get(o.repoId)?.name ?? o.repoId}
+                </span>
+                <CommitAllOutcomeBadge result={o.result} />
+                {o.message && (
+                  <span className="text-ink-faint truncate flex-1" title={o.message}>
+                    — {o.message}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+      <div className="px-5 py-3 border-t border-card flex justify-end gap-2">
+        <button
+          onClick={() => setSheet(null)}
+          className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
+        >
+          {allDone ? 'Done' : 'Cancel'}
+        </button>
+        <button
+          disabled={busy || !message.trim() || dirtyOnBranch.length === 0}
+          onClick={onRun}
+          className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+        >
+          {busy
+            ? 'Committing…'
+            : outcomes
+              ? 'Run again'
+              : `Commit on ${dirtyOnBranch.length} ${
+                  dirtyOnBranch.length === 1 ? 'repo' : 'repos'
+                }`}
+        </button>
+      </div>
+    </>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function CommitAllOutcomeBadge({
+  result,
+}: {
+  result: CommitAllOutcome['result'];
+}): JSX.Element {
+  const map: Record<CommitAllOutcome['result'], { label: string; cls: string }> = {
+    committed: { label: 'committed', cls: 'text-emerald-400' },
+    clean: { label: 'clean', cls: 'text-ink-faint' },
+    detached: { label: 'detached', cls: 'text-amber-400' },
+    'commit-failed': { label: 'failed', cls: 'text-red-400' },
+  };
+  const { label, cls } = map[result];
+  return <span className={`font-mono ${cls}`}>{label}</span>;
 }
 
 function BranchOutcomeBadge({
