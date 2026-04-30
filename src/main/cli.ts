@@ -290,6 +290,94 @@ interface GhPrJson {
   state: string;
 }
 
+/// Find the open PR for a repo's current branch via `gh pr view`. We
+/// pass `--json number,url,state` so we can distinguish "no PR exists"
+/// (gh exits non-zero with "no pull requests found" stderr) from a
+/// real failure mode (no GitHub remote, gh auth missing). The caller
+/// uses this to keep workspace open-PRs idempotent — if a PR already
+/// exists we won't try to create a duplicate.
+export async function findOpenPRForCurrentBranch(
+  repoPath: string,
+): Promise<
+  | { kind: 'found'; number: number; url: string }
+  | { kind: 'none' }
+  | { kind: 'no-remote' }
+  | { kind: 'no-gh' }
+  | { kind: 'error'; message: string }
+> {
+  const res = await run('gh', ['pr', 'view', '--json', 'number,url,state'], repoPath);
+  if (res.ok) {
+    try {
+      const parsed = JSON.parse(res.stdout) as { number: number; url: string; state: string };
+      if (parsed.state === 'OPEN') {
+        return { kind: 'found', number: parsed.number, url: parsed.url };
+      }
+      // A merged or closed PR shouldn't block creating a new one.
+      return { kind: 'none' };
+    } catch (err: unknown) {
+      return { kind: 'error', message: `gh JSON parse failed: ${String(err)}` };
+    }
+  }
+  const stderr = res.stderr.toLowerCase();
+  if (res.code === null) return { kind: 'no-gh' };
+  if (stderr.includes('no pull requests found') || stderr.includes('no pr')) {
+    return { kind: 'none' };
+  }
+  if (stderr.includes('no github remote') || stderr.includes('not a github repository')) {
+    return { kind: 'no-remote' };
+  }
+  return { kind: 'error', message: res.stderr.trim() || `gh exited ${res.code}` };
+}
+
+/// Create a PR via `gh pr create` for the current branch. Returns the
+/// created PR's URL (gh prints it to stdout on success) and number
+/// (parsed from the URL since gh doesn't print it separately in this
+/// mode). `--head` is omitted on purpose — gh defaults to the current
+/// branch, which is what we want, and passing it explicitly fails when
+/// the branch isn't pushed yet (we precheck for that elsewhere).
+export async function createPRWithGh(
+  repoPath: string,
+  args: { base: string; title: string; body: string; draft: boolean },
+): Promise<
+  | { ok: true; url: string; number: number }
+  | { ok: false; kind: 'no-remote' | 'no-gh' | 'unpushed' | 'error'; error: string }
+> {
+  const argv = [
+    'pr',
+    'create',
+    '--base',
+    args.base,
+    '--title',
+    args.title,
+    '--body',
+    args.body,
+  ];
+  if (args.draft) argv.push('--draft');
+  const res = await run('gh', argv, repoPath);
+  if (res.ok) {
+    const url = res.stdout.trim().split(/\s+/).pop() ?? '';
+    const m = url.match(/\/pull\/(\d+)(?:[/?#]|$)/);
+    if (!url || !m) {
+      return { ok: false, kind: 'error', error: `gh succeeded but URL parse failed: ${res.stdout.trim()}` };
+    }
+    return { ok: true, url, number: Number.parseInt(m[1], 10) };
+  }
+  const stderr = res.stderr.toLowerCase();
+  if (res.code === null) return { ok: false, kind: 'no-gh', error: 'gh not installed' };
+  if (
+    stderr.includes('no commits between') ||
+    stderr.includes('must first push') ||
+    stderr.includes('does not have any commits') ||
+    stderr.includes('no remote tracking')
+  ) {
+    return { ok: false, kind: 'unpushed', error: res.stderr.trim() };
+  }
+  if (stderr.includes('no github remote') || stderr.includes('not a github repository')) {
+    return { ok: false, kind: 'no-remote', error: res.stderr.trim() };
+  }
+  return { ok: false, kind: 'error', error: res.stderr.trim() || `gh exited ${res.code}` };
+}
+
 /// List open PRs for a single repo via `gh pr list --json`. Returns
 /// `null` (with a reason) for repos with no GitHub remote, no gh auth,
 /// or any other gh error — those are not failures of overgit, just

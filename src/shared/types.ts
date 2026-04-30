@@ -122,6 +122,47 @@ export interface CommitAllOutcome {
   message?: string;
 }
 
+/// Per-repo result of the workspace-wide push-all action. `up-to-date`
+/// is the no-op case (already in sync with upstream) — kept distinct
+/// from `pushed` so the result list isn't all green when nothing
+/// actually moved. `no-upstream-set` means the push had to set the
+/// upstream on first push (we ran `git push -u origin HEAD`); we report
+/// it as a separate result so the user knows tracking was just wired.
+export interface WorkspacePushOutcome {
+  repoId: UUID;
+  result: 'pushed' | 'pushed-new-upstream' | 'up-to-date' | 'detached' | 'push-failed';
+  /// Number of commits the local branch was ahead of its upstream when
+  /// we started — purely for the result-row label so the user knows how
+  /// much shipped.
+  ahead?: number;
+  branch?: string;
+  message?: string;
+}
+
+/// Per-repo result of the workspace-wide "open PRs" action. We keep the
+/// failure modes named distinctly (`unpushed` vs `no-remote` vs
+/// `no-gh`) so the renderer can render an appropriate fix-it action per
+/// row instead of a generic error.
+export interface WorkspaceOpenPROutcome {
+  repoId: UUID;
+  result:
+    | 'created'
+    | 'already-open'
+    | 'detached'
+    | 'on-default-branch'
+    | 'unpushed'
+    | 'no-gh'
+    | 'no-remote'
+    | 'create-failed';
+  branch?: string;
+  baseBranch?: string;
+  /// PR url — set on `created` and `already-open`.
+  url?: string;
+  /// PR number — set on `created` and `already-open`.
+  number?: number;
+  message?: string;
+}
+
 /// Per-repo result of the "sync default branch and create new branch"
 /// workflow. Each repo can succeed at any point in the chain; the step
 /// names tell the renderer how far we got so a partial failure is
@@ -512,6 +553,24 @@ export interface IPCInvokeMap {
   /// Aggregate `git worktree list` across the workspace's repos so the
   /// renderer can show siblings per repo without N round-trips.
   'workspace:worktrees': (workspaceId: UUID) => { repoId: UUID; worktrees: Worktree[] }[];
+  /// `git push` every workspace repo whose branch is ahead of its
+  /// upstream. Repos in detached HEAD are skipped. Repos with no
+  /// upstream get `git push -u origin HEAD` so the first push wires up
+  /// tracking — same as the single-repo Push button.
+  'workspace:pushAll': (workspaceId: UUID) => WorkspacePushOutcome[];
+  /// Open a GitHub PR on every workspace repo that's on a non-default
+  /// branch with commits pushed to its upstream. `gh pr create` runs in
+  /// each repo with the shared `title`/`body`/`draft`. Each repo's PR
+  /// targets that repo's `defaultBranch` (per-repo override is not yet
+  /// surfaced — keep it simple). Repos that already have an open PR for
+  /// the current branch are returned as `already-open` so re-running
+  /// the flow is idempotent.
+  'workspace:openPRs': (args: {
+    workspaceId: UUID;
+    title: string;
+    body: string;
+    draft: boolean;
+  }) => WorkspaceOpenPROutcome[];
 
   'cli:detect': () => CliPresence;
   'cli:reviewChanges': (args: {

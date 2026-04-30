@@ -8,6 +8,8 @@ import type {
   SyncAndBranchOutcome,
   UUID,
   WorkspaceDiffTruncation,
+  WorkspaceOpenPROutcome,
+  WorkspacePushOutcome,
 } from '@shared/types';
 
 /// Top-level sheet host. Picks which sheet (modal) to render based on
@@ -61,6 +63,12 @@ export function SheetHost(): JSX.Element | null {
         )}
         {sheet.kind === 'commitAllInWorkspace' && (
           <WorkspaceCommitAllSheet workspaceId={sheet.workspaceId} />
+        )}
+        {sheet.kind === 'pushAllInWorkspace' && (
+          <WorkspacePushAllSheet workspaceId={sheet.workspaceId} />
+        )}
+        {sheet.kind === 'openPRsInWorkspace' && (
+          <WorkspaceOpenPRsSheet workspaceId={sheet.workspaceId} />
         )}
         {sheet.kind === 'pullConflict' && (
           <PullConflictSheet
@@ -1970,6 +1978,370 @@ function BranchOutcomeBadge({
     'pull-failed': { label: 'pull failed', cls: 'text-red-400' },
     'create-failed': { label: 'create failed', cls: 'text-red-400' },
     'switch-failed': { label: 'switch failed', cls: 'text-red-400' },
+  };
+  const { label, cls } = map[result];
+  return <span className={`font-mono ${cls}`}>{label}</span>;
+}
+
+/// Workspace-wide push. Preflights with `workspaceStatuses` so the user
+/// can see exactly which repos will push (and how many commits each
+/// has) before committing the action. Repos with no upstream still
+/// participate — we wire upstream on the first push, same as the
+/// single-repo Push button.
+function WorkspacePushAllSheet({ workspaceId }: { workspaceId: UUID }): JSX.Element {
+  const ws = useStore((s) => s.workspaces.find((w) => w.id === workspaceId));
+  const repos = useStore((s) => s.repos);
+  const statuses = useStore((s) => s.workspaceStatuses[workspaceId] ?? []);
+  const refreshStatus = useStore((s) => s.refreshWorkspaceStatus);
+  const pushAllWorkspace = useStore((s) => s.pushAllWorkspace);
+  const setSheet = useStore((s) => s.setSheet);
+
+  const [busy, setBusy] = useState(false);
+  const [outcomes, setOutcomes] = useState<WorkspacePushOutcome[] | null>(null);
+
+  const reposById = useMemo(() => new Map(repos.map((r) => [r.id, r])), [repos]);
+
+  useEffect(() => {
+    void refreshStatus(workspaceId);
+  }, [refreshStatus, workspaceId]);
+
+  // Eligible = on a branch. Up-to-date repos still go through the call
+  // so the result table is symmetric ("up-to-date" is a result, not a
+  // skip), but we tell the user how many will actually push.
+  const onBranch = useMemo(() => statuses.filter((s) => s.branch !== null), [statuses]);
+  const willPush = useMemo(
+    () => onBranch.filter((s) => (s.ahead ?? 0) > 0 || s.ahead === null),
+    [onBranch],
+  );
+  const detached = useMemo(() => statuses.filter((s) => s.branch === null), [statuses]);
+
+  const onRun = async () => {
+    setBusy(true);
+    setOutcomes(null);
+    try {
+      const res = await pushAllWorkspace(workspaceId);
+      setOutcomes(res);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const ranSuccessfully =
+    outcomes !== null && outcomes.every((o) => o.result !== 'push-failed');
+
+  return (
+    <>
+      <SheetHeader title={`Push all · ${ws?.name ?? ''}`} onClose={() => setSheet(null)} />
+      <div className="flex-1 min-h-0 p-5 flex flex-col gap-4 text-sm overflow-y-auto">
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-ink-faint mb-1">
+            Will push {willPush.length} {willPush.length === 1 ? 'repo' : 'repos'}
+            {onBranch.length - willPush.length > 0 &&
+              ` · ${onBranch.length - willPush.length} already up to date`}
+          </div>
+          {onBranch.length === 0 ? (
+            <div className="text-[11px] text-ink-faint">
+              No repos on a branch — nothing to push.
+            </div>
+          ) : (
+            <ul className="text-[11px] text-ink-faint flex flex-col gap-0.5">
+              {onBranch.map((s) => (
+                <li key={s.repoId} className="flex justify-between gap-2">
+                  <span className="truncate">
+                    {reposById.get(s.repoId)?.name ?? s.repoId}
+                  </span>
+                  <span className="font-mono">
+                    {s.branch}
+                    {(s.ahead ?? 0) > 0 ? ` · ↑${s.ahead}` : ' · ↑0'}
+                    {s.ahead === null && ' · no upstream'}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        {detached.length > 0 && (
+          <div className="text-[11px] text-amber-400 bg-amber-500/[0.06] border border-amber-700/40 rounded px-3 py-2">
+            Skipping {detached.length} detached-HEAD{' '}
+            {detached.length === 1 ? 'repo' : 'repos'} —{' '}
+            {detached.map((s) => reposById.get(s.repoId)?.name ?? s.repoId).join(', ')}.
+          </div>
+        )}
+
+        {outcomes && (
+          <ul className="flex flex-col gap-1 text-[11px]">
+            {outcomes.map((o) => (
+              <li
+                key={o.repoId}
+                className="flex items-center gap-2 px-2 py-1 rounded border border-card bg-card"
+              >
+                <span className="w-32 truncate">
+                  {reposById.get(o.repoId)?.name ?? o.repoId}
+                </span>
+                <PushOutcomeBadge result={o.result} />
+                <span className="font-mono text-ink-faint">
+                  {o.branch ?? '—'}
+                  {typeof o.ahead === 'number' && o.ahead > 0 ? ` · ↑${o.ahead}` : ''}
+                </span>
+                {o.message && (
+                  <span className="text-ink-faint truncate flex-1" title={o.message}>
+                    — {o.message}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+      <div className="px-5 py-3 border-t border-card flex justify-end gap-2">
+        <button
+          onClick={() => setSheet(null)}
+          className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
+        >
+          {ranSuccessfully ? 'Done' : 'Cancel'}
+        </button>
+        <button
+          disabled={busy || onBranch.length === 0}
+          onClick={onRun}
+          className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+        >
+          {busy
+            ? 'Pushing…'
+            : outcomes
+              ? 'Run again'
+              : `Push ${willPush.length} ${willPush.length === 1 ? 'repo' : 'repos'}`}
+        </button>
+      </div>
+    </>
+  );
+}
+
+function PushOutcomeBadge({ result }: { result: WorkspacePushOutcome['result'] }): JSX.Element {
+  const map: Record<WorkspacePushOutcome['result'], { label: string; cls: string }> = {
+    pushed: { label: 'pushed', cls: 'text-emerald-400' },
+    'pushed-new-upstream': { label: 'pushed +tracking', cls: 'text-emerald-400' },
+    'up-to-date': { label: 'up-to-date', cls: 'text-ink-faint' },
+    detached: { label: 'detached', cls: 'text-amber-400' },
+    'push-failed': { label: 'failed', cls: 'text-red-400' },
+  };
+  const { label, cls } = map[result];
+  return <span className={`font-mono ${cls}`}>{label}</span>;
+}
+
+/// Workspace-wide "Open PRs". Lets the user enter one shared title and
+/// body; we run `gh pr create` per repo against each repo's default
+/// branch. Already-open PRs come back as `already-open` (with the
+/// existing URL) so re-running is idempotent.
+function WorkspaceOpenPRsSheet({ workspaceId }: { workspaceId: UUID }): JSX.Element {
+  const ws = useStore((s) => s.workspaces.find((w) => w.id === workspaceId));
+  const repos = useStore((s) => s.repos);
+  const statuses = useStore((s) => s.workspaceStatuses[workspaceId] ?? []);
+  const cli = useStore((s) => s.cliPresence);
+  const refreshStatus = useStore((s) => s.refreshWorkspaceStatus);
+  const openPRsWorkspace = useStore((s) => s.openPRsWorkspace);
+  const setSheet = useStore((s) => s.setSheet);
+
+  const [title, setTitle] = useState('');
+  const [body, setBody] = useState('');
+  const [draft, setDraft] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [outcomes, setOutcomes] = useState<WorkspaceOpenPROutcome[] | null>(null);
+
+  const reposById = useMemo(() => new Map(repos.map((r) => [r.id, r])), [repos]);
+
+  useEffect(() => {
+    void refreshStatus(workspaceId);
+  }, [refreshStatus, workspaceId]);
+
+  // The set of repos we'd actually try to PR. We exclude detached HEAD
+  // and repos sitting on the default branch (nothing to PR). We can't
+  // know without calling gh whether a PR is already open or whether
+  // the branch is unpushed — those show up in the outcomes list.
+  const candidates = useMemo(() => {
+    return statuses.filter((s) => {
+      if (s.branch === null) return false;
+      const repo = reposById.get(s.repoId);
+      if (!repo) return false;
+      const def = repo.defaultBranch;
+      return !def || s.branch !== def;
+    });
+  }, [statuses, reposById]);
+
+  const onRun = async () => {
+    if (!title.trim()) return;
+    setBusy(true);
+    setOutcomes(null);
+    try {
+      const res = await openPRsWorkspace(workspaceId, {
+        title: title.trim(),
+        body: body.trim(),
+        draft,
+      });
+      setOutcomes(res);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!cli?.gh) {
+    return (
+      <>
+        <SheetHeader title={`Open PRs · ${ws?.name ?? ''}`} onClose={() => setSheet(null)} />
+        <div className="flex-1 min-h-0 p-5 text-sm">
+          <div className="text-[12px] text-amber-400 bg-amber-500/[0.06] border border-amber-700/40 rounded px-3 py-2">
+            Install <span className="font-mono">gh</span> to open PRs from overgit.
+          </div>
+        </div>
+        <div className="px-5 py-3 border-t border-card flex justify-end">
+          <button
+            onClick={() => setSheet(null)}
+            className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
+          >
+            Close
+          </button>
+        </div>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <SheetHeader title={`Open PRs · ${ws?.name ?? ''}`} onClose={() => setSheet(null)} />
+      <div className="flex-1 min-h-0 p-5 flex flex-col gap-4 text-sm overflow-y-auto">
+        <label className="flex flex-col gap-1">
+          <span className="text-[10px] uppercase tracking-wide text-ink-faint">Title</span>
+          <input
+            autoFocus
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            placeholder="Shared PR title"
+            disabled={busy}
+            className="field px-2 py-1.5 text-sm"
+          />
+        </label>
+        <label className="flex flex-col gap-1">
+          <span className="text-[10px] uppercase tracking-wide text-ink-faint">Body</span>
+          <textarea
+            value={body}
+            onChange={(e) => setBody(e.target.value)}
+            placeholder="Shared PR body — markdown allowed"
+            disabled={busy}
+            rows={5}
+            className="field px-2 py-1.5 text-sm resize-none"
+          />
+        </label>
+        <label className="flex items-center gap-2 text-[12px] text-ink-muted">
+          <input
+            type="checkbox"
+            checked={draft}
+            onChange={(e) => setDraft(e.target.checked)}
+            disabled={busy}
+          />
+          Open as draft
+        </label>
+
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-ink-faint mb-1">
+            Will attempt on {candidates.length}{' '}
+            {candidates.length === 1 ? 'repo' : 'repos'}
+          </div>
+          {candidates.length === 0 ? (
+            <div className="text-[11px] text-ink-faint">
+              Every repo is on its default branch (or detached). Switch to a feature
+              branch to open PRs across the workspace.
+            </div>
+          ) : (
+            <ul className="text-[11px] text-ink-faint flex flex-col gap-0.5">
+              {candidates.map((s) => {
+                const repo = reposById.get(s.repoId);
+                const baseBranch = repo?.defaultBranch ?? '(default)';
+                return (
+                  <li key={s.repoId} className="flex justify-between gap-2">
+                    <span className="truncate">{repo?.name ?? s.repoId}</span>
+                    <span className="font-mono">
+                      {s.branch} → {baseBranch}
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+
+        {outcomes && (
+          <ul className="flex flex-col gap-1 text-[11px]">
+            {outcomes.map((o) => (
+              <li
+                key={o.repoId}
+                className="flex items-center gap-2 px-2 py-1 rounded border border-card bg-card"
+              >
+                <span className="w-32 truncate">
+                  {reposById.get(o.repoId)?.name ?? o.repoId}
+                </span>
+                <OpenPROutcomeBadge result={o.result} />
+                {o.url && o.number ? (
+                  <a
+                    href={o.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="font-mono text-accent hover:underline"
+                  >
+                    #{o.number}
+                  </a>
+                ) : (
+                  <span className="font-mono text-ink-faint">
+                    {o.branch ?? '—'}
+                    {o.baseBranch ? ` → ${o.baseBranch}` : ''}
+                  </span>
+                )}
+                {o.message && !o.url && (
+                  <span className="text-ink-faint truncate flex-1" title={o.message}>
+                    — {o.message}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+      <div className="px-5 py-3 border-t border-card flex justify-end gap-2">
+        <button
+          onClick={() => setSheet(null)}
+          className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
+        >
+          {outcomes ? 'Done' : 'Cancel'}
+        </button>
+        <button
+          disabled={busy || !title.trim() || candidates.length === 0}
+          onClick={onRun}
+          className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+        >
+          {busy
+            ? 'Opening PRs…'
+            : outcomes
+              ? 'Run again'
+              : `Open ${candidates.length} ${candidates.length === 1 ? 'PR' : 'PRs'}`}
+        </button>
+      </div>
+    </>
+  );
+}
+
+function OpenPROutcomeBadge({
+  result,
+}: {
+  result: WorkspaceOpenPROutcome['result'];
+}): JSX.Element {
+  const map: Record<WorkspaceOpenPROutcome['result'], { label: string; cls: string }> = {
+    created: { label: 'created', cls: 'text-emerald-400' },
+    'already-open': { label: 'already open', cls: 'text-sky-400' },
+    detached: { label: 'detached', cls: 'text-amber-400' },
+    'on-default-branch': { label: 'default branch', cls: 'text-ink-faint' },
+    unpushed: { label: 'unpushed', cls: 'text-amber-400' },
+    'no-gh': { label: 'no gh', cls: 'text-amber-400' },
+    'no-remote': { label: 'no remote', cls: 'text-amber-400' },
+    'create-failed': { label: 'failed', cls: 'text-red-400' },
   };
   const { label, cls } = map[result];
   return <span className={`font-mono ${cls}`}>{label}</span>;

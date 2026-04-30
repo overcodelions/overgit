@@ -1307,7 +1307,7 @@ export async function commitStaged(
   return { ok: false, error: res.stderr.trim() || `git commit exited ${res.code}` };
 }
 
-async function hasUpstream(repoPath: string): Promise<boolean> {
+export async function hasUpstream(repoPath: string): Promise<boolean> {
   // `rev-parse --abbrev-ref @{upstream}` exits 0 with the upstream name
   // when one is configured, and exits non-zero otherwise. The cheapest
   // existence test for upstream tracking.
@@ -1315,11 +1315,18 @@ async function hasUpstream(repoPath: string): Promise<boolean> {
   return res.ok && res.stdout.trim().length > 0;
 }
 
-export async function push(repoPath: string): Promise<{ ok: boolean; error?: string }> {
+/// Push the current branch. The success result reports whether we had
+/// to set the upstream on this push — workspace push-all surfaces that
+/// distinctly so the user knows tracking was just wired ("first push to
+/// origin/feature/x"). Single-repo callers that don't care just ignore
+/// the extra field.
+export async function push(
+  repoPath: string,
+): Promise<{ ok: true; setUpstream: boolean } | { ok: false; error: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
   if (await hasUpstream(repoPath)) {
     const res = await run(repoPath, ['push']);
-    if (res.ok) return { ok: true };
+    if (res.ok) return { ok: true, setUpstream: false };
     return { ok: false, error: res.stderr.trim() || `git push exited ${res.code}` };
   }
   // No upstream: set it on the first push so subsequent pushes/pulls
@@ -1327,7 +1334,7 @@ export async function push(repoPath: string): Promise<{ ok: boolean; error?: str
   // overwhelming default; users with a different remote setup can run
   // `git push -u <remote> HEAD` themselves once.
   const res = await run(repoPath, ['push', '-u', 'origin', 'HEAD']);
-  if (res.ok) return { ok: true };
+  if (res.ok) return { ok: true, setUpstream: true };
   return { ok: false, error: res.stderr.trim() || `git push exited ${res.code}` };
 }
 

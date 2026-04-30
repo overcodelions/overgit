@@ -62,6 +62,8 @@ import {
   workspaceCommitAll,
   workspaceFetch,
   workspaceListPRs,
+  workspaceOpenPRs,
+  workspacePushAll,
   workspaceStatus,
   workspaceSyncAndBranch,
   workspaceWorktrees,
@@ -636,6 +638,29 @@ function registerIpc(): void {
     const { workspaces, repos } = Store.load();
     return workspaceWorktrees(workspaceId, workspaces, repos);
   });
+
+  ipcMain.handle('workspace:pushAll', async (_e, workspaceId: string) => {
+    const { workspaces, repos } = Store.load();
+    return workspacePushAll(workspaceId, workspaces, repos);
+  });
+
+  ipcMain.handle(
+    'workspace:openPRs',
+    async (
+      _e,
+      args: { workspaceId: string; title: string; body: string; draft: boolean },
+    ) => {
+      const { workspaces, repos } = Store.load();
+      return workspaceOpenPRs(
+        args.workspaceId,
+        args.title,
+        args.body,
+        args.draft,
+        workspaces,
+        repos,
+      );
+    },
+  );
 
   ipcMain.handle('repo:worktrees', async (_e, repoId: string) => {
     const repo = Store.load().repos.find((r) => r.id === repoId);
