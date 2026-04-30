@@ -14,6 +14,8 @@ import {
   UUID,
   Workspace,
   WorkspaceDiffTruncation,
+  WorkspaceOpenPROutcome,
+  WorkspacePushOutcome,
   Worktree,
 } from '../shared/types';
 import {
@@ -22,13 +24,15 @@ import {
   createBranch,
   detectDefaultBranch,
   fetch as gitFetch,
+  hasUpstream,
   listWorktrees,
   pull as gitPull,
+  push as gitPush,
   rawDiff,
   diffStat,
   status as gitStatus,
 } from './git';
-import { listOpenPRs } from './cli';
+import { createPRWithGh, findOpenPRForCurrentBranch, listOpenPRs } from './cli';
 
 function reposFor(workspace: Workspace, repos: Repo[]): Repo[] {
   const byId = new Map(repos.map((r) => [r.id, r]));
@@ -279,6 +283,185 @@ export async function aggregateWorkspaceDirtyDiff(
   }
 
   return { text: parts.join('\n'), truncated };
+}
+
+/// Push every workspace repo whose branch is ahead of upstream (or has
+/// no upstream — first push). Sequential, not parallel: pushes can
+/// prompt for credentials (ssh agent unlock, gpg signing key) and
+/// interleaving prompts across repos is unworkable. The loop is fast
+/// enough for the workspace sizes overgit targets (single digits to
+/// low double digits) that serial network calls don't feel slow.
+export async function workspacePushAll(
+  workspaceId: UUID,
+  workspaces: Workspace[],
+  repos: Repo[],
+): Promise<WorkspacePushOutcome[]> {
+  const ws = workspaces.find((w) => w.id === workspaceId);
+  if (!ws) return [];
+  const members = reposFor(ws, repos);
+  const out: WorkspacePushOutcome[] = [];
+  for (const r of members) {
+    const st = await gitStatus(r.id, r.path, r.defaultBranch);
+    if (st.branch === null) {
+      out.push({ repoId: r.id, result: 'detached', message: 'Detached HEAD — skipped' });
+      continue;
+    }
+    const upstreamSet = await hasUpstream(r.path);
+    // Already in sync: skip the push round-trip entirely. We treat
+    // ahead === null as "unknown — try anyway" since `status` returns
+    // null when there's no upstream tracking; that case is covered by
+    // the upstream check below where we'll set up tracking.
+    if (upstreamSet && (st.ahead ?? 0) === 0) {
+      out.push({
+        repoId: r.id,
+        branch: st.branch,
+        result: 'up-to-date',
+        ahead: 0,
+      });
+      continue;
+    }
+    const ahead = st.ahead ?? 0;
+    const res = await gitPush(r.path);
+    if (res.ok) {
+      out.push({
+        repoId: r.id,
+        branch: st.branch,
+        result: res.setUpstream ? 'pushed-new-upstream' : 'pushed',
+        ahead,
+      });
+    } else {
+      out.push({
+        repoId: r.id,
+        branch: st.branch,
+        result: 'push-failed',
+        ahead,
+        message: res.error,
+      });
+    }
+  }
+  return out;
+}
+
+/// Open a GitHub PR per workspace repo. Each repo's PR is created
+/// against that repo's `defaultBranch` (probed if not set). The shared
+/// title / body / draft-flag is reused across all of them — the killer
+/// flow is "I just landed a coordinated change across N repos and want
+/// the team to see one cohesive set of PRs," so a uniform message is
+/// the default. Runs sequentially because gh can prompt for auth, and
+/// because per-repo failure modes (unpushed, no-remote) need to be
+/// readable in order rather than interleaved.
+export async function workspaceOpenPRs(
+  workspaceId: UUID,
+  title: string,
+  body: string,
+  draft: boolean,
+  workspaces: Workspace[],
+  repos: Repo[],
+): Promise<WorkspaceOpenPROutcome[]> {
+  const ws = workspaces.find((w) => w.id === workspaceId);
+  if (!ws) return [];
+  const members = reposFor(ws, repos);
+  const out: WorkspaceOpenPROutcome[] = [];
+  for (const r of members) {
+    const st = await gitStatus(r.id, r.path, r.defaultBranch);
+    if (st.branch === null) {
+      out.push({ repoId: r.id, result: 'detached', message: 'Detached HEAD — skipped' });
+      continue;
+    }
+    // Resolve the base branch up front. We never want to open a PR from
+    // a repo's default branch back into itself; flag that as its own
+    // outcome so the user can see why it was skipped.
+    const baseBranch = r.defaultBranch ?? (await detectDefaultBranch(r.path)) ?? 'main';
+    if (st.branch === baseBranch) {
+      out.push({
+        repoId: r.id,
+        branch: st.branch,
+        baseBranch,
+        result: 'on-default-branch',
+        message: `On ${baseBranch} — nothing to PR.`,
+      });
+      continue;
+    }
+    // Probe gh first. If gh isn't even installed, surface that once per
+    // repo (not once globally) so the renderer's row treatment is
+    // uniform — every row gets a result, not a banner.
+    const existing = await findOpenPRForCurrentBranch(r.path);
+    if (existing.kind === 'no-gh') {
+      out.push({
+        repoId: r.id,
+        branch: st.branch,
+        baseBranch,
+        result: 'no-gh',
+        message: 'gh CLI not found — install gh to open PRs.',
+      });
+      continue;
+    }
+    if (existing.kind === 'no-remote') {
+      out.push({
+        repoId: r.id,
+        branch: st.branch,
+        baseBranch,
+        result: 'no-remote',
+        message: 'No GitHub remote.',
+      });
+      continue;
+    }
+    if (existing.kind === 'found') {
+      out.push({
+        repoId: r.id,
+        branch: st.branch,
+        baseBranch,
+        result: 'already-open',
+        url: existing.url,
+        number: existing.number,
+      });
+      continue;
+    }
+    if (existing.kind === 'error') {
+      out.push({
+        repoId: r.id,
+        branch: st.branch,
+        baseBranch,
+        result: 'create-failed',
+        message: existing.message,
+      });
+      continue;
+    }
+    // existing.kind === 'none' — proceed to create.
+    const created = await createPRWithGh(r.path, {
+      base: baseBranch,
+      title,
+      body,
+      draft,
+    });
+    if (created.ok) {
+      out.push({
+        repoId: r.id,
+        branch: st.branch,
+        baseBranch,
+        result: 'created',
+        url: created.url,
+        number: created.number,
+      });
+    } else {
+      const result: WorkspaceOpenPROutcome['result'] =
+        created.kind === 'unpushed'
+          ? 'unpushed'
+          : created.kind === 'no-remote'
+            ? 'no-remote'
+            : created.kind === 'no-gh'
+              ? 'no-gh'
+              : 'create-failed';
+      out.push({
+        repoId: r.id,
+        branch: st.branch,
+        baseBranch,
+        result,
+        message: created.error,
+      });
+    }
+  }
+  return out;
 }
 
 export async function workspaceWorktrees(

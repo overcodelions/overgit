@@ -584,6 +584,30 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
             Commit all
           </button>
           <button
+            onClick={() => setSheet({ kind: 'pushAllInWorkspace', workspaceId })}
+            disabled={summary.ahead === 0 && summary.total > 0}
+            title={
+              summary.ahead === 0
+                ? 'Nothing to push — every repo is already in sync'
+                : `Push every repo whose branch is ahead of upstream (${summary.ahead} ahead)`
+            }
+            className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+          >
+            Push all{summary.ahead > 0 ? ` ↑${summary.ahead}` : ''}
+          </button>
+          <button
+            onClick={() => setSheet({ kind: 'openPRsInWorkspace', workspaceId })}
+            disabled={!cli?.gh || ws.repoIds.length === 0}
+            title={
+              !cli?.gh
+                ? 'Install gh to open PRs from overgit'
+                : 'Open a GitHub PR per repo with a shared title and body'
+            }
+            className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+          >
+            Open PRs
+          </button>
+          <button
             onClick={() => setSheet({ kind: 'editWorkspace', workspaceId })}
             className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
           >

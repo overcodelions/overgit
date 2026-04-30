@@ -22,6 +22,8 @@ import type {
   StoreSnapshot,
   UUID,
   Workspace,
+  WorkspaceOpenPROutcome,
+  WorkspacePushOutcome,
   Worktree,
 } from '@shared/types';
 
@@ -37,6 +39,8 @@ export type Sheet =
   | { kind: 'reviewChanges'; repoId: UUID; scope: 'staged' | 'working' }
   | { kind: 'newBranchInWorkspace'; workspaceId: UUID }
   | { kind: 'commitAllInWorkspace'; workspaceId: UUID }
+  | { kind: 'pushAllInWorkspace'; workspaceId: UUID }
+  | { kind: 'openPRsInWorkspace'; workspaceId: UUID }
   | { kind: 'pullConflict'; repoId: UUID; conflicts: string[]; rawError: string };
 
 interface OpenFile {
@@ -115,6 +119,11 @@ interface UiState {
   ) => Promise<{ ok: boolean; error?: string }>;
   pruneWorktrees: (id: UUID) => Promise<{ ok: boolean; error?: string; output?: string }>;
   commitAllWorkspace: (id: UUID, message: string) => Promise<CommitAllOutcome[]>;
+  pushAllWorkspace: (id: UUID) => Promise<WorkspacePushOutcome[]>;
+  openPRsWorkspace: (
+    id: UUID,
+    args: { title: string; body: string; draft: boolean },
+  ) => Promise<WorkspaceOpenPROutcome[]>;
   checkoutWorkspaceBranch: (id: UUID, branch: string, createIfMissing: boolean) => Promise<void>;
   fetchWorkspace: (id: UUID) => Promise<void>;
   refreshRepoLog: (id: UUID) => Promise<void>;
@@ -375,6 +384,28 @@ export const useStore = create<UiState>((set, get) => ({
     });
     // Refresh status so the dirty count drops on each row that committed.
     await get().refreshWorkspaceStatus(id);
+    return outcomes;
+  },
+
+  pushAllWorkspace: async (id) => {
+    const outcomes = await window.overgit.invoke('workspace:pushAll', id);
+    // After a push, ahead counters drop and upstream may have just been
+    // set — refresh status so the workspace overview is accurate.
+    await get().refreshWorkspaceStatus(id);
+    return outcomes;
+  },
+
+  openPRsWorkspace: async (id, { title, body, draft }) => {
+    const outcomes = await window.overgit.invoke('workspace:openPRs', {
+      workspaceId: id,
+      title,
+      body,
+      draft,
+    });
+    // Newly created PRs should show up in the workspace PR list
+    // immediately. Refresh after the call so the user sees their work
+    // reflected without a manual refresh click.
+    await get().refreshWorkspacePRs(id);
     return outcomes;
   },
 

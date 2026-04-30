@@ -381,7 +381,7 @@ interface BuildArgs {
   files: string[];
   stagedPaths: string[];
   unstagedPaths: string[];
-  cli: { claude?: boolean; codex?: boolean; gemini?: boolean } | null;
+  cli: { gh?: boolean; claude?: boolean; codex?: boolean; gemini?: boolean } | null;
   selectedRepoId: UUID | null;
   selectedWsId: UUID | null;
   actions: {
@@ -559,18 +559,40 @@ function buildSections(args: BuildArgs): PaletteSection[] {
     });
   }
   if (selectedWsId) {
-    const commitAllWs: PaletteItem = {
-      id: 'commit-all-ws',
-      title: 'Commit all across workspace',
-      hint: 'Shared message · skips detached HEAD',
-      glyph: '✓',
-      perform: () => {
-        actions.setSheet({ kind: 'commitAllInWorkspace', workspaceId: selectedWsId });
-        actions.close();
+    const wsActions: PaletteItem[] = [
+      {
+        id: 'commit-all-ws',
+        title: 'Commit all across workspace',
+        hint: 'Shared message · skips detached HEAD',
+        glyph: '✓',
+        perform: () => {
+          actions.setSheet({ kind: 'commitAllInWorkspace', workspaceId: selectedWsId });
+          actions.close();
+        },
       },
-    };
-    if (matches(commitAllWs.title) || (commitAllWs.hint && matches(commitAllWs.hint))) {
-      repoActionItems.push(commitAllWs);
+      {
+        id: 'push-all-ws',
+        title: 'Push all across workspace',
+        hint: 'Push every repo whose branch is ahead of upstream',
+        glyph: '↑',
+        perform: () => {
+          actions.setSheet({ kind: 'pushAllInWorkspace', workspaceId: selectedWsId });
+          actions.close();
+        },
+      },
+      {
+        id: 'open-prs-ws',
+        title: 'Open PRs across workspace',
+        hint: cli?.gh ? 'Shared title and body · gh pr create per repo' : 'Install gh first',
+        glyph: '⇧',
+        perform: () => {
+          actions.setSheet({ kind: 'openPRsInWorkspace', workspaceId: selectedWsId });
+          actions.close();
+        },
+      },
+    ];
+    for (const a of wsActions) {
+      if (matches(a.title) || (a.hint && matches(a.hint))) repoActionItems.push(a);
     }
   }
   if (repoActionItems.length)
