@@ -65,6 +65,7 @@ export function CommandPalette(): JSX.Element | null {
   const pullRepo = useStore((s) => s.pullRepo);
   const pushRepo = useStore((s) => s.pushRepo);
   const openRepoFile = useStore((s) => s.openRepoFile);
+  const pushToast = useStore((s) => s.pushToast);
 
   const [query, setQuery] = useState('');
   const [activeIdx, setActiveIdx] = useState(0);
@@ -122,6 +123,7 @@ export function CommandPalette(): JSX.Element | null {
           pullRepo,
           pushRepo,
           openRepoFile,
+          pushToast,
         },
       }),
     [
@@ -148,6 +150,7 @@ export function CommandPalette(): JSX.Element | null {
       pullRepo,
       pushRepo,
       openRepoFile,
+      pushToast,
     ],
   );
 
@@ -402,6 +405,7 @@ interface BuildArgs {
     pullRepo: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
     pushRepo: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
     openRepoFile: (id: UUID, path: string) => Promise<unknown>;
+    pushToast: (t: { kind: 'info' | 'success' | 'warn' | 'error'; message: string }) => string;
   };
 }
 
@@ -440,7 +444,7 @@ function buildSections(args: BuildArgs): PaletteSection[] {
       glyph: '+',
       perform: async () => {
         const res = await actions.createBranch(selectedRepoId, query.trim(), true);
-        if (!res.ok) alert(res.error ?? 'Create failed');
+        if (!res.ok) actions.pushToast({ kind: 'error', message: res.error ?? 'Create failed' });
         actions.close();
       },
     });
@@ -478,7 +482,7 @@ function buildSections(args: BuildArgs): PaletteSection[] {
         glyph: '↻',
         perform: async () => {
           const res = await actions.fetchRepo(id);
-          if (!res.ok) alert(res.error ?? 'Fetch failed');
+          if (!res.ok) actions.pushToast({ kind: 'error', message: res.error ?? 'Fetch failed' });
           actions.close();
         },
       },
@@ -489,7 +493,7 @@ function buildSections(args: BuildArgs): PaletteSection[] {
         glyph: '↓',
         perform: async () => {
           const res = await actions.pullRepo(id);
-          if (!res.ok) alert(res.error ?? 'Pull failed');
+          if (!res.ok) actions.pushToast({ kind: 'error', message: res.error ?? 'Pull failed' });
           actions.close();
         },
       },
@@ -500,7 +504,7 @@ function buildSections(args: BuildArgs): PaletteSection[] {
         glyph: '↑',
         perform: async () => {
           const res = await actions.pushRepo(id);
-          if (!res.ok) alert(res.error ?? 'Push failed');
+          if (!res.ok) actions.pushToast({ kind: 'error', message: res.error ?? 'Push failed' });
           actions.close();
         },
       },
@@ -685,11 +689,12 @@ function buildSections(args: BuildArgs): PaletteSection[] {
           const target = b.kind === 'remote' ? b.shortName : b.name;
           const out = await actions.checkoutRepo(selectedRepoId, target, false);
           if (out.result === 'dirty') {
-            alert(
-              `Can't switch to ${target}: working tree is dirty. Stash or commit first.`,
-            );
+            actions.pushToast({
+              kind: 'warn',
+              message: `Can't switch to ${target}: working tree is dirty. Stash or commit first.`,
+            });
           } else if (out.result === 'error' || out.result === 'missing-branch') {
-            alert(out.message ?? 'Checkout failed');
+            actions.pushToast({ kind: 'error', message: out.message ?? 'Checkout failed' });
           }
           actions.close();
         },

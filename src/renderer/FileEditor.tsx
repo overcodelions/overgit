@@ -38,11 +38,12 @@ function EditorBody(): JSX.Element {
   const setContent = useStore((s) => s.setOpenFileContent);
   const closeFile = useStore((s) => s.closeRepoFile);
   const save = useStore((s) => s.saveOpenFile);
+  const pushToast = useStore((s) => s.pushToast);
 
   const onSave = useCallback(async () => {
     const res = await save();
-    if (!res.ok) alert(res.error ?? 'Save failed');
-  }, [save]);
+    if (!res.ok) pushToast({ kind: 'error', message: res.error ?? 'Save failed' });
+  }, [save, pushToast]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {

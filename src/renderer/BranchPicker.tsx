@@ -33,6 +33,8 @@ export function BranchPicker({ repoId, anchorRef, onClose }: Props): JSX.Element
   const checkout = useStore((s) => s.checkoutRepo);
   const create = useStore((s) => s.createRepoBranch);
   const refreshBranches = useStore((s) => s.refreshRepoBranches);
+  const pushToast = useStore((s) => s.pushToast);
+  const requestConfirm = useStore((s) => s.requestConfirm);
 
   const [search, setSearch] = useState('');
   const [mode, setMode] = useState<Mode>({ kind: 'list' });
@@ -100,13 +102,19 @@ export function BranchPicker({ repoId, anchorRef, onClose }: Props): JSX.Element
     try {
       const target = b.kind === 'remote' ? b.shortName : b.name;
       const outcome = await checkout(repoId, target, false);
-      if (outcome.result === 'error') alert(outcome.message ?? 'Checkout failed');
-      else if (outcome.result === 'dirty')
-        alert(
-          `Can't switch to ${target}: working tree has uncommitted changes. Stash, commit, or discard first.`,
-        );
-      else if (outcome.result === 'missing-branch')
-        alert(`Branch ${target} doesn't exist locally or on origin.`);
+      if (outcome.result === 'error') {
+        pushToast({ kind: 'error', message: outcome.message ?? 'Checkout failed' });
+      } else if (outcome.result === 'dirty') {
+        pushToast({
+          kind: 'warn',
+          message: `Can't switch to ${target}: working tree has uncommitted changes. Stash, commit, or discard first.`,
+        });
+      } else if (outcome.result === 'missing-branch') {
+        pushToast({
+          kind: 'warn',
+          message: `Branch ${target} doesn't exist locally or on origin.`,
+        });
+      }
       onClose();
     } finally {
       setBusy(false);
@@ -123,17 +131,17 @@ export function BranchPicker({ repoId, anchorRef, onClose }: Props): JSX.Element
     // and squash can be added as a sub-menu in a future pass — most
     // common case is just "merge X in", and conflicts get caught by
     // the in-progress banner in the Changes tab.
-    if (
-      !window.confirm(
-        `Merge ${target} into the current branch?\n\nIf there are conflicts you'll see a banner in the Changes tab with Resolve / Abort options.`,
-      )
-    )
-      return;
+    const ok = await requestConfirm({
+      title: `Merge ${target}?`,
+      body: `Merge ${target} into the current branch?\n\nIf there are conflicts you'll see a banner in the Changes tab with Resolve / Abort options.`,
+      confirmLabel: 'Merge',
+    });
+    if (!ok) return;
     setBusy(true);
     try {
       const res = await mergeBranchAction(repoId, target, 'merge');
       if (!res.ok) {
-        alert(res.error ?? 'Merge failed');
+        pushToast({ kind: 'error', message: res.error ?? 'Merge failed' });
       }
       onClose();
     } finally {
@@ -143,20 +151,23 @@ export function BranchPicker({ repoId, anchorRef, onClose }: Props): JSX.Element
 
   const onRebase = async (b: BranchSummary) => {
     const target = b.kind === 'remote' ? b.name : b.shortName;
-    if (
-      !window.confirm(
-        `Rebase current branch onto ${target}? Your commits will be replayed on top of ${target}.`,
-      )
-    )
-      return;
+    const ok = await requestConfirm({
+      title: `Rebase onto ${target}?`,
+      body: `Rebase current branch onto ${target}? Your commits will be replayed on top of ${target}.`,
+      confirmLabel: 'Rebase',
+    });
+    if (!ok) return;
     setBusy(true);
     try {
       const res = await rebaseOntoAction(repoId, target);
       if (!res.ok) {
-        alert(
-          (res.error ?? 'Rebase failed') +
+        pushToast({
+          kind: 'error',
+          message:
+            (res.error ?? 'Rebase failed') +
             '\n\nIf there are conflicts, resolve them in the Changes tab — the conflict banner will guide you through Continue / Abort.',
-        );
+          sticky: true,
+        });
       }
       onClose();
     } finally {
@@ -177,26 +188,30 @@ export function BranchPicker({ repoId, anchorRef, onClose }: Props): JSX.Element
       if (opts.syncDefault && repo?.defaultBranch) {
         const switchRes = await checkout(repoId, repo.defaultBranch, false);
         if (switchRes.result === 'dirty') {
-          alert(
-            `Can't sync to ${repo.defaultBranch}: working tree is dirty. Stash or commit first.`,
-          );
+          pushToast({
+            kind: 'warn',
+            message: `Can't sync to ${repo.defaultBranch}: working tree is dirty. Stash or commit first.`,
+          });
           return;
         }
         if (switchRes.result === 'error' || switchRes.result === 'missing-branch') {
-          alert(switchRes.message ?? `Could not switch to ${repo.defaultBranch}`);
+          pushToast({
+            kind: 'error',
+            message: switchRes.message ?? `Could not switch to ${repo.defaultBranch}`,
+          });
           return;
         }
       }
       if (opts.pull) {
         const pullRes = await pullRepo(repoId);
         if (!pullRes.ok) {
-          alert(pullRes.error ?? 'Pull failed');
+          pushToast({ kind: 'error', message: pullRes.error ?? 'Pull failed' });
           return;
         }
       }
       const res = await create(repoId, name, true);
       if (!res.ok) {
-        alert(res.error ?? 'Create failed');
+        pushToast({ kind: 'error', message: res.error ?? 'Create failed' });
         return;
       }
       await refresh(repoId);

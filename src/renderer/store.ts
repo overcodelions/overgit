@@ -48,6 +48,33 @@ interface OpenFile {
   path: string;
 }
 
+/// Lightweight notification surface. Replaces ad-hoc `alert(...)` calls
+/// scattered across the renderer; `alert` blocks the renderer thread
+/// in Electron, so any async work behind it stalls until the user
+/// dismisses the dialog. Toasts auto-hide unless `sticky` is set.
+export interface Toast {
+  id: string;
+  kind: 'info' | 'success' | 'warn' | 'error';
+  message: string;
+  sticky?: boolean;
+}
+
+/// Modeless confirmation request. `requestConfirm` returns a promise so
+/// callers read the same as `window.confirm` (`if (await ...)`), but
+/// it's resolved by the in-app sheet rather than blocking the renderer.
+/// We keep `resolve` on the store entry so the host component can call
+/// it from button handlers without prop-drilling.
+export interface ConfirmRequest {
+  id: string;
+  title: string;
+  body: string;
+  confirmLabel: string;
+  cancelLabel: string;
+  /// Renders the confirm button in the destructive (red) treatment.
+  destructive: boolean;
+  resolve: (ok: boolean) => void;
+}
+
 interface UiState {
   loaded: boolean;
   repos: Repo[];
@@ -88,6 +115,14 @@ interface UiState {
   /// and its own keyboard semantics. One boolean is enough; the
   /// renderer derives the result list from existing store fields.
   paletteOpen: boolean;
+  /// Active toast notifications. Newest are pushed to the end; the host
+  /// renders them top-to-bottom so the most recent is visible without
+  /// scrolling.
+  toasts: Toast[];
+  /// Pending confirmation, if any. Renderer's <ConfirmHost /> watches
+  /// this and renders the modal. Single-slot — only one confirm at a
+  /// time, which matches what `window.confirm` allowed.
+  pendingConfirm: ConfirmRequest | null;
   /// The most recent workspace-checkout result, kept around so the UI
   /// can show per-repo outcomes and offer Stash/Commit affordances on
   /// repos that came back dirty.
@@ -209,6 +244,20 @@ interface UiState {
   removeRepo: (id: UUID) => Promise<void>;
   removeWorkspace: (id: UUID) => Promise<void>;
   updateWorkspace: (id: UUID, patch: Partial<Pick<Workspace, 'name' | 'repoIds'>>) => Promise<void>;
+
+  pushToast: (toast: Omit<Toast, 'id'>) => string;
+  dismissToast: (id: string) => void;
+  /// Replacement for `window.confirm`. Returns true when the user
+  /// confirms, false on cancel or escape. Reasonable defaults so most
+  /// call sites just need to pass `body`.
+  requestConfirm: (args: {
+    title?: string;
+    body: string;
+    confirmLabel?: string;
+    cancelLabel?: string;
+    destructive?: boolean;
+  }) => Promise<boolean>;
+  resolveConfirm: (id: string, ok: boolean) => void;
 }
 
 function uuid(): UUID {
@@ -252,6 +301,8 @@ export const useStore = create<UiState>((set, get) => ({
   openFileLoading: false,
   sheet: null,
   paletteOpen: false,
+  toasts: [],
+  pendingConfirm: null,
 
   hydrate: async () => {
     const snap: StoreSnapshot = await window.overgit.invoke('store:load');
@@ -284,7 +335,7 @@ export const useStore = create<UiState>((set, get) => ({
     const result = await window.overgit.invoke('repo:pickAndAdd');
     if (!result.ok) {
       if ('cancelled' in result) return;
-      alert(result.error);
+      get().pushToast({ kind: 'error', message: result.error });
       return;
     }
     const repos = [...get().repos.filter((r) => r.id !== result.repo.id), result.repo];
@@ -497,21 +548,21 @@ export const useStore = create<UiState>((set, get) => ({
 
   stageFiles: async (id, paths) => {
     const res = await window.overgit.invoke('repo:stageFiles', { repoId: id, paths });
-    if (!res.ok) alert(res.error ?? 'Stage failed');
+    if (!res.ok) get().pushToast({ kind: 'error', message: res.error ?? 'Stage failed' });
     await get().refreshRepoChanges(id);
     await get().refreshRepoStatus(id);
   },
 
   unstageFiles: async (id, paths) => {
     const res = await window.overgit.invoke('repo:unstageFiles', { repoId: id, paths });
-    if (!res.ok) alert(res.error ?? 'Unstage failed');
+    if (!res.ok) get().pushToast({ kind: 'error', message: res.error ?? 'Unstage failed' });
     await get().refreshRepoChanges(id);
     await get().refreshRepoStatus(id);
   },
 
   discardFiles: async (id, paths) => {
     const res = await window.overgit.invoke('repo:discardFiles', { repoId: id, paths });
-    if (!res.ok) alert(res.error ?? 'Discard failed');
+    if (!res.ok) get().pushToast({ kind: 'error', message: res.error ?? 'Discard failed' });
     await get().refreshRepoChanges(id);
     await get().refreshRepoStatus(id);
   },
@@ -955,5 +1006,51 @@ export const useStore = create<UiState>((set, get) => ({
     );
     set({ workspaces });
     await window.overgit.invoke('store:saveWorkspaces', workspaces);
+  },
+
+  pushToast: (t) => {
+    const id = uuid();
+    const toast: Toast = { id, ...t };
+    set({ toasts: [...get().toasts, toast] });
+    if (!t.sticky) {
+      // Auto-dismiss after 5s for transient feedback. Errors that the
+      // user might need to copy/paste should be flagged sticky by the
+      // caller.
+      const ms = t.kind === 'error' ? 8000 : 4000;
+      setTimeout(() => get().dismissToast(id), ms);
+    }
+    return id;
+  },
+
+  dismissToast: (id) => {
+    set({ toasts: get().toasts.filter((t) => t.id !== id) });
+  },
+
+  requestConfirm: ({
+    title = 'Are you sure?',
+    body,
+    confirmLabel = 'Confirm',
+    cancelLabel = 'Cancel',
+    destructive = false,
+  }) =>
+    new Promise<boolean>((resolve) => {
+      set({
+        pendingConfirm: {
+          id: uuid(),
+          title,
+          body,
+          confirmLabel,
+          cancelLabel,
+          destructive,
+          resolve,
+        },
+      });
+    }),
+
+  resolveConfirm: (id, ok) => {
+    const cur = get().pendingConfirm;
+    if (!cur || cur.id !== id) return;
+    cur.resolve(ok);
+    set({ pendingConfirm: null });
   },
 }));

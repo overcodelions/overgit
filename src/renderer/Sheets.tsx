@@ -357,6 +357,7 @@ function DefaultBranchRow({ repoId }: { repoId: UUID }): JSX.Element {
   const summaries = useStore((s) => s.repoBranchSummaries[repoId]);
   const refresh = useStore((s) => s.refreshRepoBranchSummaries);
   const setDefault = useStore((s) => s.setRepoDefaultBranch);
+  const pushToast = useStore((s) => s.pushToast);
 
   useEffect(() => {
     if (summaries == null) refresh(repoId);
@@ -372,7 +373,10 @@ function DefaultBranchRow({ repoId }: { repoId: UUID }): JSX.Element {
     if (detected) {
       await setDefault(repoId, detected);
     } else {
-      alert("Couldn't detect a default branch (no origin/HEAD set). Pick one manually.");
+      pushToast({
+        kind: 'warn',
+        message: "Couldn't detect a default branch (no origin/HEAD set). Pick one manually.",
+      });
     }
   };
 
@@ -1090,6 +1094,7 @@ function PullConflictSheet({
   const setSheet = useStore((s) => s.setSheet);
   const pullForce = useStore((s) => s.pullForce);
   const repo = useStore((s) => s.repos.find((r) => r.id === repoId));
+  const requestConfirm = useStore((s) => s.requestConfirm);
   const [busy, setBusy] = useState<'stash' | 'discard' | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<{ stashed: boolean } | null>(null);
@@ -1097,13 +1102,15 @@ function PullConflictSheet({
   const fileWord = conflicts.length === 1 ? 'file' : 'files';
 
   const onRetry = async (strategy: 'stash' | 'discard') => {
-    if (
-      strategy === 'discard' &&
-      !window.confirm(
-        `Discard local changes in ${conflicts.length} ${fileWord}? This cannot be undone — the working-tree copies will be replaced with HEAD.`,
-      )
-    )
-      return;
+    if (strategy === 'discard') {
+      const ok = await requestConfirm({
+        title: 'Discard local changes?',
+        body: `Discard local changes in ${conflicts.length} ${fileWord}? This cannot be undone — the working-tree copies will be replaced with HEAD.`,
+        confirmLabel: 'Discard',
+        destructive: true,
+      });
+      if (!ok) return;
+    }
     setBusy(strategy);
     setError(null);
     try {

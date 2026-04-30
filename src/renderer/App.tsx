@@ -55,6 +55,103 @@ export function App(): JSX.Element {
       </div>
       <SheetHost />
       <CommandPalette />
+      <ConfirmHost />
+      <ToastHost />
+    </div>
+  );
+}
+
+/// Renders the in-flight confirm request, if any. We use the same
+/// backdrop-and-card structure as SheetHost but keep this separate so
+/// confirms can stack on top of an open sheet (the "Discard hunk?"
+/// prompt comes up over the Changes tab without stomping a sheet).
+function ConfirmHost(): JSX.Element | null {
+  const pending = useStore((s) => s.pendingConfirm);
+  const resolve = useStore((s) => s.resolveConfirm);
+
+  useEffect(() => {
+    if (!pending) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        resolve(pending.id, false);
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        resolve(pending.id, true);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [pending, resolve]);
+
+  if (!pending) return null;
+  const onCancel = () => resolve(pending.id, false);
+  const onConfirm = () => resolve(pending.id, true);
+
+  return (
+    <div
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 backdrop-blur-sm"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onCancel();
+      }}
+    >
+      <div className="bg-surface-elevated border border-card rounded-lg shadow-2xl w-[440px] max-w-[92vw] overflow-hidden">
+        <div className="px-5 py-3 border-b border-card">
+          <h2 className="text-sm font-semibold">{pending.title}</h2>
+        </div>
+        <div className="px-5 py-4 text-[13px] text-ink-muted whitespace-pre-wrap">
+          {pending.body}
+        </div>
+        <div className="px-5 py-3 border-t border-card flex justify-end gap-2">
+          <button
+            onClick={onCancel}
+            className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
+          >
+            {pending.cancelLabel}
+          </button>
+          <button
+            autoFocus
+            onClick={onConfirm}
+            className={`text-xs px-3 py-1.5 rounded text-white ${
+              pending.destructive
+                ? 'bg-red-600 hover:bg-red-500'
+                : 'bg-accent hover:bg-accent-strong'
+            }`}
+          >
+            {pending.confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/// Bottom-right toast stack. Each toast can be dismissed by clicking
+/// it; non-sticky toasts also auto-fade. Position is fixed bottom-right
+/// because that's where the user's eye lands after a successful action
+/// at the top of the panel.
+function ToastHost(): JSX.Element | null {
+  const toasts = useStore((s) => s.toasts);
+  const dismiss = useStore((s) => s.dismissToast);
+  if (toasts.length === 0) return null;
+  const tone: Record<string, string> = {
+    info: 'bg-card border-card text-ink',
+    success: 'bg-emerald-500/15 border-emerald-500/30 text-emerald-200',
+    warn: 'bg-amber-500/15 border-amber-500/30 text-amber-200',
+    error: 'bg-red-500/15 border-red-500/30 text-red-200',
+  };
+  return (
+    <div className="fixed bottom-4 right-4 z-[55] flex flex-col gap-2 w-[360px] max-w-[80vw] pointer-events-none">
+      {toasts.map((t) => (
+        <button
+          key={t.id}
+          onClick={() => dismiss(t.id)}
+          className={`pointer-events-auto text-left text-xs px-3 py-2 rounded border shadow-lg whitespace-pre-wrap ${tone[t.kind] ?? tone.info}`}
+          title="Click to dismiss"
+        >
+          {t.message}
+        </button>
+      ))}
     </div>
   );
 }
@@ -229,6 +326,7 @@ function Sidebar(): JSX.Element {
   const setSheet = useStore((s) => s.setSheet);
   const removeRepo = useStore((s) => s.removeRepo);
   const removeWorkspace = useStore((s) => s.removeWorkspace);
+  const requestConfirm = useStore((s) => s.requestConfirm);
 
   const [search, setSearch] = useState('');
   const query = search.trim().toLowerCase();
@@ -278,14 +376,13 @@ function Sidebar(): JSX.Element {
               repo={r}
               selected={selectedRepo === r.id}
               onSelect={() => selectRepo(r.id)}
-              onRemove={() => {
-                if (
-                  window.confirm(
-                    `Remove "${r.name}" from overgit? The repo on disk is left alone.`,
-                  )
-                ) {
-                  void removeRepo(r.id);
-                }
+              onRemove={async () => {
+                const ok = await requestConfirm({
+                  title: `Remove ${r.name}?`,
+                  body: `Remove "${r.name}" from overgit? The repo on disk is left alone.`,
+                  confirmLabel: 'Remove',
+                });
+                if (ok) void removeRepo(r.id);
               }}
             />
           ))
@@ -308,10 +405,13 @@ function Sidebar(): JSX.Element {
               selected={selectedWs === w.id && !selectedRepo}
               onSelect={() => selectWs(w.id)}
               onEdit={() => setSheet({ kind: 'editWorkspace', workspaceId: w.id })}
-              onRemove={() => {
-                if (window.confirm(`Remove workspace "${w.name}"?`)) {
-                  void removeWorkspace(w.id);
-                }
+              onRemove={async () => {
+                const ok = await requestConfirm({
+                  title: `Remove workspace?`,
+                  body: `Remove workspace "${w.name}"?`,
+                  confirmLabel: 'Remove',
+                });
+                if (ok) void removeWorkspace(w.id);
               }}
             />
           ))
@@ -825,6 +925,7 @@ function CheckoutOutcomeRow({
   const stash = useStore((s) => s.stashRepo);
   const commitAll = useStore((s) => s.commitAllRepo);
   const retry = useStore((s) => s.retryCheckoutRepo);
+  const pushToast = useStore((s) => s.pushToast);
 
   const [showCommit, setShowCommit] = useState(false);
   const [message, setMessage] = useState('');
@@ -835,7 +936,7 @@ function CheckoutOutcomeRow({
     try {
       const res = await stash(outcome.repoId);
       if (!res.ok) {
-        alert(res.error ?? 'Stash failed');
+        pushToast({ kind: 'error', message: res.error ?? 'Stash failed' });
         return;
       }
       await retry(outcome.repoId);
@@ -850,7 +951,7 @@ function CheckoutOutcomeRow({
     try {
       const res = await commitAll(outcome.repoId, message.trim());
       if (!res.ok) {
-        alert(res.error ?? 'Commit failed');
+        pushToast({ kind: 'error', message: res.error ?? 'Commit failed' });
         return;
       }
       setShowCommit(false);
