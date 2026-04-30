@@ -508,6 +508,36 @@ function buildSections(args: BuildArgs): PaletteSection[] {
           actions.close();
         },
       },
+      {
+        id: 'manage-tags',
+        title: 'Manage tags',
+        hint: 'list, create, delete, push',
+        glyph: '⚑',
+        perform: () => {
+          actions.setSheet({ kind: 'manageRepo', repoId: id, tab: 'tags' });
+          actions.close();
+        },
+      },
+      {
+        id: 'manage-remotes',
+        title: 'Manage remotes',
+        hint: 'add, edit, remove',
+        glyph: '⇄',
+        perform: () => {
+          actions.setSheet({ kind: 'manageRepo', repoId: id, tab: 'remotes' });
+          actions.close();
+        },
+      },
+      {
+        id: 'manage-submodules',
+        title: 'Submodules & LFS',
+        hint: 'inspect submodules and LFS status',
+        glyph: '⊕',
+        perform: () => {
+          actions.setSheet({ kind: 'manageRepo', repoId: id, tab: 'submodules' });
+          actions.close();
+        },
+      },
     ];
     if (anyLlm) {
       candidates.push(

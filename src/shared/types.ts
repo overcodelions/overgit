@@ -566,6 +566,45 @@ export interface IPCInvokeMap {
   /// Aggregate `git worktree list` across the workspace's repos so the
   /// renderer can show siblings per repo without N round-trips.
   'workspace:worktrees': (workspaceId: UUID) => { repoId: UUID; worktrees: Worktree[] }[];
+  'repo:listTags': (repoId: UUID) => Tag[];
+  /// Create a tag. `message` makes it annotated; omitting (or empty
+  /// string) makes it lightweight. `ref` defaults to HEAD when null.
+  'repo:createTag': (args: {
+    repoId: UUID;
+    name: string;
+    ref: string | null;
+    message: string | null;
+  }) => { ok: boolean; error?: string };
+  'repo:deleteTag': (args: { repoId: UUID; name: string }) => { ok: boolean; error?: string };
+  /// Push a single tag to a remote (`git push <remote> <tag>`).
+  'repo:pushTag': (args: {
+    repoId: UUID;
+    name: string;
+    remote: string;
+  }) => { ok: boolean; error?: string };
+
+  'repo:listRemotes': (repoId: UUID) => Remote[];
+  'repo:addRemote': (args: {
+    repoId: UUID;
+    name: string;
+    url: string;
+  }) => { ok: boolean; error?: string };
+  'repo:removeRemote': (args: {
+    repoId: UUID;
+    name: string;
+  }) => { ok: boolean; error?: string };
+  'repo:setRemoteUrl': (args: {
+    repoId: UUID;
+    name: string;
+    url: string;
+    /// 'fetch' = `git remote set-url <name> <url>`,
+    /// 'push'  = `git remote set-url --push <name> <url>`.
+    kind: 'fetch' | 'push';
+  }) => { ok: boolean; error?: string };
+
+  'repo:listSubmodules': (repoId: UUID) => Submodule[];
+  'repo:lfsStatus': (repoId: UUID) => LfsStatus;
+
   /// Aggregated "what happened recently" across the workspace. Walks
   /// `git log` on the current branch of each repo (capped per-repo and
   /// in total) and merges in the gh PR list. Returned items are sorted
@@ -676,6 +715,62 @@ export type WorkspaceActivity =
       /// transitions in one timestamp.
       at: string;
     };
+
+/// One git tag with its kind. Annotated tags carry a message; the UI
+/// renders them with a small icon to distinguish them from lightweight
+/// tags, which are just refs.
+export interface Tag {
+  name: string;
+  /// 'lightweight' — just a ref pointing at a commit; 'annotated' —
+  /// a tag object with a message and tagger metadata.
+  kind: 'lightweight' | 'annotated';
+  /// Sha of the commit the tag resolves to (peeled).
+  sha: string;
+  shortSha: string;
+  /// First line of the tag message for annotated tags; empty for
+  /// lightweight tags.
+  subject: string;
+  /// Tagger / author name for annotated; empty otherwise.
+  tagger: string;
+  /// ISO 8601 tag/author date.
+  date: string;
+}
+
+/// One configured remote. We store URLs separately for fetch and push;
+/// `git remote -v` emits both, and they often differ for repos using a
+/// pull-from-upstream / push-to-fork setup.
+export interface Remote {
+  name: string;
+  fetchUrl: string;
+  pushUrl: string;
+}
+
+/// One git submodule (parsed from `git submodule status`). Submodules
+/// are an overlay-friendly thing to surface — overgit doesn't manage
+/// them, just shows the user that they exist and what commit each is
+/// pinned to. The `state` field encodes git's status prefix:
+///   ' ' → up-to-date, '+' → checked-out commit ≠ pinned, '-' → not
+///   initialized, 'U' → merge conflict in submodule.
+export interface Submodule {
+  path: string;
+  sha: string;
+  shortSha: string;
+  /// `(<ref>)` suffix git emits — e.g. "v1.2.0" or
+  /// "heads/main-1-gabcdef" — kept as-is so the renderer can show what
+  /// commit description git knew.
+  describe: string;
+  state: 'up-to-date' | 'modified' | 'uninitialized' | 'conflict';
+}
+
+/// LFS presence summary. We deliberately don't enumerate every lfs ptr
+/// in the repo — too expensive for a passive badge. The renderer just
+/// shows "uses LFS" when `enabled` is true.
+export interface LfsStatus {
+  enabled: boolean;
+  /// Number of distinct filter patterns in `.gitattributes` that route
+  /// through `filter=lfs`. > 0 implies enabled.
+  patternCount: number;
+}
 
 /// One commit in a file's history (`git log --follow -- <path>`).
 /// Includes the path the file had at the commit, since `--follow`

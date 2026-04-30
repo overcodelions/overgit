@@ -43,6 +43,7 @@ export type Sheet =
   | { kind: 'pushAllInWorkspace'; workspaceId: UUID }
   | { kind: 'openPRsInWorkspace'; workspaceId: UUID }
   | { kind: 'fileHistory'; repoId: UUID; path: string; tab: 'history' | 'blame' }
+  | { kind: 'manageRepo'; repoId: UUID; tab: 'tags' | 'remotes' | 'submodules' }
   | { kind: 'pullConflict'; repoId: UUID; conflicts: string[]; rawError: string };
 
 interface OpenFile {

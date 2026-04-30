@@ -10,6 +10,7 @@ import {
   abortCherryPick,
   abortMerge,
   abortRebase,
+  addRemote,
   adoptWorktreeBranch,
   amendCommit,
   applyPatch,
@@ -19,6 +20,7 @@ import {
   branchSummaries,
   continueCherryPick,
   continueRebase,
+  createTag,
   changes as gitChanges,
   checkoutBranch,
   checkoutCommit,
@@ -28,6 +30,7 @@ import {
   commitStaged,
   createBranch,
   deleteBranch,
+  deleteTag,
   detectDefaultBranch,
   diff as gitDiff,
   diffFile,
@@ -35,11 +38,17 @@ import {
   dropStash,
   fetch as gitFetch,
   fileLog as gitFileLog,
+  lfsStatus,
   listBranches,
   listBranchCommits,
+  listRemotes,
   listStashes,
+  listSubmodules,
+  listTags,
   listWorktrees,
   pruneWorktrees,
+  pushTag,
+  removeRemote,
   removeWorktree,
   log as gitLog,
   looksLikeRepo,
@@ -50,6 +59,7 @@ import {
   push as gitPush,
   rawDiff,
   rebaseOnto,
+  setRemoteUrl,
   stageFiles,
   stash as gitStash,
   stashDiff,
@@ -565,6 +575,94 @@ function registerIpc(): void {
       return blameFile(repo.path, args.path);
     },
   );
+
+  ipcMain.handle('repo:listTags', async (_e, repoId: string) => {
+    const repo = repoFromArg(repoId);
+    if (!repo) return [];
+    return listTags(repo.path);
+  });
+
+  ipcMain.handle(
+    'repo:createTag',
+    async (
+      _e,
+      args: { repoId: string; name: string; ref: string | null; message: string | null },
+    ) => {
+      const repo = repoFromArg(args.repoId);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return createTag(repo.path, {
+        name: args.name,
+        ref: args.ref,
+        message: args.message,
+      });
+    },
+  );
+
+  ipcMain.handle(
+    'repo:deleteTag',
+    async (_e, args: { repoId: string; name: string }) => {
+      const repo = repoFromArg(args.repoId);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return deleteTag(repo.path, args.name);
+    },
+  );
+
+  ipcMain.handle(
+    'repo:pushTag',
+    async (_e, args: { repoId: string; name: string; remote: string }) => {
+      const repo = repoFromArg(args.repoId);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return pushTag(repo.path, args.name, args.remote);
+    },
+  );
+
+  ipcMain.handle('repo:listRemotes', async (_e, repoId: string) => {
+    const repo = repoFromArg(repoId);
+    if (!repo) return [];
+    return listRemotes(repo.path);
+  });
+
+  ipcMain.handle(
+    'repo:addRemote',
+    async (_e, args: { repoId: string; name: string; url: string }) => {
+      const repo = repoFromArg(args.repoId);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return addRemote(repo.path, args.name, args.url);
+    },
+  );
+
+  ipcMain.handle(
+    'repo:removeRemote',
+    async (_e, args: { repoId: string; name: string }) => {
+      const repo = repoFromArg(args.repoId);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return removeRemote(repo.path, args.name);
+    },
+  );
+
+  ipcMain.handle(
+    'repo:setRemoteUrl',
+    async (
+      _e,
+      args: { repoId: string; name: string; url: string; kind: 'fetch' | 'push' },
+    ) => {
+      const repo = repoFromArg(args.repoId);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return setRemoteUrl(repo.path, args.name, args.url, args.kind);
+    },
+  );
+
+  ipcMain.handle('repo:listSubmodules', async (_e, repoId: string) => {
+    const repo = repoFromArg(repoId);
+    if (!repo) return [];
+    return listSubmodules(repo.path);
+  });
+
+  ipcMain.handle('repo:lfsStatus', async (_e, repoId: string) => {
+    const repo = repoFromArg(repoId);
+    if (!repo) return { enabled: false, patternCount: 0 };
+    return lfsStatus(repo.path);
+  });
 
   ipcMain.handle(
     'repo:setDefaultBranch',
