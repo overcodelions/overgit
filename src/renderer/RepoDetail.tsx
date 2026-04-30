@@ -975,6 +975,8 @@ function ConflictBanner({
 }): JSX.Element {
   const op = status.inProgress!;
   const conflicts = status.conflicts;
+  const repos = useStore((s) => s.repos);
+  const repoPath = repos.find((r) => r.id === repoId)?.path;
   const stage = useStore((s) => s.stageFiles);
   const abortMerge = useStore((s) => s.abortMerge);
   const abortRebase = useStore((s) => s.abortRebase);
@@ -982,8 +984,15 @@ function ConflictBanner({
   const abortCherryPick = useStore((s) => s.abortCherryPick);
   const continueCherryPick = useStore((s) => s.continueCherryPick);
   const markResolved = useStore((s) => s.markResolved);
+  const openRepoFile = useStore((s) => s.openRepoFile);
   const refreshStatus = useStore((s) => s.refreshRepoStatus);
   const refreshChanges = useStore((s) => s.refreshRepoChanges);
+
+  const onOpen = (relPath: string) => {
+    if (!repoPath) return;
+    window.dispatchEvent(new CustomEvent('overgit:setRepoTab', { detail: 'files' }));
+    void openRepoFile(repoId, joinRepoPath(repoPath, relPath));
+  };
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -1136,6 +1145,13 @@ function ConflictBanner({
               <span className="font-mono truncate flex-1" title={p}>
                 {p}
               </span>
+              <button
+                onClick={() => onOpen(p)}
+                className="text-[10px] uppercase tracking-wide text-ink-faint hover:text-ink px-1.5"
+                title="Open in editor — fix the <<<<<<< / >>>>>>> markers"
+              >
+                Open
+              </button>
               <button
                 disabled={busy}
                 onClick={() => onMarkOne(p)}
