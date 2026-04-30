@@ -8,10 +8,12 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
+  BlameLine,
   ChangedFile,
   CheckoutOutcome,
   Commit,
   FileDiff,
+  FileLogCommit,
   GraphCommit,
   RepoChanges,
   RepoStatus,
@@ -655,6 +657,158 @@ export async function log(repoPath: string, limit = 50): Promise<Commit[]> {
       date: date ?? '',
       body: (body ?? '').trim(),
     });
+  }
+  return out;
+}
+
+/// `git log --follow -- <path>` for one file. `--follow` walks
+/// through renames so the result includes commits from before the file
+/// was at its current path; we record the path each commit knew the
+/// file by so the renderer can show "old/path → new/path" on rename
+/// commits. Same x1f/x1e record framing as the regular `log` for
+/// consistency, plus a `%n` for the path-at-commit (filled in via
+/// --name-only).
+const FILE_LOG_FORMAT = '%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%s%x1e';
+
+export async function fileLog(
+  repoPath: string,
+  relPath: string,
+  limit = 200,
+): Promise<FileLogCommit[]> {
+  if (!looksLikeRepo(repoPath)) return [];
+  // `--name-only` after the format makes git emit the file's path on
+  // its own line per record; we parse the path off each record's tail.
+  // `--follow` is required for the rename-walking behavior. It only
+  // works with a single pathspec, which is what we always pass here.
+  const res = await run(repoPath, [
+    'log',
+    '--follow',
+    `-${Math.max(1, Math.min(limit, 1000))}`,
+    `--pretty=format:${FILE_LOG_FORMAT}`,
+    '--name-only',
+    '--',
+    relPath,
+  ]);
+  if (!res.ok) return [];
+  const out: FileLogCommit[] = [];
+  for (const record of res.stdout.split('\x1e')) {
+    const trimmed = record.replace(/^\s+|\s+$/g, '');
+    if (!trimmed) continue;
+    // Split off the trailing path (everything after the final field of
+    // the format). `--name-only` puts the path on its own line, so we
+    // peel the last non-empty line as the path and parse the head as
+    // the format fields.
+    const lines = trimmed.split('\n');
+    const pathAtCommit = lines.pop()?.trim() ?? relPath;
+    const head = lines.join('\n');
+    const [sha, shortSha, author, authorEmail, authorDate, subject] =
+      head.split('\x1f');
+    if (!sha) continue;
+    out.push({
+      sha,
+      shortSha: shortSha ?? sha.slice(0, 7),
+      author: author ?? '',
+      authorEmail: authorEmail ?? '',
+      authorDate: authorDate ?? '',
+      subject: subject ?? '',
+      pathAtCommit,
+    });
+  }
+  return out;
+}
+
+/// `git blame --porcelain` for one file. The porcelain format is:
+///   <sha> <orig-line> <final-line> [<lines-in-this-group>]
+///   author <name>
+///   author-mail <<email>>
+///   author-time <unix-ts>
+///   author-tz <+/-HHMM>
+///   ...
+///   summary <commit subject>
+///   filename <repo-rel path>
+///   <TAB><file content of this line>
+///
+/// Subsequent groups attributed to the same sha omit the metadata
+/// lines, so we cache them per sha while iterating. We surface only the
+/// fields we render; the rest can be added later.
+export async function blameFile(
+  repoPath: string,
+  relPath: string,
+): Promise<BlameLine[]> {
+  if (!looksLikeRepo(repoPath)) return [];
+  const res = await run(repoPath, ['blame', '--porcelain', '--', relPath]);
+  if (!res.ok) return [];
+  const out: BlameLine[] = [];
+  const meta = new Map<
+    string,
+    { author: string; authorEmail: string; authorDate: string; summary: string }
+  >();
+  let current: {
+    sha: string;
+    finalLine: number;
+    author?: string;
+    authorEmail?: string;
+    authorTime?: string;
+    summary?: string;
+  } | null = null;
+
+  for (const line of res.stdout.split('\n')) {
+    if (line.startsWith('\t')) {
+      // Content line. Flush the current group with whatever we have,
+      // falling back to the cached metadata for repeated shas.
+      if (current) {
+        const cached = meta.get(current.sha);
+        const author = current.author ?? cached?.author ?? '';
+        const authorEmail = current.authorEmail ?? cached?.authorEmail ?? '';
+        const authorTime = current.authorTime ?? '';
+        const authorDate =
+          authorTime !== ''
+            ? new Date(Number.parseInt(authorTime, 10) * 1000).toISOString()
+            : (cached?.authorDate ?? '');
+        const summary = current.summary ?? cached?.summary ?? '';
+        // Cache the per-sha metadata so subsequent groups attributed
+        // to the same commit can render the same gutter without git
+        // having to repeat them.
+        if (!meta.has(current.sha)) {
+          meta.set(current.sha, { author, authorEmail, authorDate, summary });
+        }
+        out.push({
+          lineNumber: current.finalLine,
+          content: line.slice(1),
+          sha: current.sha,
+          shortSha: current.sha.slice(0, 7),
+          author,
+          authorEmail,
+          authorDate,
+          summary,
+        });
+      }
+      current = null;
+      continue;
+    }
+
+    const headMatch = /^([0-9a-f]{40})\s+(\d+)\s+(\d+)(?:\s+\d+)?\s*$/.exec(line);
+    if (headMatch) {
+      // New group header. The "final" line number is the third field —
+      // that's what we use for rendering since our gutter mirrors the
+      // file at HEAD. Until we hit the content TAB line we collect
+      // metadata into `current`.
+      current = {
+        sha: headMatch[1],
+        finalLine: Number.parseInt(headMatch[3], 10),
+      };
+      continue;
+    }
+    if (!current) continue;
+    if (line.startsWith('author ')) current.author = line.slice('author '.length);
+    else if (line.startsWith('author-mail ')) {
+      const raw = line.slice('author-mail '.length).trim();
+      current.authorEmail = raw.replace(/^<|>$/g, '');
+    } else if (line.startsWith('author-time ')) {
+      current.authorTime = line.slice('author-time '.length).trim();
+    } else if (line.startsWith('summary ')) {
+      current.summary = line.slice('summary '.length);
+    }
   }
   return out;
 }

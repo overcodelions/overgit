@@ -39,6 +39,22 @@ function EditorBody(): JSX.Element {
   const closeFile = useStore((s) => s.closeRepoFile);
   const save = useStore((s) => s.saveOpenFile);
   const pushToast = useStore((s) => s.pushToast);
+  const setSheet = useStore((s) => s.setSheet);
+  const repoPath = useStore(
+    (s) => s.repos.find((r) => r.id === file.repoId)?.path,
+  );
+
+  // `file.path` is absolute (resolved by fs:readFile). The history /
+  // blame backend wants a repo-relative path. Strip the repo root with
+  // a separator-aware test so Windows backslashes survive.
+  const relPath =
+    repoPath && file.path.startsWith(repoPath)
+      ? file.path.slice(repoPath.length).replace(/^[/\\]/, '')
+      : file.path;
+
+  const openHistory = (tab: 'history' | 'blame') => {
+    setSheet({ kind: 'fileHistory', repoId: file.repoId, path: relPath, tab });
+  };
 
   const onSave = useCallback(async () => {
     const res = await save();
@@ -64,6 +80,20 @@ function EditorBody(): JSX.Element {
           {file.path}
           {dirty && <span className="text-amber-400"> · modified</span>}
         </span>
+        <button
+          onClick={() => openHistory('history')}
+          className="text-xs px-2 py-1 rounded text-ink-muted hover:text-ink hover:bg-card"
+          title="Show this file's commit history"
+        >
+          History
+        </button>
+        <button
+          onClick={() => openHistory('blame')}
+          className="text-xs px-2 py-1 rounded text-ink-muted hover:text-ink hover:bg-card"
+          title="Show line-by-line blame"
+        >
+          Blame
+        </button>
         {dirty && (
           <button
             onClick={onSave}

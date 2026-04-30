@@ -41,6 +41,7 @@ export type Sheet =
   | { kind: 'commitAllInWorkspace'; workspaceId: UUID }
   | { kind: 'pushAllInWorkspace'; workspaceId: UUID }
   | { kind: 'openPRsInWorkspace'; workspaceId: UUID }
+  | { kind: 'fileHistory'; repoId: UUID; path: string; tab: 'history' | 'blame' }
   | { kind: 'pullConflict'; repoId: UUID; conflicts: string[]; rawError: string };
 
 interface OpenFile {
