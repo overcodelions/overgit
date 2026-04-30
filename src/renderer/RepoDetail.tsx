@@ -96,6 +96,7 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
   const fetchRepo = useStore((s) => s.fetchRepo);
   const pullRepo = useStore((s) => s.pullRepo);
   const pushRepo = useStore((s) => s.pushRepo);
+  const pushToast = useStore((s) => s.pushToast);
 
   const [busy, setBusy] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -115,7 +116,7 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
     setBusy(true);
     try {
       const res = await fn();
-      if (!res.ok) alert(res.error ?? 'Action failed');
+      if (!res.ok) pushToast({ kind: 'error', message: res.error ?? 'Action failed' });
     } finally {
       setBusy(false);
     }
@@ -139,7 +140,7 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
         });
         return;
       }
-      alert(res.error ?? 'Pull failed');
+      pushToast({ kind: 'error', message: res.error ?? 'Pull failed' });
     } finally {
       setBusy(false);
     }
@@ -368,6 +369,8 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
   const setSheet = useStore((s) => s.setSheet);
   const openRepoFile = useStore((s) => s.openRepoFile);
   const stashFilesAction = useStore((s) => s.stashFiles);
+  const pushToast = useStore((s) => s.pushToast);
+  const requestConfirm = useStore((s) => s.requestConfirm);
   // Last commit — pulled from the graph (already cached for History)
   // so this doesn't trigger an extra IPC call.
   const lastCommit = useStore((s) => s.repoGraph[repoId]?.[0]);
@@ -384,7 +387,7 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
   const onStash = async (paths: string[], message?: string) => {
     if (paths.length === 0) return;
     const res = await stashFilesAction(repoId, paths, message);
-    if (!res.ok) alert(res.error ?? 'Stash failed');
+    if (!res.ok) pushToast({ kind: 'error', message: res.error ?? 'Stash failed' });
   };
 
   // "View" handler shared by both groups: switch to the Files tab and
@@ -519,7 +522,10 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
         ? await amend(repoId, message.trim())
         : await commit(repoId, message.trim());
       if (!res.ok) {
-        alert(res.error ?? (amendMode ? 'Amend failed' : 'Commit failed'));
+        pushToast({
+          kind: 'error',
+          message: res.error ?? (amendMode ? 'Amend failed' : 'Commit failed'),
+        });
         return;
       }
       setMessage('');
@@ -531,9 +537,12 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
   };
 
   const onDiscard = async (file: ChangedFile) => {
-    const ok = window.confirm(
-      `Discard changes to ${file.path}? This cannot be undone.`,
-    );
+    const ok = await requestConfirm({
+      title: 'Discard changes?',
+      body: `Discard changes to ${file.path}? This cannot be undone.`,
+      confirmLabel: 'Discard',
+      destructive: true,
+    });
     if (!ok) return;
     await discard(repoId, [file.path]);
     if (selected?.path === file.path) setSelected(null);
@@ -646,15 +655,16 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
               label: 'Discard',
               glyph: ICON_DISCARD,
               tone: 'danger',
-              onAction: (paths) => {
-                if (
-                  !window.confirm(
-                    `Discard changes in ${paths.length} ${
-                      paths.length === 1 ? 'file' : 'files'
-                    }? This cannot be undone.`,
-                  )
-                )
-                  return;
+              onAction: async (paths) => {
+                const ok = await requestConfirm({
+                  title: 'Discard changes?',
+                  body: `Discard changes in ${paths.length} ${
+                    paths.length === 1 ? 'file' : 'files'
+                  }? This cannot be undone.`,
+                  confirmLabel: 'Discard',
+                  destructive: true,
+                });
+                if (!ok) return;
                 void discard(repoId, paths);
               },
             },
@@ -985,6 +995,7 @@ function ConflictBanner({
   const continueCherryPick = useStore((s) => s.continueCherryPick);
   const markResolved = useStore((s) => s.markResolved);
   const openRepoFile = useStore((s) => s.openRepoFile);
+  const requestConfirm = useStore((s) => s.requestConfirm);
   const refreshStatus = useStore((s) => s.refreshRepoStatus);
   const refreshChanges = useStore((s) => s.refreshRepoChanges);
 
@@ -1000,12 +1011,13 @@ function ConflictBanner({
   const allResolved = remaining === 0;
 
   const onAbort = async () => {
-    if (
-      !window.confirm(
-        `Abort the in-progress ${op}? This rolls the working tree back to before it started.`,
-      )
-    )
-      return;
+    const ok = await requestConfirm({
+      title: `Abort ${op}?`,
+      body: `Abort the in-progress ${op}? This rolls the working tree back to before it started.`,
+      confirmLabel: 'Abort',
+      destructive: true,
+    });
+    if (!ok) return;
     setBusy(true);
     setError(null);
     try {
@@ -1557,6 +1569,7 @@ function StashTab({ repoId }: { repoId: UUID }): JSX.Element {
   const applyStash = useStore((s) => s.applyStash);
   const applyStashForce = useStore((s) => s.applyStashForce);
   const dropStash = useStore((s) => s.dropStash);
+  const requestConfirm = useStore((s) => s.requestConfirm);
   // Note: no `openFile` here on purpose. A stash diff shows the
   // stashed content, which usually doesn't match what's on disk —
   // clicking Open would either silently load the wrong version
@@ -1624,14 +1637,15 @@ function StashTab({ repoId }: { repoId: UUID }): JSX.Element {
 
   const onForceApply = async () => {
     if (selected == null || !error) return;
-    if (
-      !window.confirm(
-        `Force overwrite ${error.conflicts?.length ?? 0} working-tree ${
-          error.conflicts?.length === 1 ? 'file' : 'files'
-        } and ${error.pop ? 'pop' : 'apply'} the stash? The local copies are deleted before the stash content is restored.`,
-      )
-    )
-      return;
+    const ok = await requestConfirm({
+      title: 'Force overwrite?',
+      body: `Force overwrite ${error.conflicts?.length ?? 0} working-tree ${
+        error.conflicts?.length === 1 ? 'file' : 'files'
+      } and ${error.pop ? 'pop' : 'apply'} the stash? The local copies are deleted before the stash content is restored.`,
+      confirmLabel: 'Force overwrite',
+      destructive: true,
+    });
+    if (!ok) return;
     setBusy(true);
     try {
       const res = await applyStashForce(repoId, selected, error.pop);
@@ -1646,12 +1660,13 @@ function StashTab({ repoId }: { repoId: UUID }): JSX.Element {
   };
 
   const onDrop = async (index: number) => {
-    if (
-      !window.confirm(
-        `Drop stash@{${index}}? This is irreversible — the contents are lost.`,
-      )
-    )
-      return;
+    const ok = await requestConfirm({
+      title: `Drop stash@{${index}}?`,
+      body: `Drop stash@{${index}}? This is irreversible — the contents are lost.`,
+      confirmLabel: 'Drop',
+      destructive: true,
+    });
+    if (!ok) return;
     setBusy(true);
     setError(null);
     try {
@@ -1896,6 +1911,8 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
   const refreshBranches = useStore((s) => s.refreshRepoBranchSummaries);
   const checkoutRepo = useStore((s) => s.checkoutRepo);
   const pruneWorktrees = useStore((s) => s.pruneWorktrees);
+  const pushToast = useStore((s) => s.pushToast);
+  const requestConfirm = useStore((s) => s.requestConfirm);
   const [busy, setBusy] = useState(false);
   const [pruning, setPruning] = useState(false);
   const [switching, setSwitching] = useState<string | null>(null);
@@ -1935,9 +1952,12 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
     try {
       const out = await checkoutRepo(repoId, name, false);
       if (out.result === 'dirty') {
-        alert(`Can't switch to ${name}: working tree is dirty. Stash or commit first.`);
+        pushToast({
+          kind: 'warn',
+          message: `Can't switch to ${name}: working tree is dirty. Stash or commit first.`,
+        });
       } else if (out.result === 'error' || out.result === 'missing-branch') {
-        alert(out.message ?? 'Checkout failed');
+        pushToast({ kind: 'error', message: out.message ?? 'Checkout failed' });
       }
     } finally {
       setSwitching(null);
@@ -1945,17 +1965,22 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
   };
 
   const onPrune = async () => {
-    if (
-      !window.confirm(
-        'Run `git worktree prune`? Removes administrative records for worktrees whose directories were deleted manually. Safe — it never touches files on disk.',
-      )
-    )
-      return;
+    const ok = await requestConfirm({
+      title: 'Prune worktrees?',
+      body: 'Run `git worktree prune`? Removes administrative records for worktrees whose directories were deleted manually. Safe — it never touches files on disk.',
+      confirmLabel: 'Prune',
+    });
+    if (!ok) return;
     setPruning(true);
     try {
       const res = await pruneWorktrees(repoId);
-      if (!res.ok) alert(res.error ?? 'Prune failed');
-      else if (res.output) alert(`Pruned:\n${res.output}`);
+      if (!res.ok) {
+        pushToast({ kind: 'error', message: res.error ?? 'Prune failed' });
+      } else if (res.output) {
+        pushToast({ kind: 'success', message: `Pruned:\n${res.output}` });
+      } else {
+        pushToast({ kind: 'success', message: 'Worktrees pruned.' });
+      }
     } finally {
       setPruning(false);
     }
@@ -2491,6 +2516,8 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
   const createBranch = useStore((s) => s.createRepoBranch);
   const repoPath = useStore((s) => s.repos.find((r) => r.id === repoId)?.path);
   const openRepoFile = useStore((s) => s.openRepoFile);
+  const pushToast = useStore((s) => s.pushToast);
+  const requestConfirm = useStore((s) => s.requestConfirm);
 
   // Shared "Open in editor" handler for every diff rendered in this
   // tab. Working-tree diff and per-commit detail use the same path —
@@ -2809,21 +2836,24 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
           }}
           onBranchFromHere={async (name) => {
             const res = await createBranch(repoId, name.trim(), true, menu.sha);
-            if (!res.ok) alert(res.error ?? 'Create failed');
+            if (!res.ok) pushToast({ kind: 'error', message: res.error ?? 'Create failed' });
           }}
           onCheckout={async () => {
-            if (
-              !window.confirm(
-                'Check out this commit? You will be on a detached HEAD — create a branch first if you plan to make changes.',
-              )
-            )
-              return;
+            const ok = await requestConfirm({
+              title: 'Detach HEAD?',
+              body: 'Check out this commit? You will be on a detached HEAD — create a branch first if you plan to make changes.',
+              confirmLabel: 'Detach and check out',
+            });
+            if (!ok) return;
             const res = await window.overgit.invoke('repo:checkoutCommit', {
               repoId,
               sha: menu.sha,
             });
-            if (!res.ok) alert(res.error ?? 'Checkout failed');
-            else await useStore.getState().refreshRepoStatus(repoId);
+            if (!res.ok) {
+              pushToast({ kind: 'error', message: res.error ?? 'Checkout failed' });
+            } else {
+              await useStore.getState().refreshRepoStatus(repoId);
+            }
           }}
         />
       )}
@@ -3363,6 +3393,7 @@ function ChangesFileBlock({
   onFileAction: (file: FileDiff, action: 'stage' | 'unstage' | 'discard') => void;
 }): JSX.Element {
   const hunks = useMemo(() => parseHunks(file), [file]);
+  const requestConfirm = useStore((s) => s.requestConfirm);
 
   // Whole-file actions sit in the file header so the user can stage or
   // discard everything in one click without scrolling. Hunk-level
@@ -3393,9 +3424,16 @@ function ChangesFileBlock({
               <button
                 key={a}
                 disabled={busy}
-                onClick={() => {
-                  if (a === 'discard' && !window.confirm(`Discard all changes in ${file.path}?`))
-                    return;
+                onClick={async () => {
+                  if (a === 'discard') {
+                    const ok = await requestConfirm({
+                      title: 'Discard file changes?',
+                      body: `Discard all changes in ${file.path}?`,
+                      confirmLabel: 'Discard',
+                      destructive: true,
+                    });
+                    if (!ok) return;
+                  }
                   onFileAction(file, a);
                 }}
                 className={`text-[10px] uppercase tracking-wide font-mono h-6 px-2 rounded border ${tone} disabled:opacity-50`}
@@ -3448,6 +3486,7 @@ function HunkBlock({
     action: 'stage' | 'unstage' | 'discard',
   ) => void;
 }): JSX.Element {
+  const requestConfirm = useStore((s) => s.requestConfirm);
   const actions = side === 'staged' ? (['unstage'] as const) : (['stage', 'discard'] as const);
   const adds = hunk.lines.filter((l) => l.startsWith('+')).length;
   const dels = hunk.lines.filter((l) => l.startsWith('-')).length;
@@ -3472,9 +3511,16 @@ function HunkBlock({
               <button
                 key={a}
                 disabled={busy}
-                onClick={() => {
-                  if (a === 'discard' && !window.confirm('Discard this hunk? This cannot be undone.'))
-                    return;
+                onClick={async () => {
+                  if (a === 'discard') {
+                    const ok = await requestConfirm({
+                      title: 'Discard hunk?',
+                      body: 'Discard this hunk? This cannot be undone.',
+                      confirmLabel: 'Discard',
+                      destructive: true,
+                    });
+                    if (!ok) return;
+                  }
                   onHunk(file, hunk, a);
                 }}
                 className={`text-[10px] uppercase tracking-wide font-mono h-6 px-2 rounded border ${tone} disabled:opacity-50`}
