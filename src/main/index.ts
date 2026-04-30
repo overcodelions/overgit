@@ -10,6 +10,7 @@ import {
   abortCherryPick,
   abortMerge,
   abortRebase,
+  adoptWorktreeBranch,
   amendCommit,
   applyPatch,
   applyStash,
@@ -35,6 +36,9 @@ import {
   listBranches,
   listBranchCommits,
   listStashes,
+  listWorktrees,
+  pruneWorktrees,
+  removeWorktree,
   log as gitLog,
   looksLikeRepo,
   markResolved,
@@ -53,11 +57,14 @@ import {
 } from './git';
 import { listFilesUnder, readFileUnderRoot, writeFileUnderRoot } from './fs';
 import {
+  aggregateWorkspaceDirtyDiff,
   workspaceCheckout,
+  workspaceCommitAll,
   workspaceFetch,
   workspaceListPRs,
   workspaceStatus,
   workspaceSyncAndBranch,
+  workspaceWorktrees,
 } from './workspace';
 import { detectCliPresence, reviewDiffWithLlm, suggestCommitMessage } from './cli';
 import { Repo } from '../shared/types';
@@ -617,6 +624,64 @@ function registerIpc(): void {
     },
   );
 
+  ipcMain.handle(
+    'workspace:commitAll',
+    async (_e, args: { workspaceId: string; message: string }) => {
+      const { workspaces, repos } = Store.load();
+      return workspaceCommitAll(args.workspaceId, args.message, workspaces, repos);
+    },
+  );
+
+  ipcMain.handle('workspace:worktrees', async (_e, workspaceId: string) => {
+    const { workspaces, repos } = Store.load();
+    return workspaceWorktrees(workspaceId, workspaces, repos);
+  });
+
+  ipcMain.handle('repo:worktrees', async (_e, repoId: string) => {
+    const repo = Store.load().repos.find((r) => r.id === repoId);
+    if (!repo) return [];
+    return listWorktrees(repo.path);
+  });
+
+  ipcMain.handle(
+    'repo:adoptWorktreeBranch',
+    async (
+      _e,
+      args: {
+        repoId: string;
+        worktreePath: string;
+        branch: string;
+        forceRemove: boolean;
+        commitMessage?: string;
+      },
+    ) => {
+      const repo = Store.load().repos.find((r) => r.id === args.repoId);
+      if (!repo) return { ok: false as const, step: 'precheck' as const, error: 'Unknown repo' };
+      return adoptWorktreeBranch(
+        repo.path,
+        args.worktreePath,
+        args.branch,
+        args.forceRemove,
+        args.commitMessage,
+      );
+    },
+  );
+
+  ipcMain.handle(
+    'repo:removeWorktree',
+    async (_e, args: { repoId: string; worktreePath: string; force: boolean }) => {
+      const repo = Store.load().repos.find((r) => r.id === args.repoId);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return removeWorktree(repo.path, args.worktreePath, args.force);
+    },
+  );
+
+  ipcMain.handle('repo:pruneWorktrees', async (_e, repoId: string) => {
+    const repo = Store.load().repos.find((r) => r.id === repoId);
+    if (!repo) return { ok: false, error: 'Unknown repo' };
+    return pruneWorktrees(repo.path);
+  });
+
   ipcMain.handle('cli:detect', () => detectCliPresence());
 
   ipcMain.handle(
@@ -649,6 +714,57 @@ function registerIpc(): void {
         return { ok: false, error: diff.error ?? 'Could not read staged diff', tool: args.tool };
       }
       return suggestCommitMessage(args.tool, diff.text);
+    },
+  );
+
+  ipcMain.handle(
+    'workspace:reviewChanges',
+    async (
+      _e,
+      args: { workspaceId: string; tool: 'claude' | 'codex' | 'gemini' },
+    ) => {
+      const { workspaces, repos } = Store.load();
+      const aggregate = await aggregateWorkspaceDirtyDiff(
+        args.workspaceId,
+        workspaces,
+        repos,
+      );
+      if (!aggregate.text.trim()) {
+        return {
+          ok: false,
+          output: '',
+          error: 'No dirty on-branch changes to review.',
+          tool: args.tool,
+          truncated: aggregate.truncated,
+        };
+      }
+      const result = await reviewDiffWithLlm(args.tool, aggregate.text);
+      return { ...result, truncated: aggregate.truncated };
+    },
+  );
+
+  ipcMain.handle(
+    'workspace:suggestCommitMessage',
+    async (
+      _e,
+      args: { workspaceId: string; tool: 'claude' | 'codex' | 'gemini' },
+    ) => {
+      const { workspaces, repos } = Store.load();
+      const aggregate = await aggregateWorkspaceDirtyDiff(
+        args.workspaceId,
+        workspaces,
+        repos,
+      );
+      if (!aggregate.text.trim()) {
+        return {
+          ok: false as const,
+          error: 'No dirty on-branch changes to summarize.',
+          tool: args.tool,
+          truncated: aggregate.truncated,
+        };
+      }
+      const result = await suggestCommitMessage(args.tool, aggregate.text);
+      return { ...result, truncated: aggregate.truncated };
     },
   );
 }

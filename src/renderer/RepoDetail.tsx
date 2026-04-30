@@ -10,6 +10,7 @@ import type {
   LlmTool,
   RepoStatus,
   UUID,
+  Worktree,
 } from '@shared/types';
 import { HISTORY_ASIDE_MAX_WIDTH, HISTORY_ASIDE_MIN_WIDTH } from '@shared/types';
 
@@ -29,7 +30,7 @@ function joinRepoPath(repoRoot: string, relPath: string): string {
   return `${trimmedRoot}${sep}${normalized}`;
 }
 
-type Tab = 'changes' | 'history' | 'files' | 'stash';
+type Tab = 'changes' | 'history' | 'files' | 'stash' | 'branches';
 
 /// Detail view for a single repo. Two tabs:
 /// - Changes: stage / unstage / discard / commit (the standard daily flow)
@@ -66,7 +67,8 @@ export function RepoDetail({ repoId }: { repoId: UUID }): JSX.Element {
         detail === 'changes' ||
         detail === 'history' ||
         detail === 'files' ||
-        detail === 'stash'
+        detail === 'stash' ||
+        detail === 'branches'
       ) {
         setTab(detail);
       }
@@ -83,6 +85,7 @@ export function RepoDetail({ repoId }: { repoId: UUID }): JSX.Element {
       {tab === 'history' && <HistoryTab repoId={repoId} />}
       {tab === 'files' && <FileEditor repoId={repoId} />}
       {tab === 'stash' && <StashTab repoId={repoId} />}
+      {tab === 'branches' && <BranchesTab repoId={repoId} />}
     </main>
   );
 }
@@ -329,10 +332,11 @@ function Tabs({ tab, onChange }: { tab: Tab; onChange: (t: Tab) => void }): JSX.
     history: 'History',
     files: 'Files',
     stash: 'Stash',
+    branches: 'Branches',
   };
   return (
     <nav className="px-6 border-b border-card flex gap-2">
-      {(['changes', 'history', 'files', 'stash'] as const).map((t) => (
+      {(['changes', 'history', 'files', 'stash', 'branches'] as const).map((t) => (
         <button
           key={t}
           onClick={() => onChange(t)}
@@ -1851,6 +1855,558 @@ function StashTab({ repoId }: { repoId: UUID }): JSX.Element {
         )}
       </section>
     </main>
+  );
+}
+
+/// Branches tab. Two sections so the local branch landscape and the
+/// on-disk landscape don't visually blur together:
+///
+///   1. Local branches — every refs/heads ref, annotated with the
+///      worktree that has it checked out (if any). Clicking a row
+///      switches the main repo when the branch isn't owned by some
+///      other worktree; if it IS owned, the row links to the owning
+///      path so the user can either jump to it on disk or adopt it
+///      back into the main checkout via the linked worktree's
+///      "Switch main repo here" affordance.
+///
+///   2. Linked worktrees — siblings of the main checkout (`!isMain`).
+///      The main repo itself is omitted because it's the directory the
+///      user is already looking at; rendering it here just adds noise.
+function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
+  const wts = useStore((s) => s.workspaceWorktrees[repoId]);
+  const repoPath = useStore((s) => s.repos.find((r) => r.id === repoId)?.path);
+  const branches = useStore((s) => s.repoBranchSummaries[repoId]);
+  const refreshWorktrees = useStore((s) => s.refreshRepoWorktrees);
+  const refreshBranches = useStore((s) => s.refreshRepoBranchSummaries);
+  const checkoutRepo = useStore((s) => s.checkoutRepo);
+  const pruneWorktrees = useStore((s) => s.pruneWorktrees);
+  const [busy, setBusy] = useState(false);
+  const [pruning, setPruning] = useState(false);
+  const [switching, setSwitching] = useState<string | null>(null);
+
+  useEffect(() => {
+    void refreshWorktrees(repoId);
+    void refreshBranches(repoId);
+  }, [refreshWorktrees, refreshBranches, repoId]);
+
+  const onRefresh = async () => {
+    setBusy(true);
+    try {
+      await Promise.all([refreshWorktrees(repoId), refreshBranches(repoId)]);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const linked = useMemo(() => (wts ?? []).filter((w) => !w.isMain), [wts]);
+  // branchName → worktree path that owns it. Used to annotate branch
+  // rows and decide whether a click should switch or just navigate.
+  const ownership = useMemo(() => {
+    const m = new Map<string, Worktree>();
+    for (const w of wts ?? []) if (w.branch) m.set(w.branch, w);
+    return m;
+  }, [wts]);
+
+  const localBranches = useMemo(
+    () => (branches ?? []).filter((b) => b.kind === 'local'),
+    [branches],
+  );
+
+  const hasPrunable = useMemo(() => (wts ?? []).some((w) => w.prunable), [wts]);
+
+  const onSwitchBranch = async (name: string) => {
+    setSwitching(name);
+    try {
+      const out = await checkoutRepo(repoId, name, false);
+      if (out.result === 'dirty') {
+        alert(`Can't switch to ${name}: working tree is dirty. Stash or commit first.`);
+      } else if (out.result === 'error' || out.result === 'missing-branch') {
+        alert(out.message ?? 'Checkout failed');
+      }
+    } finally {
+      setSwitching(null);
+    }
+  };
+
+  const onPrune = async () => {
+    if (
+      !window.confirm(
+        'Run `git worktree prune`? Removes administrative records for worktrees whose directories were deleted manually. Safe — it never touches files on disk.',
+      )
+    )
+      return;
+    setPruning(true);
+    try {
+      const res = await pruneWorktrees(repoId);
+      if (!res.ok) alert(res.error ?? 'Prune failed');
+      else if (res.output) alert(`Pruned:\n${res.output}`);
+    } finally {
+      setPruning(false);
+    }
+  };
+
+  return (
+    <main className="flex-1 overflow-y-auto p-6 flex flex-col gap-6">
+      <header className="flex items-baseline justify-between">
+        <div>
+          <h2 className="text-sm font-semibold">Branches</h2>
+          <p className="text-[11px] text-ink-faint">
+            Local branches you can switch to, plus any linked worktrees that have a branch
+            checked out elsewhere on disk.
+          </p>
+        </div>
+        <button
+          onClick={onRefresh}
+          disabled={busy}
+          className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+        >
+          {busy ? 'Refreshing…' : 'Refresh'}
+        </button>
+      </header>
+
+      <section className="flex flex-col gap-2">
+        <div className="flex items-baseline justify-between">
+          <h3 className="text-[10px] uppercase tracking-wide text-ink-faint">
+            Local branches ({localBranches.length})
+          </h3>
+          <span className="text-[10px] text-ink-faint">click to switch · ⎇ marks current</span>
+        </div>
+        {branches === undefined ? (
+          <div className="text-xs text-ink-faint">Loading…</div>
+        ) : localBranches.length === 0 ? (
+          <div className="text-xs text-ink-faint p-3 rounded border border-card bg-card">
+            No local branches.
+          </div>
+        ) : (
+          <ul className="flex flex-col gap-1">
+            {localBranches.map((b) => (
+              <BranchSwitchRow
+                key={b.name}
+                name={b.shortName}
+                isCurrent={b.isCurrent}
+                subject={b.subject}
+                shortSha={b.shortSha}
+                ownedBy={ownership.get(b.shortName)}
+                isMainCheckout={
+                  ownership.get(b.shortName)?.isMain ?? false
+                }
+                disabled={switching !== null}
+                pending={switching === b.shortName}
+                onSwitch={() => onSwitchBranch(b.shortName)}
+              />
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="flex flex-col gap-2">
+        <div className="flex items-baseline justify-between">
+          <h3 className="text-[10px] uppercase tracking-wide text-ink-faint">
+            Linked worktrees ({linked.length})
+          </h3>
+          <div className="flex items-center gap-2">
+            {hasPrunable && (
+              <span className="text-[10px] text-red-400">stale entries detected</span>
+            )}
+            <button
+              onClick={onPrune}
+              disabled={pruning}
+              title="Clean up administrative records for worktrees whose directories were deleted on disk"
+              className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-surface-elevated disabled:opacity-50"
+            >
+              {pruning ? 'Pruning…' : 'Prune missing'}
+            </button>
+          </div>
+        </div>
+        {wts === undefined ? (
+          <div className="text-xs text-ink-faint">Loading…</div>
+        ) : linked.length === 0 ? (
+          <div className="text-xs text-ink-faint p-3 rounded border border-card bg-card">
+            No linked worktrees. Add one from the terminal:{' '}
+            <code className="px-1 rounded bg-surface-elevated font-mono">
+              git worktree add ../{'<dir>'} {'<branch>'}
+            </code>
+          </div>
+        ) : (
+          <ul className="flex flex-col gap-1.5">
+            {linked.map((w) => (
+              <WorktreeRow key={w.path} repoId={repoId} repoPath={repoPath} worktree={w} />
+            ))}
+          </ul>
+        )}
+      </section>
+    </main>
+  );
+}
+
+function BranchSwitchRow({
+  name,
+  isCurrent,
+  subject,
+  shortSha,
+  ownedBy,
+  isMainCheckout,
+  disabled,
+  pending,
+  onSwitch,
+}: {
+  name: string;
+  isCurrent: boolean;
+  subject: string;
+  shortSha: string;
+  ownedBy: Worktree | undefined;
+  isMainCheckout: boolean;
+  disabled: boolean;
+  pending: boolean;
+  onSwitch: () => void;
+}): JSX.Element {
+  // A branch is switchable from this row only if no *linked* worktree
+  // owns it. If the main repo owns it, that's the current branch (or a
+  // branch the main repo just had — git allows main to switch off then
+  // back). If a linked worktree owns it, the user has to use the
+  // worktree row's "Switch main repo here" affordance instead, since
+  // git refuses to check out a branch that's already in use.
+  const ownedByLinked = ownedBy !== undefined && !isMainCheckout;
+  return (
+    <li
+      className={`flex items-center gap-3 px-3 py-1.5 rounded border ${
+        isCurrent ? 'border-accent/40 bg-accent/[0.04]' : 'border-card bg-card'
+      }`}
+    >
+      <span
+        className={`font-mono text-[11px] w-3 ${isCurrent ? 'text-accent' : 'text-ink-faint'}`}
+        title={isCurrent ? 'Current branch in main checkout' : ''}
+      >
+        {isCurrent ? '⎇' : ''}
+      </span>
+      <span className="font-mono text-sm truncate flex-1" title={name}>
+        {name}
+      </span>
+      <span className="text-[11px] text-ink-faint truncate max-w-[40%]" title={subject}>
+        {subject}
+      </span>
+      <span className="text-[11px] text-ink-faint font-mono">{shortSha}</span>
+      {ownedByLinked ? (
+        <span
+          className="text-[11px] text-amber-400 font-mono truncate max-w-[40%]"
+          title={`This branch is checked out at ${ownedBy!.path}. Use that row's "Switch main repo here" to bring it back.`}
+        >
+          owned by {ownedBy!.path}
+        </span>
+      ) : isCurrent ? (
+        <span className="text-[11px] text-ink-faint">on this checkout</span>
+      ) : (
+        <button
+          onClick={onSwitch}
+          disabled={disabled}
+          className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-surface-elevated disabled:opacity-50"
+        >
+          {pending ? 'Switching…' : 'Switch'}
+        </button>
+      )}
+    </li>
+  );
+}
+
+function WorktreeRow({
+  repoId,
+  repoPath,
+  worktree: w,
+}: {
+  repoId: UUID;
+  repoPath: string | undefined;
+  worktree: Worktree;
+}): JSX.Element {
+  const adopt = useStore((s) => s.adoptWorktreeBranch);
+  const removeWt = useStore((s) => s.removeWorktree);
+  type Mode = null | 'adopt' | 'remove';
+  // Three ways to handle a potentially-dirty worktree on adopt. `clean`
+  // assumes nothing's there to deal with; `commit` keeps the work as a
+  // commit on the worktree's branch; `discard` drops it.
+  type DirtyMode = 'clean' | 'commit' | 'discard';
+  const [mode, setMode] = useState<Mode>(null);
+  const [dirtyMode, setDirtyMode] = useState<DirtyMode>('commit');
+  const [commitMessage, setCommitMessage] = useState('');
+  // Used only by the standalone Remove panel; the adopt panel routes
+  // discard through `dirtyMode === 'discard'` instead.
+  const [forceRemove, setForceRemove] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<{ step: string; message: string } | null>(null);
+
+  const canAdopt = !w.isMain && w.branch !== null;
+
+  const reset = () => {
+    setMode(null);
+    setDirtyMode('commit');
+    setCommitMessage('');
+    setForceRemove(false);
+    setError(null);
+  };
+
+  const onAdopt = async () => {
+    if (dirtyMode === 'commit' && !commitMessage.trim()) {
+      setError({ step: 'precheck', message: 'Commit message required' });
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await adopt(
+        repoId,
+        w.path,
+        w.branch!,
+        dirtyMode === 'discard',
+        dirtyMode === 'commit' ? commitMessage.trim() : undefined,
+      );
+      if (!res.ok) {
+        setError({ step: res.step, message: res.error });
+        return;
+      }
+      // Success: the row this lives on is about to disappear since the
+      // worktree no longer exists. The parent's refresh-on-action will
+      // re-render without it.
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onRemove = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await removeWt(repoId, w.path, forceRemove);
+      if (!res.ok) {
+        setError({ step: 'remove', message: res.error ?? 'Remove failed' });
+        return;
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <li className="flex flex-col gap-1 px-3 py-2 rounded border border-card bg-card">
+      <div className="flex items-center gap-2">
+        <span className="text-sm font-mono truncate flex-1" title={w.path}>
+          {w.path}
+        </span>
+        {w.isMain && (
+          <span
+            className="text-[10px] uppercase tracking-wide text-accent"
+            title="The original clone — owns the .git directory"
+          >
+            main
+          </span>
+        )}
+        {w.locked && (
+          <span
+            className="text-[10px] uppercase tracking-wide text-amber-400"
+            title="git worktree lock — protected from prune"
+          >
+            locked
+          </span>
+        )}
+        {w.prunable && (
+          <span
+            className="text-[10px] uppercase tracking-wide text-red-400"
+            title="missing on disk — run `git worktree prune` to clean up"
+          >
+            prunable
+          </span>
+        )}
+        <button
+          onClick={() => void navigator.clipboard.writeText(w.path)}
+          title="Copy path"
+          className="text-[11px] text-ink-faint hover:text-ink px-2 py-0.5 rounded hover:bg-surface-elevated"
+        >
+          copy
+        </button>
+        {canAdopt && mode === null && (
+          <button
+            onClick={() => {
+              setMode('adopt');
+              setForceRemove(false);
+              setError(null);
+            }}
+            title={`Remove the linked worktree at ${w.path} and check out ${w.branch} in the main repo`}
+            className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-surface-elevated"
+          >
+            Switch main repo here
+          </button>
+        )}
+        {!w.isMain && mode === null && (
+          <button
+            onClick={() => {
+              setMode('remove');
+              setForceRemove(false);
+              setError(null);
+            }}
+            title={`git worktree remove ${w.path}`}
+            className="text-[11px] px-2 py-0.5 rounded border border-card text-red-400 hover:bg-red-500/10"
+          >
+            Remove
+          </button>
+        )}
+      </div>
+      <div className="flex items-center gap-3 text-[11px] text-ink-faint font-mono">
+        <span className={w.branch ? 'text-ink-muted' : 'text-amber-400'}>
+          {w.branch ?? '(detached)'}
+        </span>
+        {w.head && <span>{w.head.slice(0, 10)}</span>}
+        {repoPath && w.path !== repoPath && (
+          <span className="text-ink-faint">linked from {repoPath}</span>
+        )}
+      </div>
+      {mode === 'adopt' && canAdopt && (
+        <div className="mt-1 p-3 rounded border border-amber-700/40 bg-amber-500/[0.04] flex flex-col gap-2 text-[11px]">
+          <div>
+            <span className="font-medium text-ink">Switch main repo to {w.branch}?</span> This will
+            remove the linked checkout at <code className="font-mono">{w.path}</code> and then{' '}
+            <code className="font-mono px-1 rounded bg-card">git switch {w.branch}</code> in the
+            main repo. The main repo must be clean.
+          </div>
+          <fieldset className="flex flex-col gap-1.5 mt-1">
+            <legend className="text-[10px] uppercase tracking-wide text-ink-faint">
+              If the worktree has uncommitted changes
+            </legend>
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="radio"
+                name={`dirty-${w.path}`}
+                checked={dirtyMode === 'commit'}
+                onChange={() => setDirtyMode('commit')}
+                disabled={busy}
+                className="mt-0.5"
+              />
+              <div className="flex-1">
+                <div>Commit them on {w.branch} first, then switch</div>
+                <div className="text-[10px] text-ink-faint">
+                  `git add -A` + commit inside the worktree before remove. No-op if it's clean.
+                </div>
+              </div>
+            </label>
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="radio"
+                name={`dirty-${w.path}`}
+                checked={dirtyMode === 'discard'}
+                onChange={() => setDirtyMode('discard')}
+                disabled={busy}
+                className="mt-0.5"
+              />
+              <div className="flex-1">
+                <div>Discard them (force remove)</div>
+                <div className="text-[10px] text-ink-faint">
+                  `git worktree remove --force` — uncommitted edits in the worktree are lost.
+                </div>
+              </div>
+            </label>
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="radio"
+                name={`dirty-${w.path}`}
+                checked={dirtyMode === 'clean'}
+                onChange={() => setDirtyMode('clean')}
+                disabled={busy}
+                className="mt-0.5"
+              />
+              <div className="flex-1">
+                <div>Assume it's clean</div>
+                <div className="text-[10px] text-ink-faint">
+                  Plain `git worktree remove` — fails loudly if anything's dirty.
+                </div>
+              </div>
+            </label>
+          </fieldset>
+          {dirtyMode === 'commit' && (
+            <input
+              value={commitMessage}
+              onChange={(e) => setCommitMessage(e.target.value)}
+              disabled={busy}
+              placeholder={`Commit message (only used if ${w.path} is dirty)`}
+              className="field px-2 py-1.5 text-xs"
+            />
+          )}
+          {error && (
+            <div className="text-red-400">
+              {error.step === 'precheck'
+                ? 'Cannot start: '
+                : error.step === 'commit'
+                  ? 'Commit in worktree failed: '
+                  : error.step === 'remove'
+                    ? 'Worktree remove failed: '
+                    : 'Branch switch failed: '}
+              {error.message}
+            </div>
+          )}
+          <div className="flex gap-2 justify-end">
+            <button
+              onClick={reset}
+              disabled={busy}
+              className="px-3 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={onAdopt}
+              disabled={busy}
+              className="px-3 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+            >
+              {busy
+                ? 'Switching…'
+                : dirtyMode === 'commit'
+                  ? `Commit & switch to ${w.branch}`
+                  : `Switch to ${w.branch}`}
+            </button>
+          </div>
+        </div>
+      )}
+      {mode === 'remove' && (
+        <div className="mt-1 p-3 rounded border border-red-700/40 bg-red-500/[0.04] flex flex-col gap-2 text-[11px]">
+          <div>
+            <span className="font-medium text-ink">Remove this worktree?</span>{' '}
+            <code className="font-mono px-1 rounded bg-card">git worktree remove {w.path}</code>{' '}
+            unregisters the checkout and deletes the directory. The branch{' '}
+            {w.branch ? (
+              <>
+                <code className="font-mono">{w.branch}</code> stays available; you can re-add the
+                worktree later.
+              </>
+            ) : (
+              <>(detached HEAD) is unaffected, but anything not committed is lost.</>
+            )}
+          </div>
+          <label className="flex items-center gap-2 cursor-pointer text-ink-muted">
+            <input
+              type="checkbox"
+              checked={forceRemove}
+              onChange={(e) => setForceRemove(e.target.checked)}
+              disabled={busy}
+            />
+            <span>
+              Force (discard uncommitted changes in <code className="font-mono">{w.path}</code>)
+            </span>
+          </label>
+          {error && <div className="text-red-400">{error.message}</div>}
+          <div className="flex gap-2 justify-end">
+            <button
+              onClick={reset}
+              disabled={busy}
+              className="px-3 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={onRemove}
+              disabled={busy}
+              className="px-3 py-1 rounded bg-red-500 text-white hover:bg-red-600 disabled:opacity-50"
+            >
+              {busy ? 'Removing…' : 'Remove worktree'}
+            </button>
+          </div>
+        </div>
+      )}
+    </li>
   );
 }
 

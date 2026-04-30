@@ -13,6 +13,7 @@ import type {
   RepoStatus,
   UUID,
   Workspace,
+  Worktree,
 } from '@shared/types';
 import { SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH } from '@shared/types';
 
@@ -24,6 +25,7 @@ import { SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH } from '@shared/types';
 // across renders when there's no entry yet.
 const EMPTY_STATUSES: RepoStatus[] = [];
 const EMPTY_PRS: RepoPRs[] = [];
+const EMPTY_WORKTREES: Worktree[] = [];
 
 export function App(): JSX.Element {
   const { loaded, hydrate } = useStore();
@@ -182,12 +184,12 @@ function useGlobalShortcuts(): void {
         setSheet({ kind: 'newBranchInWorkspace', workspaceId: selectedWsId });
         return;
       }
-      // Cmd+1..4 dispatch a custom event that RepoDetail listens for.
+      // Cmd+1..5 dispatch a custom event that RepoDetail listens for.
       // Done this way so the shortcut works regardless of focus and
       // doesn't require lifting tab state into the global store.
-      if (selectedRepoId && /^[1-4]$/.test(e.key)) {
+      if (selectedRepoId && /^[1-5]$/.test(e.key)) {
         e.preventDefault();
-        const tabs = ['changes', 'history', 'files', 'stash'] as const;
+        const tabs = ['changes', 'history', 'files', 'stash', 'branches'] as const;
         window.dispatchEvent(
           new CustomEvent('overgit:setRepoTab', {
             detail: tabs[Number.parseInt(e.key, 10) - 1],
@@ -510,6 +512,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
   const cli = useStore((s) => s.cliPresence);
   const refresh = useStore((s) => s.refreshWorkspaceStatus);
   const refreshPRs = useStore((s) => s.refreshWorkspacePRs);
+  const refreshWorktrees = useStore((s) => s.refreshWorkspaceWorktrees);
   const fetchWs = useStore((s) => s.fetchWorkspace);
   const checkout = useStore((s) => s.checkoutWorkspaceBranch);
   const selectRepo = useStore((s) => s.selectRepo);
@@ -522,7 +525,8 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
   useEffect(() => {
     refresh(workspaceId);
     refreshPRs(workspaceId);
-  }, [refresh, refreshPRs, workspaceId]);
+    refreshWorktrees(workspaceId);
+  }, [refresh, refreshPRs, refreshWorktrees, workspaceId]);
 
   // Overview tiles, computed BEFORE any early return so React's hook
   // order stays stable. The previous version put this useMemo after
@@ -566,6 +570,18 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
             className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
           >
             + New branch
+          </button>
+          <button
+            onClick={() => setSheet({ kind: 'commitAllInWorkspace', workspaceId })}
+            disabled={summary.dirty === 0}
+            title={
+              summary.dirty === 0
+                ? 'Nothing to commit — all repos are clean'
+                : `Stage and commit every dirty repo with a shared message (${summary.dirty} dirty)`
+            }
+            className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+          >
+            Commit all
           </button>
           <button
             onClick={() => setSheet({ kind: 'editWorkspace', workspaceId })}
@@ -701,17 +717,20 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
             return (
               <li
                 key={id}
-                className="flex items-center gap-3 px-3 py-2 rounded border border-card bg-card"
+                className="flex flex-col gap-1.5 px-3 py-2 rounded border border-card bg-card"
               >
-                <button
-                  onClick={() => selectRepo(id)}
-                  className="min-w-0 flex-1 text-left hover:underline"
-                  title="Open repo detail"
-                >
-                  <div className="text-sm font-medium truncate">{repo?.name ?? id}</div>
-                  <div className="text-[11px] text-ink-faint truncate font-mono">{repo?.path}</div>
-                </button>
-                <StatusCell status={st} />
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={() => selectRepo(id)}
+                    className="min-w-0 flex-1 text-left hover:underline"
+                    title="Open repo detail"
+                  >
+                    <div className="text-sm font-medium truncate">{repo?.name ?? id}</div>
+                    <div className="text-[11px] text-ink-faint truncate font-mono">{repo?.path}</div>
+                  </button>
+                  <StatusCell status={st} />
+                </div>
+                <WorktreeList repoId={id} mainPath={repo?.path} />
               </li>
             );
           })}
@@ -920,6 +939,49 @@ function PRSection({
         </p>
       )}
     </section>
+  );
+}
+
+/// Inline list of *additional* git worktrees for a repo. Hidden when
+/// the repo has only one worktree (the common case) so we don't waste
+/// screen real-estate. The main worktree is omitted from the rendered
+/// list because it's already represented by the row this lives under;
+/// showing it again is redundant and confusing.
+function WorktreeList({
+  repoId,
+  mainPath,
+}: {
+  repoId: UUID;
+  mainPath: string | undefined;
+}): JSX.Element | null {
+  const wts = useStore((s) => s.workspaceWorktrees[repoId] ?? EMPTY_WORKTREES);
+  const siblings = useMemo(() => wts.filter((w) => !w.isMain), [wts]);
+  if (siblings.length === 0) return null;
+  return (
+    <ul className="flex flex-col gap-0.5 pl-3 border-l border-card ml-1">
+      <li className="text-[10px] uppercase tracking-wide text-ink-faint">
+        {siblings.length} additional {siblings.length === 1 ? 'worktree' : 'worktrees'}
+      </li>
+      {siblings.map((w) => (
+        <li
+          key={w.path}
+          className="flex items-center gap-2 text-[11px] text-ink-faint font-mono"
+          title={w.path}
+        >
+          <span className="text-ink-faint/60">└</span>
+          <span className="truncate flex-1">
+            {mainPath && w.path.startsWith(mainPath) ? '.' + w.path.slice(mainPath.length) : w.path}
+          </span>
+          <span className={w.branch ? 'text-ink-muted' : 'text-amber-400'}>
+            {w.branch ?? '(detached)'}
+          </span>
+          {w.locked && <span className="text-amber-400" title="git worktree lock">🔒</span>}
+          {w.prunable && (
+            <span className="text-red-400" title="missing on disk — git worktree prune">✗</span>
+          )}
+        </li>
+      ))}
+    </ul>
   );
 }
 

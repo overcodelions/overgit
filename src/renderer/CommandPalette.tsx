@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import type { KeyboardEvent as ReactKeyboardEvent, Ref } from 'react';
 import { useStore } from './store';
 import type { BranchSummary, Repo, UUID, Workspace } from '@shared/types';
 
@@ -69,6 +70,10 @@ export function CommandPalette(): JSX.Element | null {
   const [activeIdx, setActiveIdx] = useState(0);
   const [busy, setBusy] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const activeRowRef = useRef<HTMLButtonElement | null>(null);
+  const activeIdxRef = useRef(activeIdx);
+  const busyRef = useRef(busy);
+  const flatRef = useRef<PaletteItem[]>([]);
 
   // Reset query and ensure derived data is fresh whenever the palette
   // opens. The branch / file / changes caches may be cold for a repo
@@ -78,12 +83,16 @@ export function CommandPalette(): JSX.Element | null {
     if (!open) return;
     setQuery('');
     setActiveIdx(0);
-    inputRef.current?.focus();
+    // Defer focus past the commit so the input is attached before we
+    // steal focus. Some Electron renderers otherwise leave keystrokes on
+    // whatever was focused before the palette opened.
+    const id = requestAnimationFrame(() => inputRef.current?.focus());
     if (selectedRepoId) {
       refreshSummaries(selectedRepoId);
       refreshFileList(selectedRepoId);
       refreshChanges(selectedRepoId);
     }
+    return () => cancelAnimationFrame(id);
   }, [open, selectedRepoId, refreshSummaries, refreshFileList, refreshChanges]);
 
   const sections = useMemo(
@@ -144,49 +153,80 @@ export function CommandPalette(): JSX.Element | null {
 
   const flat = useMemo(() => sections.flatMap((s) => s.items), [sections]);
 
+  useEffect(() => {
+    activeIdxRef.current = activeIdx;
+  }, [activeIdx]);
+
+  useEffect(() => {
+    busyRef.current = busy;
+  }, [busy]);
+
+  useEffect(() => {
+    flatRef.current = flat;
+  }, [flat]);
+
   // Keep the keyboard cursor inside the visible list as it shrinks.
   useEffect(() => {
     if (activeIdx >= flat.length) setActiveIdx(Math.max(0, flat.length - 1));
   }, [flat.length, activeIdx]);
 
-  // Esc closes; outside-click closes; Enter runs the active item.
   useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
+    activeRowRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [activeIdx]);
+
+  const handlePaletteKey = useCallback(
+    (e: KeyboardEvent | ReactKeyboardEvent) => {
+      const key = keyName(e);
+      if (key === 'Escape') {
+        stopKeyboardEvent(e);
         close(false);
+        return;
       }
+      if (key === 'ArrowDown') {
+        stopKeyboardEvent(e);
+        setActiveIdx((i) => Math.min(Math.max(0, flatRef.current.length - 1), i + 1));
+        return;
+      }
+      if (key === 'ArrowUp') {
+        stopKeyboardEvent(e);
+        setActiveIdx((i) => Math.max(0, i - 1));
+        return;
+      }
+      if (key === 'Enter') {
+        stopKeyboardEvent(e);
+        const item = flatRef.current[activeIdxRef.current];
+        if (!item || busyRef.current) return;
+        busyRef.current = true;
+        setBusy(true);
+        void Promise.resolve(item.perform()).finally(() => {
+          busyRef.current = false;
+          setBusy(false);
+        });
+      }
+    },
+    [close],
+  );
+
+  // Handle palette navigation before app-wide shortcuts and before the
+  // input's default cursor handling. Electron can leave focus outside
+  // the modal for a frame, so we listen on both global capture targets
+  // and keep a React capture handler on the palette as a local fallback.
+  useLayoutEffect(() => {
+    if (!open) return;
+    window.addEventListener('keydown', handlePaletteKey, true);
+    document.addEventListener('keydown', handlePaletteKey, true);
+    return () => {
+      window.removeEventListener('keydown', handlePaletteKey, true);
+      document.removeEventListener('keydown', handlePaletteKey, true);
     };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [open, close]);
+  }, [open, handlePaletteKey]);
 
   if (!open) return null;
-
-  const onKey = async (e: React.KeyboardEvent) => {
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      setActiveIdx((i) => Math.min(flat.length - 1, i + 1));
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      setActiveIdx((i) => Math.max(0, i - 1));
-    } else if (e.key === 'Enter') {
-      e.preventDefault();
-      const item = flat[activeIdx];
-      if (!item) return;
-      setBusy(true);
-      try {
-        await item.perform();
-      } finally {
-        setBusy(false);
-      }
-    }
-  };
 
   return (
     <div
       className="fixed inset-0 z-50 flex items-start justify-center pt-[14vh] bg-black/40 backdrop-blur-sm"
+      onKeyDownCapture={handlePaletteKey}
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) close(false);
       }}
@@ -201,7 +241,6 @@ export function CommandPalette(): JSX.Element | null {
               setQuery(e.target.value);
               setActiveIdx(0);
             }}
-            onKeyDown={onKey}
             disabled={busy}
             placeholder={
               selectedRepoId
@@ -230,6 +269,7 @@ export function CommandPalette(): JSX.Element | null {
                       item={it}
                       active={idx === activeIdx}
                       busy={busy}
+                      buttonRef={idx === activeIdx ? activeRowRef : undefined}
                       onClick={async () => {
                         setActiveIdx(idx);
                         setBusy(true);
@@ -275,20 +315,27 @@ function PaletteRow({
   busy,
   onClick,
   onHover,
+  buttonRef,
 }: {
   item: PaletteItem;
   active: boolean;
   busy: boolean;
   onClick: () => void;
   onHover: () => void;
+  buttonRef?: Ref<HTMLButtonElement>;
 }): JSX.Element {
   return (
     <button
+      ref={buttonRef}
+      type="button"
       onClick={onClick}
       onMouseEnter={onHover}
       disabled={busy}
-      className={`w-full text-left flex items-center gap-2 px-3 py-2 text-sm ${
-        active ? 'bg-accent/15' : ''
+      aria-selected={active}
+      className={`w-full text-left flex items-center gap-2 px-3 py-2 text-sm border-l-2 ${
+        active
+          ? 'bg-accent/15 border-accent text-ink'
+          : 'border-transparent text-ink-muted'
       } disabled:opacity-50`}
     >
       {item.glyph && <span className="text-ink-faint w-4 text-center">{item.glyph}</span>}
@@ -298,6 +345,32 @@ function PaletteRow({
       )}
     </button>
   );
+}
+
+function keyName(e: KeyboardEvent | ReactKeyboardEvent): string {
+  if (e.key === 'Down') return 'ArrowDown';
+  if (e.key === 'Up') return 'ArrowUp';
+  if (e.key === 'Esc') return 'Escape';
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Escape' || e.key === 'Enter') {
+    return e.key;
+  }
+  // Both DOM KeyboardEvent and React's synthetic event have `.code`, so
+  // the union always exposes it — no need to dig through nativeEvent.
+  const code = e.code;
+  if (code === 'ArrowDown' || code === 'ArrowUp' || code === 'Escape' || code === 'Enter') {
+    return code;
+  }
+  return e.key;
+}
+
+function stopKeyboardEvent(e: KeyboardEvent | ReactKeyboardEvent): void {
+  e.preventDefault();
+  e.stopPropagation();
+  if ('stopImmediatePropagation' in e) {
+    e.stopImmediatePropagation();
+  } else {
+    e.nativeEvent.stopImmediatePropagation();
+  }
 }
 
 interface BuildArgs {
@@ -484,6 +557,21 @@ function buildSections(args: BuildArgs): PaletteSection[] {
         actions.close();
       },
     });
+  }
+  if (selectedWsId) {
+    const commitAllWs: PaletteItem = {
+      id: 'commit-all-ws',
+      title: 'Commit all across workspace',
+      hint: 'Shared message · skips detached HEAD',
+      glyph: '✓',
+      perform: () => {
+        actions.setSheet({ kind: 'commitAllInWorkspace', workspaceId: selectedWsId });
+        actions.close();
+      },
+    };
+    if (matches(commitAllWs.title) || (commitAllWs.hint && matches(commitAllWs.hint))) {
+      repoActionItems.push(commitAllWs);
+    }
   }
   if (repoActionItems.length)
     sections.push({ label: selectedRepoId ? 'Repo actions' : 'Actions', items: repoActionItems });

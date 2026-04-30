@@ -11,6 +11,7 @@ import type {
   CheckoutOutcome,
   CliPresence,
   Commit,
+  CommitAllOutcome,
   FileDiff,
   GraphCommit,
   Repo,
@@ -21,6 +22,7 @@ import type {
   StoreSnapshot,
   UUID,
   Workspace,
+  Worktree,
 } from '@shared/types';
 
 /// Sheet (modal) the user has currently open. `null` means no sheet.
@@ -34,6 +36,7 @@ export type Sheet =
   | { kind: 'editWorkspace'; workspaceId: UUID }
   | { kind: 'reviewChanges'; repoId: UUID; scope: 'staged' | 'working' }
   | { kind: 'newBranchInWorkspace'; workspaceId: UUID }
+  | { kind: 'commitAllInWorkspace'; workspaceId: UUID }
   | { kind: 'pullConflict'; repoId: UUID; conflicts: string[]; rawError: string };
 
 interface OpenFile {
@@ -50,6 +53,11 @@ interface UiState {
   selectedRepoId: UUID | null;
   workspaceStatuses: Record<UUID, RepoStatus[]>;
   workspacePRs: Record<UUID, RepoPRs[]>;
+  /// Cached `git worktree list` output per repo. Keyed by repoId, not
+  /// workspaceId, because worktrees belong to repos and the same repo
+  /// can appear in multiple workspaces — caching by workspace would
+  /// duplicate the data and risk drift between views.
+  workspaceWorktrees: Record<UUID, Worktree[]>;
   repoLog: Record<UUID, Commit[]>;
   repoDiff: Record<UUID, { key: string; files: FileDiff[] }>;
   repoChanges: Record<UUID, RepoChanges>;
@@ -88,6 +96,25 @@ interface UiState {
   selectRepo: (id: UUID | null) => void;
   refreshWorkspaceStatus: (id: UUID) => Promise<void>;
   refreshWorkspacePRs: (id: UUID) => Promise<void>;
+  refreshWorkspaceWorktrees: (id: UUID) => Promise<void>;
+  refreshRepoWorktrees: (id: UUID) => Promise<void>;
+  adoptWorktreeBranch: (
+    id: UUID,
+    worktreePath: string,
+    branch: string,
+    forceRemove: boolean,
+    commitMessage?: string,
+  ) => Promise<
+    | { ok: true }
+    | { ok: false; step: 'precheck' | 'commit' | 'remove' | 'checkout'; error: string }
+  >;
+  removeWorktree: (
+    id: UUID,
+    worktreePath: string,
+    force: boolean,
+  ) => Promise<{ ok: boolean; error?: string }>;
+  pruneWorktrees: (id: UUID) => Promise<{ ok: boolean; error?: string; output?: string }>;
+  commitAllWorkspace: (id: UUID, message: string) => Promise<CommitAllOutcome[]>;
   checkoutWorkspaceBranch: (id: UUID, branch: string, createIfMissing: boolean) => Promise<void>;
   fetchWorkspace: (id: UUID) => Promise<void>;
   refreshRepoLog: (id: UUID) => Promise<void>;
@@ -197,6 +224,7 @@ export const useStore = create<UiState>((set, get) => ({
   selectedRepoId: null,
   workspaceStatuses: {},
   workspacePRs: {},
+  workspaceWorktrees: {},
   repoLog: {},
   repoDiff: {},
   repoChanges: {},
@@ -288,6 +316,66 @@ export const useStore = create<UiState>((set, get) => ({
   refreshWorkspacePRs: async (id) => {
     const prs = await window.overgit.invoke('workspace:listPRs', id);
     set({ workspacePRs: { ...get().workspacePRs, [id]: prs } });
+  },
+
+  refreshWorkspaceWorktrees: async (id) => {
+    const rows = await window.overgit.invoke('workspace:worktrees', id);
+    const next = { ...get().workspaceWorktrees };
+    for (const row of rows) next[row.repoId] = row.worktrees;
+    set({ workspaceWorktrees: next });
+  },
+
+  refreshRepoWorktrees: async (id) => {
+    const wts = await window.overgit.invoke('repo:worktrees', id);
+    set({ workspaceWorktrees: { ...get().workspaceWorktrees, [id]: wts } });
+  },
+
+  removeWorktree: async (id, worktreePath, force) => {
+    const res = await window.overgit.invoke('repo:removeWorktree', {
+      repoId: id,
+      worktreePath,
+      force,
+    });
+    if (res.ok) await get().refreshRepoWorktrees(id);
+    return res;
+  },
+
+  pruneWorktrees: async (id) => {
+    const res = await window.overgit.invoke('repo:pruneWorktrees', id);
+    if (res.ok) await get().refreshRepoWorktrees(id);
+    return res;
+  },
+
+  adoptWorktreeBranch: async (id, worktreePath, branch, forceRemove, commitMessage) => {
+    const res = await window.overgit.invoke('repo:adoptWorktreeBranch', {
+      repoId: id,
+      worktreePath,
+      branch,
+      forceRemove,
+      commitMessage,
+    });
+    if (res.ok) {
+      // The worktree is gone and HEAD moved — refresh everything that
+      // could reflect the change.
+      await Promise.all([
+        get().refreshRepoWorktrees(id),
+        get().refreshRepoStatus(id),
+        get().refreshRepoChanges(id),
+        get().refreshRepoBranches(id),
+        get().refreshRepoBranchSummaries(id),
+      ]);
+    }
+    return res;
+  },
+
+  commitAllWorkspace: async (id, message) => {
+    const outcomes = await window.overgit.invoke('workspace:commitAll', {
+      workspaceId: id,
+      message,
+    });
+    // Refresh status so the dirty count drops on each row that committed.
+    await get().refreshWorkspaceStatus(id);
+    return outcomes;
   },
 
   checkoutWorkspaceBranch: async (id, branch, createIfMissing) => {
