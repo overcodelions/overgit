@@ -196,6 +196,14 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
         >
           Push{status?.ahead ? ` ↑${status.ahead}` : ''}
         </button>
+        <RepoExtrasBadges repoId={repoId} />
+        <button
+          onClick={() => setSheet({ kind: 'manageRepo', repoId, tab: 'tags' })}
+          className="text-xs px-2 py-1 rounded text-ink-muted hover:text-ink hover:bg-card"
+          title="Tags, remotes, submodules"
+        >
+          ⋯
+        </button>
       </div>
 
       {pickerOpen && (
@@ -206,6 +214,58 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
         />
       )}
     </header>
+  );
+}
+
+/// Small "this repo has submodules / uses LFS" badges in the header.
+/// Kept passive — clicking opens the Manage sheet to the appropriate
+/// tab. Hidden when neither applies, which is the common case.
+function RepoExtrasBadges({ repoId }: { repoId: UUID }): JSX.Element | null {
+  const setSheet = useStore((s) => s.setSheet);
+  const [submoduleCount, setSubmoduleCount] = useState<number | null>(null);
+  const [lfsEnabled, setLfsEnabled] = useState<boolean>(false);
+  // One-shot probe per repo. The data is cheap and rarely changes
+  // mid-session; a stale badge if the user runs `git submodule add`
+  // outside overgit is acceptable for v1.
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([
+      window.overgit.invoke('repo:listSubmodules', repoId),
+      window.overgit.invoke('repo:lfsStatus', repoId),
+    ]).then(([sm, lfs]) => {
+      if (cancelled) return;
+      setSubmoduleCount(sm.length);
+      setLfsEnabled(lfs.enabled);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [repoId]);
+
+  if (submoduleCount === null) return null;
+  if (submoduleCount === 0 && !lfsEnabled) return null;
+
+  return (
+    <div className="flex items-center gap-1">
+      {submoduleCount > 0 && (
+        <button
+          onClick={() => setSheet({ kind: 'manageRepo', repoId, tab: 'submodules' })}
+          className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-card hover:bg-card text-ink-muted"
+          title={`${submoduleCount} submodule${submoduleCount === 1 ? '' : 's'}`}
+        >
+          ⊕ {submoduleCount}
+        </button>
+      )}
+      {lfsEnabled && (
+        <button
+          onClick={() => setSheet({ kind: 'manageRepo', repoId, tab: 'submodules' })}
+          className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-accent/40 text-accent"
+          title="Repository uses git-lfs"
+        >
+          LFS
+        </button>
+      )}
+    </div>
   );
 }
 

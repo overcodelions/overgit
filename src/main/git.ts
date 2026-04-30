@@ -15,9 +15,13 @@ import {
   FileDiff,
   FileLogCommit,
   GraphCommit,
+  LfsStatus,
   RepoChanges,
   RepoStatus,
+  Remote,
   Stash,
+  Submodule,
+  Tag,
   UUID,
   Worktree,
 } from '../shared/types';
@@ -2012,4 +2016,223 @@ export async function diffFile(
   // exit 0 (no diff) and exit 1 (diff present) are both fine for our purposes.
   if (untracked.code !== 0 && untracked.code !== 1) return [];
   return splitDiff(untracked.stdout).map(parseFileBlock);
+}
+
+// ─── Tags ────────────────────────────────────────────────────────────
+
+/// `git for-each-ref refs/tags/...`. We pass `creatordate` as the sort
+/// key so the renderer can show newest tags first; `creator` /
+/// `creatordate` use the *underlying commit's* metadata for
+/// lightweight tags and the *tag object's* metadata for annotated
+/// tags, which matches what users expect to see ("when did this tag
+/// land").
+const TAG_FORMAT =
+  '%(refname:short)%00%(objecttype)%00%(*objectname)%00%(objectname)%00%(*subject)%00%(subject)%00%(creator)%00%(creatordate:iso-strict)';
+
+export async function listTags(repoPath: string): Promise<Tag[]> {
+  if (!looksLikeRepo(repoPath)) return [];
+  const res = await run(repoPath, [
+    'for-each-ref',
+    `--format=${TAG_FORMAT}`,
+    '--sort=-creatordate',
+    'refs/tags',
+  ]);
+  if (!res.ok) return [];
+  const out: Tag[] = [];
+  for (const line of res.stdout.split('\n')) {
+    if (!line.trim()) continue;
+    const [
+      name,
+      objectType,
+      peeledSha,
+      objectSha,
+      annotatedSubject,
+      lightSubject,
+      creator,
+      creatorDate,
+    ] = line.split('\x00');
+    if (!name) continue;
+    // Annotated tags have objecttype === 'tag', and the *object* fields
+    // hold the underlying commit data (the tag points at the commit
+    // through the tag object). Lightweight tags have objecttype ===
+    // 'commit' and `*object*` fields are empty.
+    const annotated = objectType === 'tag';
+    const sha = annotated ? peeledSha : objectSha;
+    out.push({
+      name,
+      kind: annotated ? 'annotated' : 'lightweight',
+      sha: sha ?? '',
+      shortSha: sha ? sha.slice(0, 7) : '',
+      subject: annotated ? (annotatedSubject ?? '') : (lightSubject ?? ''),
+      tagger: creator ? creator.replace(/\s+\d+\s+[+-]\d{4}.*$/, '').trim() : '',
+      date: creatorDate ?? '',
+    });
+  }
+  return out;
+}
+
+export async function createTag(
+  repoPath: string,
+  args: { name: string; ref: string | null; message: string | null },
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  if (!args.name.trim()) return { ok: false, error: 'Tag name required' };
+  const argv = ['tag'];
+  if (args.message && args.message.trim().length > 0) {
+    // Annotated tag: -a + -m. Wrapping the message in -m ensures git
+    // doesn't drop into the editor in environments where one isn't
+    // available (Electron renderer-launched git can't open $EDITOR).
+    argv.push('-a', '-m', args.message);
+  }
+  argv.push(args.name);
+  if (args.ref) argv.push(args.ref);
+  const res = await run(repoPath, argv);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git tag exited ${res.code}` };
+}
+
+export async function deleteTag(
+  repoPath: string,
+  name: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  const res = await run(repoPath, ['tag', '-d', name]);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git tag -d exited ${res.code}` };
+}
+
+export async function pushTag(
+  repoPath: string,
+  name: string,
+  remote: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  const res = await run(repoPath, ['push', remote, `refs/tags/${name}`]);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git push exited ${res.code}` };
+}
+
+// ─── Remotes ─────────────────────────────────────────────────────────
+
+export async function listRemotes(repoPath: string): Promise<Remote[]> {
+  if (!looksLikeRepo(repoPath)) return [];
+  const res = await run(repoPath, ['remote', '-v']);
+  if (!res.ok) return [];
+  // `remote -v` emits two lines per remote — one for fetch, one for
+  // push: `<name>\t<url> (fetch|push)`. We collapse them by name.
+  const byName = new Map<string, { fetchUrl: string; pushUrl: string }>();
+  for (const line of res.stdout.split('\n')) {
+    const m = /^(\S+)\s+(\S+)\s+\((fetch|push)\)$/.exec(line);
+    if (!m) continue;
+    const [, name, url, kind] = m;
+    const entry = byName.get(name) ?? { fetchUrl: '', pushUrl: '' };
+    if (kind === 'fetch') entry.fetchUrl = url;
+    else entry.pushUrl = url;
+    byName.set(name, entry);
+  }
+  return [...byName.entries()].map(([name, urls]) => ({ name, ...urls }));
+}
+
+export async function addRemote(
+  repoPath: string,
+  name: string,
+  url: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  const res = await run(repoPath, ['remote', 'add', name, url]);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git remote add exited ${res.code}` };
+}
+
+export async function removeRemote(
+  repoPath: string,
+  name: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  const res = await run(repoPath, ['remote', 'remove', name]);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git remote remove exited ${res.code}` };
+}
+
+export async function setRemoteUrl(
+  repoPath: string,
+  name: string,
+  url: string,
+  kind: 'fetch' | 'push',
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  const argv = ['remote', 'set-url'];
+  if (kind === 'push') argv.push('--push');
+  argv.push(name, url);
+  const res = await run(repoPath, argv);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git remote set-url exited ${res.code}` };
+}
+
+// ─── Submodules ──────────────────────────────────────────────────────
+
+/// `git submodule status` emits `<state-char><sha> <path> (<describe>)`
+/// per row. Trailing `(...)` is omitted for uninitialized submodules,
+/// so we tolerate its absence.
+export async function listSubmodules(repoPath: string): Promise<Submodule[]> {
+  if (!looksLikeRepo(repoPath)) return [];
+  // `--recursive` would walk nested submodules too, but they should be
+  // managed at their own repo level — flat is what the user expects.
+  const res = await run(repoPath, ['submodule', 'status']);
+  if (!res.ok || !res.stdout.trim()) return [];
+  const out: Submodule[] = [];
+  for (const line of res.stdout.split('\n')) {
+    if (!line.trim()) continue;
+    const stateChar = line[0];
+    const rest = line.slice(1);
+    // Split on the first whitespace; the path can contain spaces but
+    // the sha is always 40 hex chars, so we anchor on length instead.
+    const sha = rest.slice(0, 40);
+    const tail = rest.slice(40).trimStart();
+    const describeIdx = tail.lastIndexOf('(');
+    const path =
+      describeIdx >= 0 ? tail.slice(0, describeIdx).trim() : tail.trim();
+    const describe =
+      describeIdx >= 0 ? tail.slice(describeIdx + 1).replace(/\)\s*$/, '') : '';
+    const state: Submodule['state'] =
+      stateChar === ' '
+        ? 'up-to-date'
+        : stateChar === '+'
+          ? 'modified'
+          : stateChar === 'U'
+            ? 'conflict'
+            : 'uninitialized';
+    out.push({
+      path,
+      sha,
+      shortSha: sha.slice(0, 7),
+      describe,
+      state,
+    });
+  }
+  return out;
+}
+
+// ─── LFS ─────────────────────────────────────────────────────────────
+
+/// Best-effort LFS detection: look for `filter=lfs` in `.gitattributes`
+/// at the repo root. We don't recurse into per-directory attributes
+/// files — projects that use LFS almost always declare their patterns
+/// at the root, and this keeps the probe O(1).
+export async function lfsStatus(repoPath: string): Promise<LfsStatus> {
+  if (!looksLikeRepo(repoPath)) return { enabled: false, patternCount: 0 };
+  try {
+    const file = path.join(repoPath, '.gitattributes');
+    if (!fs.existsSync(file)) return { enabled: false, patternCount: 0 };
+    const text = await fs.promises.readFile(file, 'utf8');
+    let patternCount = 0;
+    for (const line of text.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      if (trimmed.includes('filter=lfs')) patternCount += 1;
+    }
+    return { enabled: patternCount > 0, patternCount };
+  } catch {
+    return { enabled: false, patternCount: 0 };
+  }
 }

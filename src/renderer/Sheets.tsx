@@ -4,10 +4,14 @@ import type {
   BlameLine,
   CommitAllOutcome,
   FileLogCommit,
+  LfsStatus,
   LlmTool,
+  Remote,
   Repo,
   ReviewResult,
+  Submodule,
   SyncAndBranchOutcome,
+  Tag,
   UUID,
   WorkspaceDiffTruncation,
   WorkspaceOpenPROutcome,
@@ -50,7 +54,9 @@ export function SheetHost(): JSX.Element | null {
                   ? 'w-[680px] max-w-[92vw] max-h-[80vh]'
                   : sheet.kind === 'fileHistory'
                     ? 'w-[860px] max-w-[94vw] h-[82vh]'
-                    : 'w-[640px] max-w-[90vw] max-h-[80vh]'
+                    : sheet.kind === 'manageRepo'
+                      ? 'w-[720px] max-w-[92vw] h-[78vh]'
+                      : 'w-[640px] max-w-[90vw] max-h-[80vh]'
         }`}
       >
         {sheet.kind === 'settings' && <SettingsSheet />}
@@ -80,6 +86,9 @@ export function SheetHost(): JSX.Element | null {
             path={sheet.path}
             initialTab={sheet.tab}
           />
+        )}
+        {sheet.kind === 'manageRepo' && (
+          <ManageRepoSheet repoId={sheet.repoId} initialTab={sheet.tab} />
         )}
         {sheet.kind === 'pullConflict' && (
           <PullConflictSheet
@@ -2600,6 +2609,489 @@ function formatDateShort(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toISOString().slice(0, 10);
+}
+
+/// Repo-scoped management surface — three loosely-related domains
+/// (tags, remotes, submodules) consolidated in one sheet because each
+/// one alone is too small to justify its own entry point. LFS status
+/// shows up as a footer badge inside the Submodules tab; LFS doesn't
+/// have any per-LFS-pattern operations worth a dedicated tab in v1.
+function ManageRepoSheet({
+  repoId,
+  initialTab,
+}: {
+  repoId: UUID;
+  initialTab: 'tags' | 'remotes' | 'submodules';
+}): JSX.Element {
+  const repo = useStore((s) => s.repos.find((r) => r.id === repoId));
+  const setSheet = useStore((s) => s.setSheet);
+  const [tab, setTab] = useState(initialTab);
+
+  return (
+    <>
+      <SheetHeader
+        title={`Manage · ${repo?.name ?? ''}`}
+        onClose={() => setSheet(null)}
+      />
+      <div className="flex-shrink-0 px-5 border-b border-card flex gap-2">
+        <FileHistoryTab label="Tags" active={tab === 'tags'} onClick={() => setTab('tags')} />
+        <FileHistoryTab
+          label="Remotes"
+          active={tab === 'remotes'}
+          onClick={() => setTab('remotes')}
+        />
+        <FileHistoryTab
+          label="Submodules"
+          active={tab === 'submodules'}
+          onClick={() => setTab('submodules')}
+        />
+      </div>
+      <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
+        {tab === 'tags' && <TagsPane repoId={repoId} />}
+        {tab === 'remotes' && <RemotesPane repoId={repoId} />}
+        {tab === 'submodules' && <SubmodulesPane repoId={repoId} />}
+      </div>
+    </>
+  );
+}
+
+function TagsPane({ repoId }: { repoId: UUID }): JSX.Element {
+  const pushToast = useStore((s) => s.pushToast);
+  const requestConfirm = useStore((s) => s.requestConfirm);
+  const [tags, setTags] = useState<Tag[] | null>(null);
+  const [name, setName] = useState('');
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const refresh = async () => {
+    const rows = await window.overgit.invoke('repo:listTags', repoId);
+    setTags(rows);
+  };
+
+  useEffect(() => {
+    void refresh();
+  }, [repoId]);
+
+  const onCreate = async () => {
+    if (!name.trim()) return;
+    setBusy(true);
+    try {
+      const res = await window.overgit.invoke('repo:createTag', {
+        repoId,
+        name: name.trim(),
+        ref: null,
+        message: message.trim() ? message : null,
+      });
+      if (!res.ok) {
+        pushToast({ kind: 'error', message: res.error ?? 'Tag failed' });
+        return;
+      }
+      setName('');
+      setMessage('');
+      void refresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onDelete = async (tag: Tag) => {
+    const ok = await requestConfirm({
+      title: `Delete tag ${tag.name}?`,
+      body: `Delete the local tag "${tag.name}"? Remote copies are not affected.`,
+      confirmLabel: 'Delete',
+      destructive: true,
+    });
+    if (!ok) return;
+    const res = await window.overgit.invoke('repo:deleteTag', { repoId, name: tag.name });
+    if (!res.ok) {
+      pushToast({ kind: 'error', message: res.error ?? 'Delete failed' });
+      return;
+    }
+    void refresh();
+  };
+
+  const onPush = async (tag: Tag) => {
+    const res = await window.overgit.invoke('repo:pushTag', {
+      repoId,
+      name: tag.name,
+      remote: 'origin',
+    });
+    if (!res.ok) {
+      pushToast({ kind: 'error', message: res.error ?? 'Push failed' });
+    } else {
+      pushToast({ kind: 'success', message: `Pushed ${tag.name} to origin.` });
+    }
+  };
+
+  return (
+    <>
+      <div className="px-5 py-4 border-b border-card flex flex-col gap-2">
+        <div className="text-[10px] uppercase tracking-wide text-ink-faint">
+          New tag at HEAD
+        </div>
+        <div className="flex gap-2 items-center">
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="tag name (e.g. v1.2.0)"
+            disabled={busy}
+            className="field flex-1 px-2 py-1.5 text-xs"
+          />
+          <input
+            value={message}
+            onChange={(e) => setMessage(e.target.value)}
+            placeholder="annotation (optional → annotated tag)"
+            disabled={busy}
+            className="field flex-1 px-2 py-1.5 text-xs"
+          />
+          <button
+            onClick={onCreate}
+            disabled={busy || !name.trim()}
+            className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+          >
+            Create
+          </button>
+        </div>
+      </div>
+      <div className="flex-1 overflow-y-auto p-3">
+        {tags === null ? (
+          <div className="text-xs text-ink-faint p-3">Loading tags…</div>
+        ) : tags.length === 0 ? (
+          <div className="text-xs text-ink-faint p-3">No tags yet.</div>
+        ) : (
+          <ul className="flex flex-col gap-1">
+            {tags.map((t) => (
+              <li
+                key={t.name}
+                className="flex items-center gap-2 px-3 py-1.5 rounded border border-card bg-card text-xs group"
+              >
+                <span
+                  className={
+                    t.kind === 'annotated' ? 'text-accent' : 'text-ink-faint'
+                  }
+                  title={t.kind}
+                >
+                  {t.kind === 'annotated' ? '⚑' : '◇'}
+                </span>
+                <span className="font-mono w-44 truncate" title={t.name}>
+                  {t.name}
+                </span>
+                <span className="font-mono text-[10px] text-ink-faint shrink-0">
+                  {t.shortSha}
+                </span>
+                <span
+                  className="truncate flex-1 text-ink-faint"
+                  title={t.subject}
+                >
+                  {t.subject}
+                </span>
+                <span className="text-[10px] text-ink-faint shrink-0">
+                  {t.date.slice(0, 10)}
+                </span>
+                <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <button
+                    onClick={() => onPush(t)}
+                    className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded border border-card hover:bg-card text-ink-muted hover:text-ink"
+                    title="git push origin <tag>"
+                  >
+                    Push
+                  </button>
+                  <button
+                    onClick={() => onDelete(t)}
+                    className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded border border-red-500/40 text-red-300 hover:bg-red-500/10"
+                  >
+                    Delete
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </>
+  );
+}
+
+function RemotesPane({ repoId }: { repoId: UUID }): JSX.Element {
+  const pushToast = useStore((s) => s.pushToast);
+  const requestConfirm = useStore((s) => s.requestConfirm);
+  const [remotes, setRemotes] = useState<Remote[] | null>(null);
+  const [name, setName] = useState('');
+  const [url, setUrl] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const refresh = async () => {
+    const rows = await window.overgit.invoke('repo:listRemotes', repoId);
+    setRemotes(rows);
+  };
+  useEffect(() => {
+    void refresh();
+  }, [repoId]);
+
+  const onAdd = async () => {
+    if (!name.trim() || !url.trim()) return;
+    setBusy(true);
+    try {
+      const res = await window.overgit.invoke('repo:addRemote', {
+        repoId,
+        name: name.trim(),
+        url: url.trim(),
+      });
+      if (!res.ok) {
+        pushToast({ kind: 'error', message: res.error ?? 'Add failed' });
+        return;
+      }
+      setName('');
+      setUrl('');
+      void refresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onRemove = async (r: Remote) => {
+    const ok = await requestConfirm({
+      title: `Remove remote ${r.name}?`,
+      body: `Delete the remote "${r.name}"? Branches that track it will lose their upstream.`,
+      confirmLabel: 'Remove',
+      destructive: true,
+    });
+    if (!ok) return;
+    const res = await window.overgit.invoke('repo:removeRemote', {
+      repoId,
+      name: r.name,
+    });
+    if (!res.ok) {
+      pushToast({ kind: 'error', message: res.error ?? 'Remove failed' });
+      return;
+    }
+    void refresh();
+  };
+
+  return (
+    <>
+      <div className="px-5 py-4 border-b border-card flex flex-col gap-2">
+        <div className="text-[10px] uppercase tracking-wide text-ink-faint">
+          Add remote
+        </div>
+        <div className="flex gap-2 items-center">
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="name (e.g. origin)"
+            disabled={busy}
+            className="field flex-1 px-2 py-1.5 text-xs"
+          />
+          <input
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="git@github.com:user/repo.git"
+            disabled={busy}
+            className="field flex-[2] px-2 py-1.5 text-xs font-mono"
+          />
+          <button
+            onClick={onAdd}
+            disabled={busy || !name.trim() || !url.trim()}
+            className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+          >
+            Add
+          </button>
+        </div>
+      </div>
+      <div className="flex-1 overflow-y-auto p-3">
+        {remotes === null ? (
+          <div className="text-xs text-ink-faint p-3">Loading remotes…</div>
+        ) : remotes.length === 0 ? (
+          <div className="text-xs text-ink-faint p-3">No remotes configured.</div>
+        ) : (
+          <ul className="flex flex-col gap-1">
+            {remotes.map((r) => (
+              <li
+                key={r.name}
+                className="flex flex-col gap-1 px-3 py-2 rounded border border-card bg-card text-xs group"
+              >
+                <div className="flex items-center gap-2">
+                  <span className="font-mono w-24 truncate">{r.name}</span>
+                  <span className="text-[10px] uppercase tracking-wide text-ink-faint">
+                    fetch
+                  </span>
+                  <RemoteUrlInput
+                    repoId={repoId}
+                    name={r.name}
+                    initial={r.fetchUrl}
+                    kind="fetch"
+                    onSaved={refresh}
+                  />
+                  <button
+                    onClick={() => onRemove(r)}
+                    className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded border border-red-500/40 text-red-300 hover:bg-red-500/10 ml-auto opacity-0 group-hover:opacity-100 transition-opacity"
+                  >
+                    Remove
+                  </button>
+                </div>
+                {r.pushUrl !== r.fetchUrl && (
+                  <div className="flex items-center gap-2 pl-[7.25rem]">
+                    <span className="text-[10px] uppercase tracking-wide text-ink-faint">
+                      push
+                    </span>
+                    <RemoteUrlInput
+                      repoId={repoId}
+                      name={r.name}
+                      initial={r.pushUrl}
+                      kind="push"
+                      onSaved={refresh}
+                    />
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </>
+  );
+}
+
+function RemoteUrlInput({
+  repoId,
+  name,
+  initial,
+  kind,
+  onSaved,
+}: {
+  repoId: UUID;
+  name: string;
+  initial: string;
+  kind: 'fetch' | 'push';
+  onSaved: () => void;
+}): JSX.Element {
+  const pushToast = useStore((s) => s.pushToast);
+  const [url, setUrl] = useState(initial);
+  const [busy, setBusy] = useState(false);
+  // Reset local state when the prop URL changes (e.g. after refresh).
+  useEffect(() => {
+    setUrl(initial);
+  }, [initial]);
+
+  const onSave = async () => {
+    if (url.trim() === initial) return;
+    setBusy(true);
+    try {
+      const res = await window.overgit.invoke('repo:setRemoteUrl', {
+        repoId,
+        name,
+        url: url.trim(),
+        kind,
+      });
+      if (!res.ok) {
+        pushToast({ kind: 'error', message: res.error ?? 'Update failed' });
+        return;
+      }
+      onSaved();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <input
+      value={url}
+      onChange={(e) => setUrl(e.target.value)}
+      onBlur={onSave}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+      }}
+      disabled={busy}
+      className="field flex-1 px-2 py-1 text-xs font-mono"
+    />
+  );
+}
+
+function SubmodulesPane({ repoId }: { repoId: UUID }): JSX.Element {
+  const [submodules, setSubmodules] = useState<Submodule[] | null>(null);
+  const [lfs, setLfs] = useState<LfsStatus | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([
+      window.overgit.invoke('repo:listSubmodules', repoId),
+      window.overgit.invoke('repo:lfsStatus', repoId),
+    ]).then(([sm, l]) => {
+      if (!cancelled) {
+        setSubmodules(sm);
+        setLfs(l);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [repoId]);
+
+  return (
+    <>
+      <div className="flex-1 overflow-y-auto p-3">
+        {submodules === null ? (
+          <div className="text-xs text-ink-faint p-3">Loading…</div>
+        ) : submodules.length === 0 ? (
+          <div className="text-xs text-ink-faint p-3">
+            No submodules. Initialize one with{' '}
+            <span className="font-mono">git submodule add</span> in a terminal.
+          </div>
+        ) : (
+          <ul className="flex flex-col gap-1">
+            {submodules.map((sm) => (
+              <li
+                key={sm.path}
+                className="flex items-center gap-2 px-3 py-1.5 rounded border border-card bg-card text-xs"
+              >
+                <SubmoduleStateBadge state={sm.state} />
+                <span className="font-mono truncate flex-1" title={sm.path}>
+                  {sm.path}
+                </span>
+                <span className="font-mono text-[10px] text-ink-faint">
+                  {sm.shortSha}
+                </span>
+                {sm.describe && (
+                  <span className="text-[10px] text-ink-faint">{sm.describe}</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+      {lfs && (
+        <div className="px-5 py-3 border-t border-card text-[11px] text-ink-faint flex items-center gap-2">
+          <span
+            className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${
+              lfs.enabled
+                ? 'border-accent/50 text-accent'
+                : 'border-card text-ink-faint'
+            }`}
+          >
+            LFS {lfs.enabled ? 'enabled' : 'off'}
+          </span>
+          {lfs.enabled
+            ? `${lfs.patternCount} ${lfs.patternCount === 1 ? 'pattern' : 'patterns'} routed through filter=lfs in .gitattributes.`
+            : 'No filter=lfs entries in .gitattributes.'}
+        </div>
+      )}
+    </>
+  );
+}
+
+function SubmoduleStateBadge({
+  state,
+}: {
+  state: Submodule['state'];
+}): JSX.Element {
+  const map: Record<Submodule['state'], { label: string; cls: string }> = {
+    'up-to-date': { label: '✓', cls: 'text-emerald-400' },
+    modified: { label: '+', cls: 'text-amber-400' },
+    uninitialized: { label: '−', cls: 'text-ink-faint' },
+    conflict: { label: 'U', cls: 'text-red-400' },
+  };
+  const { label, cls } = map[state];
+  return <span className={`font-mono w-3 ${cls}`} title={state}>{label}</span>;
 }
 
 function RepoPickRow({
