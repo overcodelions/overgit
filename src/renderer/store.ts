@@ -241,7 +241,7 @@ interface UiState {
     from?: string,
   ) => Promise<{ ok: boolean; error?: string }>;
   deleteRepoBranch: (id: UUID, name: string, force: boolean) => Promise<{ ok: boolean; error?: string }>;
-  loadRepoFileDiff: (id: UUID, path: string, side: 'staged' | 'unstaged') => Promise<void>;
+  loadRepoFileDiff: (id: UUID, path: string, side: 'staged' | 'unstaged' | 'combined') => Promise<void>;
 
   openRepoFile: (repoId: UUID, path: string) => Promise<void>;
   closeRepoFile: () => void;
@@ -290,6 +290,7 @@ export const useStore = create<UiState>((set, get) => ({
     sidebarVisible: true,
     sidebarWidth: 288,
     historyAsideWidth: 480,
+    stagingMode: 'simple',
   },
   selectedWorkspaceId: null,
   selectedRepoId: null,

@@ -557,7 +557,7 @@ function registerIpc(): void {
     'repo:diffFile',
     async (
       _e,
-      args: { repoId: string; path: string; side: 'staged' | 'unstaged' },
+      args: { repoId: string; path: string; side: 'staged' | 'unstaged' | 'combined' },
     ) => {
       const repo = repoFromArg(args);
       if (!repo) return [];
