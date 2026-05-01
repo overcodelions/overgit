@@ -214,6 +214,12 @@ function SettingsGeneralPanel(): JSX.Element {
     applyTheme(theme);
   };
 
+  const updateStagingMode = async (stagingMode: 'simple' | 'advanced') => {
+    const next = { ...settings, stagingMode };
+    useStore.setState({ settings: next });
+    await window.overgit.invoke('store:saveSettings', next);
+  };
+
   return (
     <div className="flex flex-col gap-6 text-sm">
       <ProcessExplainer />
@@ -235,6 +241,28 @@ function SettingsGeneralPanel(): JSX.Element {
               }`}
             >
               {t[0].toUpperCase() + t.slice(1)}
+            </button>
+          ))}
+        </div>
+      </SettingsGroup>
+
+      <SettingsGroup
+        eyebrow="Commit"
+        title="Staging"
+        subtitle="Simple: one Changes list, the checkbox decides what to commit. Advanced: separate Staged + Unstaged groups with explicit Stage/Unstage actions."
+      >
+        <div className="flex gap-2">
+          {(['simple', 'advanced'] as const).map((m) => (
+            <button
+              key={m}
+              onClick={() => updateStagingMode(m)}
+              className={`px-3 py-1.5 rounded-md border text-xs ${
+                (settings.stagingMode ?? 'simple') === m
+                  ? 'bg-accent text-white border-accent'
+                  : 'border-card hover:bg-card'
+              }`}
+            >
+              {m[0].toUpperCase() + m.slice(1)}
             </button>
           ))}
         </div>

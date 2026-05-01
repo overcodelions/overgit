@@ -394,6 +394,11 @@ export interface AppSettings {
   /// while still getting the protection of a known author/committer on
   /// every push.
   defaultIdentity?: Identity;
+  /// Staging UX. 'simple' (default) collapses staged + unstaged into one
+  /// "Changes" list where the checkbox alone decides what gets committed —
+  /// the index is synced to match on commit. 'advanced' restores the two
+  /// groups, the Stage/Unstage toolbar, and the index-side diff toggle.
+  stagingMode: 'simple' | 'advanced';
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -402,6 +407,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   sidebarWidth: 288,
   historyAsideWidth: 480,
   workspaceLastSeen: {},
+  stagingMode: 'simple',
 };
 
 export const SIDEBAR_MIN_WIDTH = 200;
@@ -470,13 +476,14 @@ export interface IPCInvokeMap {
     from?: string;
   }) => { ok: boolean; error?: string };
   'repo:deleteBranch': (args: { repoId: UUID; name: string; force: boolean }) => { ok: boolean; error?: string };
-  /// Diff for a single path, scoped to either the index (staged vs HEAD)
-  /// or the working tree (unstaged vs index). Used by the Changes pane
-  /// when a single file is selected.
+  /// Diff for a single path, scoped to either the index (staged vs HEAD),
+  /// the working tree (unstaged vs index), or both combined (working tree
+  /// vs HEAD — used by simple staging mode where the staged/unstaged
+  /// distinction is hidden from the user).
   'repo:diffFile': (args: {
     repoId: UUID;
     path: string;
-    side: 'staged' | 'unstaged';
+    side: 'staged' | 'unstaged' | 'combined';
   }) => FileDiff[];
   'repo:graph': (args: { repoId: UUID; limit?: number }) => GraphCommit[];
   'repo:listStashes': (repoId: UUID) => Stash[];
