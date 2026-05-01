@@ -38,6 +38,7 @@ export function App(): JSX.Element {
   }, [hydrate]);
 
   useGlobalShortcuts();
+  useSidebarStatusRefresh();
 
   if (!loaded) {
     return (
@@ -210,6 +211,54 @@ function SidebarWithResize(): JSX.Element {
       />
     </div>
   );
+}
+
+/// Background freshness for the sidebar dirty / ahead / behind dots.
+/// Three triggers, all running the same fan-out (`refreshAllRepoStatuses`):
+///   1. Window focus — the common case. The user did something in a
+///      terminal, alt-tabs back, expects the sidebar to reflect reality.
+///   2. visibilitychange to "visible" — same idea, covers tab-style
+///      hides on platforms where `focus` doesn't fire.
+///   3. A 60s interval as a last-ditch backstop, but only while the
+///      window is actually visible. We don't want a hidden background
+///      window shelling out `git status` across 20 repos every minute.
+/// All three converge on a single store action so duplicate fires (e.g.
+/// focus + visibilitychange in quick succession) just race harmlessly
+/// toward the same merged state.
+function useSidebarStatusRefresh(): void {
+  const refreshAll = useStore((s) => s.refreshAllRepoStatuses);
+  const loaded = useStore((s) => s.loaded);
+
+  useEffect(() => {
+    if (!loaded) return;
+    let lastRun = 0;
+    /// Coalesce bursts (focus + visibilitychange + an interval tick that
+    /// happens to land in the same second) so we don't spam git. 2s is
+    /// short enough that a deliberate quick-toggle still picks up the
+    /// new state, long enough to absorb the natural double-fire.
+    const COALESCE_MS = 2_000;
+    const run = () => {
+      const now = Date.now();
+      if (now - lastRun < COALESCE_MS) return;
+      lastRun = now;
+      void refreshAll();
+    };
+    const onFocus = () => run();
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') run();
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
+    const interval = window.setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      run();
+    }, 60_000);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.clearInterval(interval);
+    };
+  }, [loaded, refreshAll]);
 }
 
 /// Global keyboard shortcuts. We attach one keydown listener and
