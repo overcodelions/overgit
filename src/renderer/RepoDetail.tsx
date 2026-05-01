@@ -101,15 +101,59 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
 
   const [busy, setBusy] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
+  /// When set, the picker mounts directly into "create branch" mode.
+  /// Reset when the picker closes so the next Cmd+B opens to the list.
+  const [pickerInitialMode, setPickerInitialMode] = useState<'create' | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
 
   // Cmd+B shortcut → toggle the picker. The global handler in App
   // dispatches a window event when a repo is open; we just toggle.
   useEffect(() => {
-    const onOpen = () => setPickerOpen((v) => !v);
+    const onOpen = () => {
+      setPickerInitialMode(null);
+      setPickerOpen((v) => !v);
+    };
+    // Cmd+N when a repo is selected — open the picker straight into
+    // create mode so the user can type the new branch name without an
+    // extra click. Always opens (no toggle): pressing Cmd+N twice
+    // shouldn't dismiss the form you just summoned.
+    const onCreate = () => {
+      setPickerInitialMode('create');
+      setPickerOpen(true);
+    };
     window.addEventListener('overgit:openBranchPicker', onOpen);
-    return () => window.removeEventListener('overgit:openBranchPicker', onOpen);
+    window.addEventListener('overgit:newRepoBranch', onCreate);
+    return () => {
+      window.removeEventListener('overgit:openBranchPicker', onOpen);
+      window.removeEventListener('overgit:newRepoBranch', onCreate);
+    };
   }, []);
+
+  // ⌘F / ⌘P shortcuts. The global handler in App dispatches these
+  // window events when a repo is open; the actions live here because
+  // they need access to `busy`, the repoId, and the per-action store
+  // calls. Guard each so a misfire while a fetch is in flight doesn't
+  // pile a second one on top.
+  useEffect(() => {
+    const onFetch = () => {
+      if (busy) return;
+      void onAction(() => fetchRepo(repoId))();
+    };
+    const onPush = () => {
+      if (busy || !status?.branch) return;
+      void onAction(() => pushRepo(repoId))();
+    };
+    window.addEventListener('overgit:repoFetch', onFetch);
+    window.addEventListener('overgit:repoPush', onPush);
+    return () => {
+      window.removeEventListener('overgit:repoFetch', onFetch);
+      window.removeEventListener('overgit:repoPush', onPush);
+    };
+    // onAction is fresh per render but stable for the duration of a
+    // mount; intentionally omitted to keep the listener attach/detach
+    // tied to data deps that actually matter.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [busy, repoId, status?.branch, fetchRepo, pushRepo]);
 
   const setSheet = useStore((s) => s.setSheet);
 
@@ -179,9 +223,11 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
         <button
           disabled={busy}
           onClick={onAction(() => fetchRepo(repoId))}
-          className="text-xs px-2.5 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
+          title="Fetch (⌘F)"
+          className="text-xs px-2.5 py-1 rounded border border-card hover:bg-card disabled:opacity-50 flex items-center gap-1.5"
         >
-          Fetch
+          <span>Fetch</span>
+          <kbd className="text-[11px] text-ink-faint font-mono">⌘F</kbd>
         </button>
         <button
           disabled={busy || !status?.branch}
@@ -193,9 +239,11 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
         <button
           disabled={busy || !status?.branch}
           onClick={onAction(() => pushRepo(repoId))}
-          className="text-xs px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+          title="Push (⌘P)"
+          className="text-xs px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50 flex items-center gap-1.5"
         >
-          Push{status?.ahead ? ` ↑${status.ahead}` : ''}
+          <span>Push{status?.ahead ? ` ↑${status.ahead}` : ''}</span>
+          <kbd className="text-[11px] text-white/85 font-mono">⌘P</kbd>
         </button>
         <RepoExtrasBadges repoId={repoId} />
         <button
@@ -211,7 +259,11 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
         <BranchPicker
           repoId={repoId}
           anchorRef={triggerRef}
-          onClose={() => setPickerOpen(false)}
+          initialMode={pickerInitialMode}
+          onClose={() => {
+            setPickerOpen(false);
+            setPickerInitialMode(null);
+          }}
         />
       )}
     </header>
@@ -707,6 +759,37 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
     }
   };
 
+  // ⌘↩ shortcut. Routed via window event from the global handler so the
+  // keystroke fires regardless of whether focus is in the commit
+  // textarea, the diff pane, or the file list. We re-evaluate the same
+  // disabled-condition the button uses so the shortcut is a no-op in
+  // states where pressing the button would be too.
+  useEffect(() => {
+    const onShortcut = () => {
+      if (busy || !message.trim()) return;
+      const blockedSimple =
+        stagingMode === 'simple' && !amendMode && simpleCheckedCount === 0;
+      const blockedAdvanced =
+        stagingMode !== 'simple' &&
+        !amendMode &&
+        staged.length === 0 &&
+        unstaged.length === 0;
+      if (blockedSimple || blockedAdvanced) return;
+      void onCommit();
+    };
+    window.addEventListener('overgit:repoCommit', onShortcut);
+    return () => window.removeEventListener('overgit:repoCommit', onShortcut);
+  }, [
+    busy,
+    message,
+    stagingMode,
+    amendMode,
+    simpleCheckedCount,
+    staged.length,
+    unstaged.length,
+    onCommit,
+  ]);
+
   const onDiscard = async (file: ChangedFile) => {
     const ok = await requestConfirm({
       title: 'Discard changes?',
@@ -896,6 +979,15 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
           <CommitMessageSuggest
             repoId={repoId}
             stagedCount={stagingMode === 'simple' ? simpleCheckedCount : staged.length}
+            // In simple mode the index doesn't reflect intent — the
+            // checked set does. Pass it so the LLM diffs the right
+            // bytes. In advanced mode we leave this undefined and the
+            // backend falls back to `git diff --cached`.
+            paths={
+              stagingMode === 'simple'
+                ? combined.filter((f) => simpleChecked.has(f.path)).map((f) => f.path)
+                : undefined
+            }
             onSuggested={(text) => setMessage(text)}
           />
           <textarea
@@ -963,38 +1055,41 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
                 : !amendMode && staged.length === 0 && unstaged.length === 0)
             }
             onClick={onCommit}
-            className={`text-sm px-3 py-1.5 rounded text-white disabled:opacity-50 ${
+            className={`text-sm px-3 py-1.5 rounded text-white disabled:opacity-50 flex items-center justify-center gap-2 ${
               amendMode
                 ? 'bg-amber-500 hover:bg-amber-600'
                 : 'bg-accent hover:bg-accent-strong'
             }`}
             title={
               amendMode
-                ? "Rewrites the previous commit. Only safe if you haven't pushed it."
+                ? "Rewrites the previous commit. Only safe if you haven't pushed it. (⌘↩)"
                 : stagingMode === 'simple'
                   ? `Commits the ${simpleCheckedCount} checked file${
                       simpleCheckedCount === 1 ? '' : 's'
-                    }.`
+                    }. (⌘↩)`
                   : !amendMode && staged.length === 0 && unstaged.length > 0
                     ? `Stages every changed file, then commits. ${unstaged.length} file${
                         unstaged.length === 1 ? '' : 's'
-                      } will be staged.`
-                    : undefined
+                      } will be staged. (⌘↩)`
+                    : 'Commit (⌘↩)'
             }
           >
-            {amendMode
-              ? stagingMode === 'simple'
-                ? `Amend${simpleCheckedCount > 0 ? ` (${simpleCheckedCount})` : ''}`
-                : `Amend${staged.length > 0 ? ` + ${staged.length}` : ''}`
-              : stagingMode === 'simple'
-                ? simpleCheckedCount > 0
-                  ? `Commit ${simpleCheckedCount}`
-                  : 'Commit'
-                : staged.length > 0
-                  ? `Commit ${staged.length}`
-                  : unstaged.length > 0
-                    ? `Commit all (${unstaged.length})`
-                    : 'Commit'}
+            <span>
+              {amendMode
+                ? stagingMode === 'simple'
+                  ? `Amend${simpleCheckedCount > 0 ? ` (${simpleCheckedCount})` : ''}`
+                  : `Amend${staged.length > 0 ? ` + ${staged.length}` : ''}`
+                : stagingMode === 'simple'
+                  ? simpleCheckedCount > 0
+                    ? `Commit ${simpleCheckedCount}`
+                    : 'Commit'
+                  : staged.length > 0
+                    ? `Commit ${staged.length}`
+                    : unstaged.length > 0
+                      ? `Commit all (${unstaged.length})`
+                      : 'Commit'}
+            </span>
+            <kbd className="text-[13px] text-white/85 font-mono">⌘↩</kbd>
           </button>
         </div>
       </aside>
@@ -1085,10 +1180,14 @@ function IdentityIndicator({ repoId }: { repoId: UUID }): JSX.Element | null {
 function CommitMessageSuggest({
   repoId,
   stagedCount,
+  paths,
   onSuggested,
 }: {
   repoId: UUID;
   stagedCount: number;
+  /// Optional path list for select-vs-stage mode. When set, the LLM
+  /// diffs these paths vs HEAD instead of the (often empty) git index.
+  paths?: string[];
   onSuggested: (text: string) => void;
 }): JSX.Element {
   const cli = useStore((s) => s.cliPresence);
@@ -1134,6 +1233,7 @@ function CommitMessageSuggest({
       const res = await window.overgit.invoke('cli:suggestCommitMessage', {
         repoId,
         tool,
+        paths,
       });
       if (!res.ok) {
         setStatus({ kind: 'err', message: res.error ?? 'Suggest failed' });
@@ -1144,7 +1244,7 @@ function CommitMessageSuggest({
     } finally {
       setBusy(false);
     }
-  }, [tool, stagedCount, repoId, onSuggested]);
+  }, [tool, stagedCount, repoId, paths, onSuggested]);
 
   // Listen for Cmd+K → "Stage all & suggest commit message" which
   // dispatches `overgit:suggestCommitMessage` after navigating here.
@@ -1578,7 +1678,7 @@ function FileGroup({
           line; the pill carries the count so per-button counts are
           dropped below to prevent the cramped two-line wrap. */}
       {someChecked && (
-        <div className="flex flex-nowrap items-center gap-2 px-3 py-1.5 bg-accent/10 border-b border-accent/20">
+        <div className="flex flex-nowrap items-center gap-2 px-3 py-1.5 bg-accent/10">
           {pending ? (
             <>
               <span className="text-[11px] font-medium text-accent whitespace-nowrap inline-flex items-center gap-1 flex-shrink-0">

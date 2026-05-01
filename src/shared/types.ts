@@ -626,6 +626,13 @@ export interface IPCInvokeMap {
     createIfMissing: boolean;
   }) => CheckoutOutcome[];
   'workspace:fetchAll': (workspaceId: UUID) => { repoId: UUID; ok: boolean; error?: string }[];
+  /// Branch names that exist in any member repo (local + remote-tracking
+  /// refs, with the remote prefix stripped), each annotated with the
+  /// number of member repos that carry it. Drives the workspace branch
+  /// typeahead.
+  'workspace:branchSuggestions': (
+    workspaceId: UUID,
+  ) => { branch: string; repoCount: number; total: number }[];
   'workspace:listPRs': (workspaceId: UUID) => RepoPRs[];
   'workspace:syncAndBranch': (args: {
     workspaceId: UUID;
@@ -722,6 +729,12 @@ export interface IPCInvokeMap {
   'cli:suggestCommitMessage': (args: {
     repoId: UUID;
     tool: LlmTool;
+    /// Paths the user has actually selected to commit, when in "simple"
+    /// (select-vs-stage) mode — the index may be empty even though the
+    /// user has files checked. Diffs these paths vs HEAD so the LLM
+    /// summarizes what's about to be committed, not what's currently
+    /// staged. When undefined or empty, falls back to the staged diff.
+    paths?: string[];
   }) => { ok: true; message: string; tool: LlmTool } | { ok: false; error: string; tool: LlmTool };
 
   /// Run an LLM CLI review across every dirty on-branch repo in the

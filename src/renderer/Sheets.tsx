@@ -20,6 +20,7 @@ import type {
   WorkspaceOpenPROutcome,
   WorkspacePushOutcome,
 } from '@shared/types';
+import { sanitizeBranchName } from '@shared/branch-name';
 
 /// Top-level sheet host. Picks which sheet (modal) to render based on
 /// `store.sheet` and provides the common backdrop + escape-to-close.
@@ -1957,8 +1958,10 @@ function WorkspaceBranchSheet({ workspaceId }: { workspaceId: UUID }): JSX.Eleme
     [statuses],
   );
 
+  const sanitizedBranch = useMemo(() => sanitizeBranchName(branch), [branch]);
+
   const onRun = async () => {
-    if (!branch.trim()) return;
+    if (!sanitizedBranch.value || sanitizedBranch.error) return;
     setBusy(true);
     setOutcomes(null);
     setPreflightError(null);
@@ -2003,7 +2006,7 @@ function WorkspaceBranchSheet({ workspaceId }: { workspaceId: UUID }): JSX.Eleme
       setBusyLabel('Creating branch…');
       const res = await window.overgit.invoke('workspace:syncAndBranch', {
         workspaceId,
-        branch: branch.trim(),
+        branch: sanitizedBranch.value,
         syncDefault,
         pullBeforeBranch: pullBefore,
       });
@@ -2037,6 +2040,16 @@ function WorkspaceBranchSheet({ workspaceId }: { workspaceId: UUID }): JSX.Eleme
             placeholder="feature/my-thing"
             className="field px-2 py-1.5 text-sm font-mono"
           />
+          {branch.trim() && sanitizedBranch.error ? (
+            <span className="text-[11px] text-red-400">{sanitizedBranch.error}</span>
+          ) : (
+            sanitizedBranch.changed && (
+              <span className="text-[11px] text-amber-300">
+                Will create as{' '}
+                <span className="font-mono">{sanitizedBranch.value}</span>
+              </span>
+            )
+          )}
         </label>
 
         <fieldset className="flex flex-col gap-2 p-3 rounded border border-card bg-card">
@@ -2146,7 +2159,7 @@ function WorkspaceBranchSheet({ workspaceId }: { workspaceId: UUID }): JSX.Eleme
           {allCreated ? 'Done' : 'Cancel'}
         </button>
         <button
-          disabled={busy || !branch.trim()}
+          disabled={busy || !sanitizedBranch.value || !!sanitizedBranch.error}
           onClick={onRun}
           className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
         >

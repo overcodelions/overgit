@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useStore } from './store';
 import type { BranchSummary, Commit, UUID } from '@shared/types';
+import { sanitizeBranchName } from '@shared/branch-name';
 
 interface Props {
   repoId: UUID;
@@ -8,6 +9,10 @@ interface Props {
   /// rect rather than a portal so the picker tracks the trigger if the
   /// header reflows.
   anchorRef: React.RefObject<HTMLElement>;
+  /// Mount the picker directly into a sub-mode instead of the branch
+  /// list. Currently only `create` is wired — used by the Cmd+N shortcut
+  /// so the user lands on the "name your new branch" form immediately.
+  initialMode?: 'create' | null;
   onClose: () => void;
 }
 
@@ -25,7 +30,7 @@ type Mode =
 ///   - Create branch (inline form, switches on submit)
 ///   - Cherry-pick from a branch (opens a commit picker, applies on Enter)
 /// Both close the popover on success and surface errors via window.alert.
-export function BranchPicker({ repoId, anchorRef, onClose }: Props): JSX.Element | null {
+export function BranchPicker({ repoId, anchorRef, initialMode, onClose }: Props): JSX.Element | null {
   const repo = useStore((s) => s.repos.find((r) => r.id === repoId));
   const status = useStore((s) => s.repoStatus[repoId]);
   const summaries = useStore((s) => s.repoBranchSummaries[repoId] ?? null);
@@ -37,7 +42,9 @@ export function BranchPicker({ repoId, anchorRef, onClose }: Props): JSX.Element
   const requestConfirm = useStore((s) => s.requestConfirm);
 
   const [search, setSearch] = useState('');
-  const [mode, setMode] = useState<Mode>({ kind: 'list' });
+  const [mode, setMode] = useState<Mode>(
+    initialMode === 'create' ? { kind: 'create' } : { kind: 'list' },
+  );
   const [busy, setBusy] = useState(false);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -506,9 +513,11 @@ function CreateMode({
   const [syncDefault, setSyncDefault] = useState(!!defaultBranch);
   const [pull, setPull] = useState(!!defaultBranch);
 
+  const sanitized = useMemo(() => sanitizeBranchName(name), [name]);
+
   const submit = () => {
-    if (!name.trim()) return;
-    onSubmit(name.trim(), { syncDefault, pull });
+    if (!sanitized.value || sanitized.error) return;
+    onSubmit(sanitized.value, { syncDefault, pull });
   };
 
   return (
@@ -528,6 +537,19 @@ function CreateMode({
         placeholder="feature/your-branch"
         className="field px-2 py-1.5 text-xs"
       />
+      {/* Live sanitization preview / error. Non-blocking when we just
+          rewrote the input (spaces → hyphens etc.), blocking when the
+          name has nothing salvageable. Avoids a round-trip through git
+          to learn `feature/foo bar` is invalid. */}
+      {name.trim() && sanitized.error ? (
+        <div className="text-[11px] text-red-400">{sanitized.error}</div>
+      ) : (
+        sanitized.changed && (
+          <div className="text-[11px] text-amber-300">
+            Will create as <span className="font-mono">{sanitized.value}</span>
+          </div>
+        )
+      )}
       {defaultBranch ? (
         <div className="flex flex-col gap-1 text-[11px] text-ink-muted">
           <label className="flex items-start gap-2 cursor-pointer">
@@ -569,7 +591,7 @@ function CreateMode({
           Back
         </button>
         <button
-          disabled={busy || !name.trim()}
+          disabled={busy || !sanitized.value || !!sanitized.error}
           onClick={submit}
           className="text-xs px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
         >

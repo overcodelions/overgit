@@ -28,6 +28,7 @@ import {
   detectDefaultBranch,
   fetch as gitFetch,
   hasUpstream,
+  listBranches,
   listWorktrees,
   log as gitLog,
   pull as gitPull,
@@ -87,6 +88,61 @@ export async function workspaceCheckout(
     outcomes.push(await checkoutBranch(r.id, r.path, branch, createIfMissing));
   }
   return outcomes;
+}
+
+/// Aggregate every branch name that exists across the workspace's
+/// repos so the renderer can offer a typeahead before the user commits
+/// to a `Switch all`. We coalesce local heads and remote-tracking refs
+/// into bare branch names (so `origin/feature/x` and the local
+/// `feature/x` are the same suggestion) and count how many member
+/// repos carry each one. The renderer uses that count to surface the
+/// "X/Y repos have this branch" hint and to default the `create if
+/// missing` toggle sensibly.
+export async function workspaceBranchSuggestions(
+  workspaceId: UUID,
+  workspaces: Workspace[],
+  repos: Repo[],
+): Promise<{ branch: string; repoCount: number; total: number }[]> {
+  const ws = workspaces.find((w) => w.id === workspaceId);
+  if (!ws) return [];
+  const members = reposFor(ws, repos);
+  const total = members.length;
+  if (total === 0) return [];
+
+  // Per-repo branch listings are independent and read-only; fan out.
+  const perRepo = await Promise.all(
+    members.map(async (r) => {
+      const { local, remote } = await listBranches(r.path);
+      const names = new Set<string>();
+      for (const n of local) names.add(n);
+      // `origin/feature/x` → `feature/x`. We strip the first path
+      // segment (the remote name); subsequent slashes belong to the
+      // branch name itself.
+      for (const n of remote) {
+        const slash = n.indexOf('/');
+        if (slash > 0) names.add(n.slice(slash + 1));
+      }
+      return { repoId: r.id, names };
+    }),
+  );
+
+  const tally = new Map<string, Set<UUID>>();
+  for (const { repoId, names } of perRepo) {
+    for (const name of names) {
+      let s = tally.get(name);
+      if (!s) {
+        s = new Set();
+        tally.set(name, s);
+      }
+      s.add(repoId);
+    }
+  }
+
+  return [...tally.entries()]
+    .map(([branch, set]) => ({ branch, repoCount: set.size, total }))
+    .sort(
+      (a, b) => b.repoCount - a.repoCount || a.branch.localeCompare(b.branch),
+    );
 }
 
 export async function workspaceFetch(

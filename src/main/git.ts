@@ -421,12 +421,31 @@ export async function checkoutBranch(
   // ref so the user can switch to a branch they've fetched but not yet
   // checked out locally.
   const localExists = await run(repoPath, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`]);
-  const remoteExists = await run(repoPath, [
+  let remoteExists = await run(repoPath, [
     'show-ref',
     '--verify',
     '--quiet',
     `refs/remotes/origin/${branch}`,
   ]);
+
+  // Cache miss: ask the actual remote whether it has this branch. A
+  // freshly-added repo has no remote-tracking refs until something is
+  // fetched, so without this probe a workspace checkout would falsely
+  // report `missing-branch` for a branch that exists on origin.
+  if (!localExists.ok && !remoteExists.ok) {
+    const ls = await run(repoPath, ['ls-remote', '--heads', 'origin', branch]);
+    if (ls.ok && ls.stdout.trim().length > 0) {
+      const fetchRes = await run(repoPath, ['fetch', 'origin', branch]);
+      if (fetchRes.ok) {
+        remoteExists = await run(repoPath, [
+          'show-ref',
+          '--verify',
+          '--quiet',
+          `refs/remotes/origin/${branch}`,
+        ]);
+      }
+    }
+  }
 
   if (!localExists.ok && !remoteExists.ok) {
     if (!createIfMissing) {
@@ -604,8 +623,22 @@ function classifyFailure(repoId: UUID, branch: string, r: RunResult): CheckoutOu
 export async function rawDiff(
   repoPath: string,
   scope: 'staged' | 'working',
+  paths?: string[],
 ): Promise<{ ok: boolean; text: string; error?: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, text: '', error: 'Not a git repo' };
+  // When the renderer passes an explicit path list, diff those paths
+  // against HEAD regardless of `scope`. This mirrors what the eventual
+  // commit will contain in select-vs-stage mode, where the user's
+  // checkboxes drive the commit content rather than git's index. We
+  // include both staged and unstaged hunks for those files because the
+  // commit-time staging sync will roll them all in.
+  if (paths && paths.length > 0) {
+    const res = await run(repoPath, ['diff', '--no-color', 'HEAD', '--', ...paths]);
+    if (!res.ok) {
+      return { ok: false, text: '', error: res.stderr.trim() || `git exited ${res.code}` };
+    }
+    return { ok: true, text: res.stdout };
+  }
   const args = scope === 'staged'
     ? ['diff', '--cached', '--no-color']
     : ['diff', '--no-color', 'HEAD'];
@@ -1551,6 +1584,41 @@ export async function pull(
   repoPath: string,
 ): Promise<{ ok: boolean; error?: string; conflicts?: string[] }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+
+  // No upstream? Wire it up to origin/<branch> if that ref exists so
+  // the user doesn't get the cryptic "no tracking information" wall
+  // of text. Mirrors push()'s "first push sets tracking" behavior.
+  if (!(await hasUpstream(repoPath))) {
+    const head = await run(repoPath, ['rev-parse', '--abbrev-ref', 'HEAD']);
+    const branch = head.ok ? head.stdout.trim() : '';
+    if (!branch || branch === 'HEAD') {
+      return { ok: false, error: 'No branch checked out (detached HEAD).' };
+    }
+    const remoteRef = await run(repoPath, [
+      'rev-parse',
+      '--verify',
+      '--quiet',
+      `refs/remotes/origin/${branch}`,
+    ]);
+    if (!remoteRef.ok) {
+      return {
+        ok: false,
+        error: `No upstream for "${branch}", and origin has no branch with that name. Push first to create it.`,
+      };
+    }
+    const setUp = await run(repoPath, [
+      'branch',
+      `--set-upstream-to=origin/${branch}`,
+      branch,
+    ]);
+    if (!setUp.ok) {
+      return {
+        ok: false,
+        error: setUp.stderr.trim() || `git branch --set-upstream-to exited ${setUp.code}`,
+      };
+    }
+  }
+
   const res = await run(repoPath, ['pull', '--no-rebase']);
   if (res.ok) return { ok: true };
   // Detect "would be overwritten" so the renderer can offer recovery
