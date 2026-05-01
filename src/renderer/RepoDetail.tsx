@@ -2321,10 +2321,12 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
   const [busy, setBusy] = useState(false);
   const [pruning, setPruning] = useState(false);
   const [switching, setSwitching] = useState<string | null>(null);
+  const [filter, setFilter] = useState('');
 
   useEffect(() => {
     void refreshWorktrees(repoId);
     void refreshBranches(repoId);
+    setFilter('');
   }, [refreshWorktrees, refreshBranches, repoId]);
 
   const onRefresh = async () => {
@@ -2349,6 +2351,25 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
     () => (branches ?? []).filter((b) => b.kind === 'local'),
     [branches],
   );
+
+  const q = filter.trim().toLowerCase();
+  const filteredLocal = useMemo(() => {
+    if (!q) return localBranches;
+    return localBranches.filter(
+      (b) =>
+        b.shortName.toLowerCase().includes(q) ||
+        b.subject.toLowerCase().includes(q) ||
+        b.shortSha.toLowerCase().includes(q),
+    );
+  }, [localBranches, q]);
+  const filteredLinked = useMemo(() => {
+    if (!q) return linked;
+    return linked.filter(
+      (w) =>
+        (w.branch ?? '').toLowerCase().includes(q) ||
+        w.path.toLowerCase().includes(q),
+    );
+  }, [linked, q]);
 
   const hasPrunable = useMemo(() => (wts ?? []).some((w) => w.prunable), [wts]);
 
@@ -2410,10 +2431,32 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
         </button>
       </header>
 
+      <div className="flex items-center gap-2">
+        <input
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+          placeholder="Filter branches by name, subject, sha, path…"
+          className="field flex-1 px-2 py-1 text-[11px]"
+        />
+        {filter && (
+          <button
+            onClick={() => setFilter('')}
+            className="text-[10px] text-ink-muted hover:text-ink px-1.5 py-1 rounded hover:bg-card"
+            title="Clear filter"
+          >
+            ✕
+          </button>
+        )}
+      </div>
+
       <section className="flex flex-col gap-2">
         <div className="flex items-baseline justify-between">
           <h3 className="text-[10px] uppercase tracking-wide text-ink-faint">
-            Local branches ({localBranches.length})
+            Local branches ({filteredLocal.length}
+            {q && filteredLocal.length !== localBranches.length
+              ? ` of ${localBranches.length}`
+              : ''}
+            )
           </h3>
           <span className="text-[10px] text-ink-faint">click to switch · ⎇ marks current</span>
         </div>
@@ -2423,9 +2466,13 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
           <div className="text-xs text-ink-faint p-3 rounded border border-card bg-card">
             No local branches.
           </div>
+        ) : filteredLocal.length === 0 ? (
+          <div className="text-xs text-ink-faint p-3 rounded border border-card bg-card">
+            No branches match “{filter}”.
+          </div>
         ) : (
           <ul className="flex flex-col gap-1">
-            {localBranches.map((b) => (
+            {filteredLocal.map((b) => (
               <BranchSwitchRow
                 key={b.name}
                 name={b.shortName}
@@ -2448,7 +2495,9 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
       <section className="flex flex-col gap-2">
         <div className="flex items-baseline justify-between">
           <h3 className="text-[10px] uppercase tracking-wide text-ink-faint">
-            Linked worktrees ({linked.length})
+            Linked worktrees ({filteredLinked.length}
+            {q && filteredLinked.length !== linked.length ? ` of ${linked.length}` : ''}
+            )
           </h3>
           <div className="flex items-center gap-2">
             {hasPrunable && (
@@ -2473,9 +2522,13 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
               git worktree add ../{'<dir>'} {'<branch>'}
             </code>
           </div>
+        ) : filteredLinked.length === 0 ? (
+          <div className="text-xs text-ink-faint p-3 rounded border border-card bg-card">
+            No worktrees match “{filter}”.
+          </div>
         ) : (
           <ul className="flex flex-col gap-1.5">
-            {linked.map((w) => (
+            {filteredLinked.map((w) => (
               <WorktreeRow key={w.path} repoId={repoId} repoPath={repoPath} worktree={w} />
             ))}
           </ul>
