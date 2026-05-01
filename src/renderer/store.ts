@@ -43,7 +43,7 @@ export type Sheet =
   | { kind: 'pushAllInWorkspace'; workspaceId: UUID }
   | { kind: 'openPRsInWorkspace'; workspaceId: UUID }
   | { kind: 'fileHistory'; repoId: UUID; path: string; tab: 'history' | 'blame' }
-  | { kind: 'manageRepo'; repoId: UUID; tab: 'tags' | 'remotes' | 'submodules' }
+  | { kind: 'manageRepo'; repoId: UUID; tab: 'tags' | 'remotes' | 'submodules' | 'identity' }
   | { kind: 'pullConflict'; repoId: UUID; conflicts: string[]; rawError: string };
 
 interface OpenFile {
@@ -352,9 +352,37 @@ export const useStore = create<UiState>((set, get) => ({
       get().pushToast({ kind: 'error', message: result.error });
       return;
     }
-    const repos = [...get().repos.filter((r) => r.id !== result.repo.id), result.repo];
-    set({ repos });
-    await window.overgit.invoke('store:saveRepos', repos);
+    if (result.repos.length === 0) {
+      // Nothing matched — surface the first reason so the user
+      // understands why their pick produced no rows.
+      const why = result.skipped[0]?.reason ?? 'No repositories found in the chosen folders.';
+      get().pushToast({ kind: 'warn', message: why });
+      return;
+    }
+    // Merge: drop any existing entries with the same ids (the main
+    // process returns existing repos as-is when a duplicate path is
+    // picked) and append the picked ones in their dialog order.
+    const ids = new Set(result.repos.map((r) => r.id));
+    const merged = [...get().repos.filter((r) => !ids.has(r.id)), ...result.repos];
+    set({ repos: merged });
+    await window.overgit.invoke('store:saveRepos', merged);
+    if (result.repos.length === 1) {
+      get().pushToast({ kind: 'success', message: `Added ${result.repos[0].name}.` });
+    } else {
+      get().pushToast({
+        kind: 'success',
+        message: `Added ${result.repos.length} repositories.`,
+      });
+    }
+    if (result.skipped.length > 0) {
+      get().pushToast({
+        kind: 'warn',
+        message: `Skipped ${result.skipped.length} folder(s) — no repos found.`,
+      });
+    }
+    // Auto-select the first newly added repo so the detail pane
+    // populates immediately, matching the previous single-pick UX.
+    if (result.repos[0]) get().selectRepo(result.repos[0].id);
   },
 
   createWorkspace: async (name, repoIds) => {

@@ -1,13 +1,16 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useStore } from './store';
 import type {
+  AppSettings,
   BlameLine,
   CommitAllOutcome,
   FileLogCommit,
+  Identity,
   LfsStatus,
   LlmTool,
   Remote,
   Repo,
+  ResolvedIdentity,
   ReviewResult,
   Submodule,
   SyncAndBranchOutcome,
@@ -119,10 +122,11 @@ function SheetHeader({ title, onClose }: { title: string; onClose: () => void })
   );
 }
 
-type SettingsTab = 'general' | 'ai' | 'repos' | 'shortcuts';
+type SettingsTab = 'general' | 'identity' | 'ai' | 'repos' | 'shortcuts';
 
 const SETTINGS_TABS: { id: SettingsTab; label: string; hint: string }[] = [
   { id: 'general', label: 'General', hint: 'Theme, library' },
+  { id: 'identity', label: 'Identity', hint: 'Commit author' },
   { id: 'ai', label: 'AI & Forges', hint: 'CLI integrations' },
   { id: 'repos', label: 'Repos', hint: 'Default branches' },
   { id: 'shortcuts', label: 'Shortcuts', hint: 'Keyboard' },
@@ -179,6 +183,7 @@ function SettingsSheet(): JSX.Element {
 
         <div className="overflow-y-auto px-6 py-5">
           {tab === 'general' && <SettingsGeneralPanel />}
+          {tab === 'identity' && <SettingsIdentityPanel />}
           {tab === 'ai' && <SettingsCliPanel />}
           {tab === 'repos' && <SettingsReposPanel />}
           {tab === 'shortcuts' && <SettingsShortcutsPanel />}
@@ -301,6 +306,558 @@ function SettingsReposPanel(): JSX.Element {
           </ul>
         )}
       </SettingsGroup>
+    </div>
+  );
+}
+
+function SettingsIdentityPanel(): JSX.Element {
+  const settings = useStore((s) => s.settings);
+  const repos = useStore((s) => s.repos);
+
+  const current = settings.defaultIdentity;
+  const [name, setName] = useState(current?.name ?? '');
+  const [email, setEmail] = useState(current?.email ?? '');
+  const [savingDefault, setSavingDefault] = useState(false);
+
+  useEffect(() => {
+    setName(current?.name ?? '');
+    setEmail(current?.email ?? '');
+  }, [current?.name, current?.email]);
+
+  const defaultDirty = name !== (current?.name ?? '') || email !== (current?.email ?? '');
+
+  const onSaveDefault = async () => {
+    setSavingDefault(true);
+    try {
+      const next: AppSettings = {
+        ...settings,
+        defaultIdentity:
+          name.trim() && email.trim()
+            ? { name: name.trim(), email: email.trim() }
+            : undefined,
+      };
+      useStore.setState({ settings: next });
+      await window.overgit.invoke('store:saveSettings', next);
+    } finally {
+      setSavingDefault(false);
+    }
+  };
+
+  const onClearDefault = async () => {
+    setSavingDefault(true);
+    try {
+      const next: AppSettings = { ...settings, defaultIdentity: undefined };
+      useStore.setState({ settings: next });
+      await window.overgit.invoke('store:saveSettings', next);
+      setName('');
+      setEmail('');
+    } finally {
+      setSavingDefault(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-6 text-sm">
+      <SettingsGroup
+        eyebrow="Identity"
+        title="Default commit author"
+        subtitle="Used when a repo has no per-repo override and its local .git/config has no user.name/user.email."
+      >
+        <div className="flex flex-wrap gap-2 items-end max-w-2xl">
+          <div className="flex flex-col gap-1 flex-1 min-w-[160px]">
+            <label className="text-[10px] uppercase tracking-wide text-ink-faint">Name</label>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="e.g. Lionel Farr"
+              className="field px-2 py-1.5 text-sm"
+            />
+          </div>
+          <div className="flex flex-col gap-1 flex-1 min-w-[200px]">
+            <label className="text-[10px] uppercase tracking-wide text-ink-faint">Email</label>
+            <input
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="you@example.com"
+              className="field px-2 py-1.5 text-sm"
+            />
+          </div>
+          <button
+            onClick={onSaveDefault}
+            disabled={savingDefault || !defaultDirty || (!!name.trim() !== !!email.trim())}
+            className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+          >
+            Save default
+          </button>
+          {current && (
+            <button
+              onClick={onClearDefault}
+              disabled={savingDefault}
+              className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+            >
+              Clear
+            </button>
+          )}
+        </div>
+      </SettingsGroup>
+
+      <SettingsGroup
+        eyebrow="Per-repo"
+        title="Identity per repository"
+        subtitle="Edit any row inline, or check rows and bulk-apply an identity. Override columns left blank fall through to the repo's git config / global default / system git."
+      >
+        {repos.length === 0 ? (
+          <div className="text-[11px] text-ink-faint p-3 rounded border border-card bg-card">
+            No repos yet. Add one from the sidebar.
+          </div>
+        ) : (
+          <IdentityBulkTable />
+        )}
+      </SettingsGroup>
+    </div>
+  );
+}
+
+interface RowDraft {
+  /// Override draft. Empty string means "no override" — same on save
+  /// (we'll send identity: null). We don't track repo-config / global
+  /// fallbacks here; this draft only ever represents the per-repo
+  /// override the user is editing.
+  name: string;
+  email: string;
+}
+
+function IdentityBulkTable(): JSX.Element {
+  const repos = useStore((s) => s.repos);
+  const settings = useStore((s) => s.settings);
+  const pushToast = useStore((s) => s.pushToast);
+  const [resolved, setResolved] = useState<Record<UUID, ResolvedIdentity>>({});
+  const [drafts, setDrafts] = useState<Record<UUID, RowDraft>>({});
+  const [checked, setChecked] = useState<Set<UUID>>(new Set());
+  const [busy, setBusy] = useState<Set<UUID>>(new Set());
+  const [filter, setFilter] = useState('');
+
+  const refreshResolved = async () => {
+    const map = await window.overgit.invoke('repo:resolveAllIdentities');
+    setResolved(map);
+  };
+
+  useEffect(() => {
+    void refreshResolved();
+  }, [repos.length]);
+
+  // Seed drafts from saved overrides whenever the underlying repo
+  // identity list changes (e.g. after a save). Untouched rows stay in
+  // sync with the store; rows the user is currently editing keep their
+  // in-flight text because the spread below only fills missing keys.
+  useEffect(() => {
+    setDrafts((prev) => {
+      const next: Record<UUID, RowDraft> = {};
+      for (const r of repos) {
+        next[r.id] = prev[r.id] ?? {
+          name: r.identity?.name ?? '',
+          email: r.identity?.email ?? '',
+        };
+      }
+      return next;
+    });
+  }, [repos]);
+
+  // The bulk-apply dropdown: global default plus every distinct
+  // identity already in use across repos. Lets the user click "Apply"
+  // with whatever identity they already have wired up somewhere.
+  const presets = useMemo(() => {
+    const list: { label: string; identity: Identity }[] = [];
+    if (settings.defaultIdentity) {
+      list.push({
+        label: `Global default · ${settings.defaultIdentity.name} <${settings.defaultIdentity.email}>`,
+        identity: settings.defaultIdentity,
+      });
+    }
+    const seen = new Set<string>();
+    if (settings.defaultIdentity) {
+      seen.add(`${settings.defaultIdentity.name}|${settings.defaultIdentity.email}`);
+    }
+    for (const r of repos) {
+      if (!r.identity) continue;
+      const key = `${r.identity.name}|${r.identity.email}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      list.push({
+        label: `${r.identity.name} <${r.identity.email}>`,
+        identity: r.identity,
+      });
+    }
+    return list;
+  }, [repos, settings.defaultIdentity]);
+
+  const [presetIndex, setPresetIndex] = useState(0);
+
+  const filtered = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    if (!q) return repos;
+    return repos.filter(
+      (r) =>
+        r.name.toLowerCase().includes(q) ||
+        r.path.toLowerCase().includes(q) ||
+        (r.identity?.email ?? '').toLowerCase().includes(q),
+    );
+  }, [repos, filter]);
+
+  const allChecked = filtered.length > 0 && filtered.every((r) => checked.has(r.id));
+  const someChecked = filtered.some((r) => checked.has(r.id));
+
+  const toggleAll = () => {
+    setChecked((prev) => {
+      const next = new Set(prev);
+      if (allChecked) {
+        for (const r of filtered) next.delete(r.id);
+      } else {
+        for (const r of filtered) next.add(r.id);
+      }
+      return next;
+    });
+  };
+
+  const updateDraft = (id: UUID, patch: Partial<RowDraft>) => {
+    setDrafts((prev) => ({
+      ...prev,
+      [id]: { ...prev[id], ...patch },
+    }));
+  };
+
+  /// Save one repo's draft. Both fields blank → clear override; both
+  /// filled → set override; mixed (only one filled) → reject so we
+  /// never store half an identity.
+  const saveRow = async (id: UUID): Promise<boolean> => {
+    const d = drafts[id];
+    if (!d) return false;
+    const name = d.name.trim();
+    const email = d.email.trim();
+    if (!!name !== !!email) {
+      pushToast({
+        kind: 'error',
+        message: 'Name and email must both be set, or both blank.',
+      });
+      return false;
+    }
+    setBusy((prev) => new Set(prev).add(id));
+    try {
+      const identity: Identity | null = name && email ? { name, email } : null;
+      await window.overgit.invoke('repo:setIdentity', { repoId: id, identity });
+      useStore.setState({
+        repos: useStore.getState().repos.map((r) =>
+          r.id === id ? { ...r, identity: identity ?? undefined } : r,
+        ),
+      });
+      return true;
+    } finally {
+      setBusy((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    }
+  };
+
+  const onSaveRow = async (id: UUID) => {
+    const ok = await saveRow(id);
+    if (ok) {
+      pushToast({ kind: 'success', message: 'Identity saved.' });
+      void refreshResolved();
+    }
+  };
+
+  // Every row whose draft differs from the persisted override. Powers
+  // "Save all" / "Revert" — without these, bulk-editing a dozen rows
+  // forces a dozen Save clicks, which defeats the point of the table.
+  const dirtyIds = useMemo(() => {
+    const out: UUID[] = [];
+    for (const r of repos) {
+      const d = drafts[r.id];
+      if (!d) continue;
+      const savedName = r.identity?.name ?? '';
+      const savedEmail = r.identity?.email ?? '';
+      if (d.name !== savedName || d.email !== savedEmail) out.push(r.id);
+    }
+    return out;
+  }, [repos, drafts]);
+
+  const onSaveAll = async () => {
+    if (dirtyIds.length === 0) return;
+    setBusy((prev) => {
+      const next = new Set(prev);
+      for (const id of dirtyIds) next.add(id);
+      return next;
+    });
+    try {
+      const results = await Promise.all(dirtyIds.map((id) => saveRow(id)));
+      const okCount = results.filter(Boolean).length;
+      if (okCount > 0) {
+        pushToast({
+          kind: 'success',
+          message: `Saved ${okCount} repo${okCount === 1 ? '' : 's'}.`,
+        });
+      }
+      void refreshResolved();
+    } finally {
+      setBusy((prev) => {
+        const next = new Set(prev);
+        for (const id of dirtyIds) next.delete(id);
+        return next;
+      });
+    }
+  };
+
+  const onRevertAll = () => {
+    setDrafts((prev) => {
+      const next = { ...prev };
+      for (const id of dirtyIds) {
+        const r = repos.find((x) => x.id === id);
+        if (!r) continue;
+        next[id] = { name: r.identity?.name ?? '', email: r.identity?.email ?? '' };
+      }
+      return next;
+    });
+  };
+
+  const onClearRow = async (id: UUID) => {
+    updateDraft(id, { name: '', email: '' });
+    setBusy((prev) => new Set(prev).add(id));
+    try {
+      await window.overgit.invoke('repo:setIdentity', { repoId: id, identity: null });
+      useStore.setState({
+        repos: useStore.getState().repos.map((r) =>
+          r.id === id ? { ...r, identity: undefined } : r,
+        ),
+      });
+      void refreshResolved();
+    } finally {
+      setBusy((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    }
+  };
+
+  const applyPreset = async (scope: 'all' | 'selected') => {
+    const preset = presets[presetIndex];
+    if (!preset) return;
+    const target =
+      scope === 'all'
+        ? filtered
+        : filtered.filter((r) => checked.has(r.id));
+    if (target.length === 0) {
+      pushToast({
+        kind: 'warn',
+        message:
+          scope === 'selected'
+            ? 'Check at least one row first.'
+            : 'No repos to apply to.',
+      });
+      return;
+    }
+    setBusy((prev) => {
+      const next = new Set(prev);
+      for (const r of target) next.add(r.id);
+      return next;
+    });
+    try {
+      await Promise.all(
+        target.map(async (r) => {
+          await window.overgit.invoke('repo:setIdentity', {
+            repoId: r.id,
+            identity: preset.identity,
+          });
+          updateDraft(r.id, {
+            name: preset.identity.name,
+            email: preset.identity.email,
+          });
+        }),
+      );
+      useStore.setState({
+        repos: useStore.getState().repos.map((r) =>
+          target.some((t) => t.id === r.id) ? { ...r, identity: preset.identity } : r,
+        ),
+      });
+      pushToast({
+        kind: 'success',
+        message: `Applied to ${target.length} repo${target.length === 1 ? '' : 's'}.`,
+      });
+      void refreshResolved();
+    } finally {
+      setBusy((prev) => {
+        const next = new Set(prev);
+        for (const r of target) next.delete(r.id);
+        return next;
+      });
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-3">
+      {/* Bulk-apply controls */}
+      <div className="flex flex-wrap items-center gap-2 p-2 rounded border border-card bg-card/40">
+        <span className="text-[11px] uppercase tracking-wide text-ink-faint">Bulk apply</span>
+        {presets.length === 0 ? (
+          <span className="text-[11px] text-ink-faint italic">
+            Set a global default or a per-repo override below to enable bulk apply.
+          </span>
+        ) : (
+          <>
+            <select
+              value={presetIndex}
+              onChange={(e) => setPresetIndex(Number(e.target.value))}
+              className="field text-xs px-2 py-1 max-w-[300px]"
+            >
+              {presets.map((p, i) => (
+                <option key={i} value={i}>
+                  {p.label}
+                </option>
+              ))}
+            </select>
+            <button
+              onClick={() => applyPreset('selected')}
+              disabled={!someChecked}
+              className="text-[11px] px-2 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
+              title="Apply to checked rows"
+            >
+              Apply to selected ({checked.size})
+            </button>
+            <button
+              onClick={() => applyPreset('all')}
+              className="text-[11px] px-2 py-1 rounded border border-card hover:bg-card"
+              title="Apply to every visible row"
+            >
+              Apply to all ({filtered.length})
+            </button>
+          </>
+        )}
+        <div className="flex-1" />
+        <button
+          onClick={onSaveAll}
+          disabled={dirtyIds.length === 0}
+          className="text-[11px] px-2 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-40"
+          title="Save every row whose name/email differs from what's stored"
+        >
+          Save all ({dirtyIds.length})
+        </button>
+        <button
+          onClick={onRevertAll}
+          disabled={dirtyIds.length === 0}
+          className="text-[11px] px-2 py-1 rounded border border-card hover:bg-card disabled:opacity-40"
+          title="Discard unsaved row edits"
+        >
+          Revert
+        </button>
+        <input
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+          placeholder="Filter…"
+          className="field text-xs px-2 py-1 w-[180px]"
+        />
+      </div>
+
+      {/* Header */}
+      <div className="grid grid-cols-[24px_minmax(0,1.4fr)_minmax(0,1.2fr)_minmax(0,1.5fr)_minmax(0,1fr)_auto] gap-2 px-2 text-[10px] uppercase tracking-wide text-ink-faint">
+        <input
+          type="checkbox"
+          checked={allChecked}
+          ref={(el) => {
+            if (el) el.indeterminate = !allChecked && someChecked;
+          }}
+          onChange={toggleAll}
+          aria-label="Select all"
+        />
+        <span>Repository</span>
+        <span>Override name</span>
+        <span>Override email</span>
+        <span>Active source</span>
+        <span></span>
+      </div>
+
+      {/* Rows */}
+      <ul className="flex flex-col">
+        {filtered.map((r) => {
+          const draft = drafts[r.id] ?? { name: '', email: '' };
+          const res = resolved[r.id];
+          const dirty =
+            draft.name !== (r.identity?.name ?? '') ||
+            draft.email !== (r.identity?.email ?? '');
+          const isBusy = busy.has(r.id);
+          return (
+            <li
+              key={r.id}
+              className="grid grid-cols-[24px_minmax(0,1.4fr)_minmax(0,1.2fr)_minmax(0,1.5fr)_minmax(0,1fr)_auto] gap-2 items-center px-2 py-1.5 border-b border-card last:border-b-0"
+            >
+              <input
+                type="checkbox"
+                checked={checked.has(r.id)}
+                onChange={() => {
+                  setChecked((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(r.id)) next.delete(r.id);
+                    else next.add(r.id);
+                    return next;
+                  });
+                }}
+                aria-label={`Select ${r.name}`}
+              />
+              <div className="min-w-0">
+                <div className="text-xs font-medium truncate">{r.name}</div>
+                <div className="text-[10px] text-ink-faint truncate font-mono">{r.path}</div>
+              </div>
+              <input
+                value={draft.name}
+                onChange={(e) => updateDraft(r.id, { name: e.target.value })}
+                placeholder="(no override)"
+                disabled={isBusy}
+                className="field text-xs px-2 py-1"
+              />
+              <input
+                value={draft.email}
+                onChange={(e) => updateDraft(r.id, { email: e.target.value })}
+                placeholder="(no override)"
+                disabled={isBusy}
+                className="field text-xs px-2 py-1"
+              />
+              <div className="min-w-0 text-[11px]">
+                {res ? (
+                  <>
+                    <IdentitySourceLabel source={res.source} />
+                    <div className="text-[10px] text-ink-faint truncate font-mono">
+                      {res.email || '(no email)'}
+                    </div>
+                  </>
+                ) : (
+                  <span className="text-ink-faint">…</span>
+                )}
+              </div>
+              <div className="flex gap-1">
+                <button
+                  onClick={() => onSaveRow(r.id)}
+                  disabled={isBusy || !dirty}
+                  className="text-[11px] px-2 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-40"
+                  title="Save this row"
+                >
+                  Save
+                </button>
+                {(r.identity || draft.name || draft.email) && (
+                  <button
+                    onClick={() => onClearRow(r.id)}
+                    disabled={isBusy}
+                    className="text-[11px] px-2 py-1 rounded border border-card hover:bg-card disabled:opacity-40"
+                    title="Clear this repo's override"
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+            </li>
+          );
+        })}
+      </ul>
     </div>
   );
 }
@@ -2621,7 +3178,7 @@ function ManageRepoSheet({
   initialTab,
 }: {
   repoId: UUID;
-  initialTab: 'tags' | 'remotes' | 'submodules';
+  initialTab: 'tags' | 'remotes' | 'submodules' | 'identity';
 }): JSX.Element {
   const repo = useStore((s) => s.repos.find((r) => r.id === repoId));
   const setSheet = useStore((s) => s.setSheet);
@@ -2645,14 +3202,173 @@ function ManageRepoSheet({
           active={tab === 'submodules'}
           onClick={() => setTab('submodules')}
         />
+        <FileHistoryTab
+          label="Identity"
+          active={tab === 'identity'}
+          onClick={() => setTab('identity')}
+        />
       </div>
       <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
         {tab === 'tags' && <TagsPane repoId={repoId} />}
         {tab === 'remotes' && <RemotesPane repoId={repoId} />}
         {tab === 'submodules' && <SubmodulesPane repoId={repoId} />}
+        {tab === 'identity' && <IdentityPane repoId={repoId} />}
       </div>
     </>
   );
+}
+
+function IdentityPane({ repoId }: { repoId: UUID }): JSX.Element {
+  const repo = useStore((s) => s.repos.find((r) => r.id === repoId))!;
+  const pushToast = useStore((s) => s.pushToast);
+  const [resolved, setResolved] = useState<ResolvedIdentity | null>(null);
+  const [name, setName] = useState(repo.identity?.name ?? '');
+  const [email, setEmail] = useState(repo.identity?.email ?? '');
+  const [busy, setBusy] = useState(false);
+
+  const refresh = async () => {
+    const r = await window.overgit.invoke('repo:resolveIdentity', repoId);
+    setResolved(r);
+  };
+
+  useEffect(() => {
+    void refresh();
+  }, [repoId]);
+
+  // Re-sync the form when the underlying repo.identity changes (e.g.
+  // we just saved or cleared).
+  useEffect(() => {
+    setName(repo.identity?.name ?? '');
+    setEmail(repo.identity?.email ?? '');
+  }, [repo.identity?.name, repo.identity?.email]);
+
+  const onSave = async () => {
+    if (!name.trim() || !email.trim()) return;
+    setBusy(true);
+    try {
+      const identity: Identity = { name: name.trim(), email: email.trim() };
+      await window.overgit.invoke('repo:setIdentity', { repoId, identity });
+      // Update the renderer-side Repo so other panels see the change
+      // without a hydrate round-trip.
+      useStore.setState({
+        repos: useStore.getState().repos.map((r) =>
+          r.id === repoId ? { ...r, identity } : r,
+        ),
+      });
+      pushToast({ kind: 'success', message: 'Per-repo identity saved.' });
+      void refresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onClear = async () => {
+    setBusy(true);
+    try {
+      await window.overgit.invoke('repo:setIdentity', { repoId, identity: null });
+      useStore.setState({
+        repos: useStore.getState().repos.map((r) =>
+          r.id === repoId ? { ...r, identity: undefined } : r,
+        ),
+      });
+      setName('');
+      setEmail('');
+      pushToast({ kind: 'success', message: 'Override cleared.' });
+      void refresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex-1 overflow-y-auto p-5 flex flex-col gap-5 text-sm">
+      <section className="rounded-lg border border-card bg-card/40 px-4 py-3">
+        <div className="text-[10px] uppercase tracking-wide text-ink-faint">
+          Resolved identity
+        </div>
+        {resolved ? (
+          <>
+            <div className="mt-1 text-sm font-medium">
+              {resolved.name || <span className="text-amber-400">(no name)</span>}{' '}
+              <span className="text-ink-faint font-mono text-[11px]">
+                &lt;{resolved.email || '(no email)'}&gt;
+              </span>
+            </div>
+            <div className="mt-1 text-[11px] text-ink-faint">
+              Source: <IdentitySourceLabel source={resolved.source} />
+            </div>
+          </>
+        ) : (
+          <div className="mt-1 text-[11px] text-ink-faint">Resolving…</div>
+        )}
+      </section>
+
+      <section>
+        <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-accent">
+          Override
+        </div>
+        <div className="mt-0.5 text-[13px] font-semibold text-ink leading-tight">
+          Per-repo author / committer
+        </div>
+        <div className="mt-1 text-[11px] leading-snug text-ink-faint">
+          Pins every commit overgit makes in this repo to the values below — wins over the
+          repo's local git config and the global default. Leave blank to fall back through
+          the precedence chain (repo's .git/config → global default → system git).
+        </div>
+
+        <div className="mt-3 flex flex-col gap-2 max-w-md">
+          <label className="text-[11px] uppercase tracking-wide text-ink-faint">Name</label>
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="Author name"
+            className="field px-2 py-1.5 text-sm"
+          />
+          <label className="text-[11px] uppercase tracking-wide text-ink-faint mt-2">Email</label>
+          <input
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            placeholder="you@example.com"
+            className="field px-2 py-1.5 text-sm"
+          />
+          <div className="flex gap-2 mt-2">
+            <button
+              onClick={onSave}
+              disabled={busy || !name.trim() || !email.trim()}
+              className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+            >
+              Save override
+            </button>
+            {repo.identity && (
+              <button
+                onClick={onClear}
+                disabled={busy}
+                className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+              >
+                Clear override
+              </button>
+            )}
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function IdentitySourceLabel({
+  source,
+}: {
+  source: ResolvedIdentity['source'];
+}): JSX.Element {
+  const map: Record<ResolvedIdentity['source'], { label: string; tone: string }> = {
+    override: { label: 'per-repo override', tone: 'text-emerald-400' },
+    'repo-config': { label: "repo's .git/config", tone: 'text-ink' },
+    'global-default': { label: 'overgit global default', tone: 'text-accent' },
+    system: { label: 'system git config', tone: 'text-amber-400' },
+    unset: { label: 'NOT SET — commits will fail', tone: 'text-red-400' },
+  };
+  const v = map[source];
+  return <span className={`font-mono ${v.tone}`}>{v.label}</span>;
 }
 
 function TagsPane({ repoId }: { repoId: UUID }): JSX.Element {

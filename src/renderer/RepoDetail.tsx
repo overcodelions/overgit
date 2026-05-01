@@ -9,6 +9,7 @@ import type {
   GraphCommit,
   LlmTool,
   RepoStatus,
+  ResolvedIdentity,
   UUID,
   Worktree,
 } from '@shared/types';
@@ -732,6 +733,7 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
         />
 
         <div className="mt-auto p-3 border-t border-card flex flex-col gap-2">
+          <IdentityIndicator repoId={repoId} />
           <CommitMessageSuggest
             repoId={repoId}
             stagedCount={staged.length}
@@ -837,6 +839,68 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
 /// the first available LLM CLI by default (claude > codex > gemini),
 /// runs `cli:suggestCommitMessage` on the staged diff, and drops the
 /// result into the commit input on success.
+function IdentityIndicator({ repoId }: { repoId: UUID }): JSX.Element | null {
+  const setSheet = useStore((s) => s.setSheet);
+  const [resolved, setResolved] = useState<ResolvedIdentity | null>(null);
+
+  // Re-resolve when the repo changes or after a commit lands (other
+  // commits may have changed local config). The store doesn't have a
+  // commit-finished pubsub yet, but refreshing on every status tick is
+  // overkill — keep it on mount + repoId. The user can also reopen the
+  // pane to refresh.
+  useEffect(() => {
+    let cancelled = false;
+    void window.overgit.invoke('repo:resolveIdentity', repoId).then((r) => {
+      if (!cancelled) setResolved(r);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [repoId]);
+
+  if (!resolved) return null;
+
+  // Tone — the wrong-user bug almost always lives in `system` (we
+  // silently inherit the global ~/.gitconfig). Surface that in amber so
+  // it's visible even when the user wasn't looking for it. `unset` is
+  // outright red — commits will fail.
+  const tone =
+    resolved.source === 'unset'
+      ? 'border-red-500/40 bg-red-500/10 text-red-200'
+      : resolved.source === 'system'
+        ? 'border-amber-500/40 bg-amber-500/10 text-amber-100'
+        : 'border-card bg-card/40 text-ink-muted';
+
+  const sourceLabel: Record<ResolvedIdentity['source'], string> = {
+    override: 'per-repo override',
+    'repo-config': "repo's git config",
+    'global-default': 'overgit default',
+    system: 'system git config',
+    unset: 'NOT SET',
+  };
+
+  return (
+    <button
+      onClick={() => setSheet({ kind: 'manageRepo', repoId, tab: 'identity' })}
+      className={`text-left text-[10px] px-2 py-1.5 rounded border ${tone} hover:opacity-90 transition-opacity`}
+      title="Click to change the per-repo identity override"
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className="uppercase tracking-wide opacity-70">Committing as</span>
+        <span className="opacity-70 truncate">{sourceLabel[resolved.source]}</span>
+      </div>
+      <div className="mt-0.5 truncate">
+        <span className="font-medium">
+          {resolved.name || <span className="opacity-60">(no name)</span>}
+        </span>{' '}
+        <span className="font-mono opacity-70">
+          &lt;{resolved.email || '(no email)'}&gt;
+        </span>
+      </div>
+    </button>
+  );
+}
+
 function CommitMessageSuggest({
   repoId,
   stagedCount,
