@@ -2031,14 +2031,16 @@ export async function commitGraph(
   return out;
 }
 
-/// Single-file diff for the Changes pane. `staged` shows index vs HEAD;
-/// otherwise we show worktree vs index, with one carve-out: untracked
-/// files have no index entry, so we synthesize an "add" diff against
-/// /dev/null using `git diff --no-index`.
+/// Single-file diff for the Changes pane. `staged` shows index vs HEAD,
+/// `unstaged` shows worktree vs index, `combined` shows worktree vs HEAD
+/// (the simple-mode view, where the staged/unstaged split is hidden).
+/// Untracked files have no index entry / HEAD blob to diff against, so
+/// we synthesize an "add" diff against /dev/null using `git diff
+/// --no-index`.
 export async function diffFile(
   repoPath: string,
   filePath: string,
-  side: 'staged' | 'unstaged',
+  side: 'staged' | 'unstaged' | 'combined',
 ): Promise<FileDiff[]> {
   if (!looksLikeRepo(repoPath)) return [];
   if (side === 'staged') {
@@ -2047,12 +2049,16 @@ export async function diffFile(
     return splitDiff(res.stdout).map(parseFileBlock);
   }
 
-  // Unstaged: try `git diff -- <path>` first. For untracked files this
-  // returns nothing (untracked has no index entry to diff against), so
-  // we fall back to `diff --no-index /dev/null <path>` to synthesize an
+  // Unstaged or combined: try a tracked diff first (`git diff` for
+  // unstaged → worktree vs index; `git diff HEAD` for combined →
+  // worktree vs HEAD). For untracked files this returns nothing, so we
+  // fall back to `diff --no-index /dev/null <path>` to synthesize an
   // add-diff. `--no-index` exits 1 when there's a difference (which is
   // the normal case here), so we tolerate exit-1 explicitly.
-  const tracked = await run(repoPath, ['diff', '--no-color', '--', filePath]);
+  const trackedArgs = side === 'combined'
+    ? ['diff', 'HEAD', '--no-color', '--', filePath]
+    : ['diff', '--no-color', '--', filePath];
+  const tracked = await run(repoPath, trackedArgs);
   if (tracked.ok && tracked.stdout.trim().length > 0) {
     return splitDiff(tracked.stdout).map(parseFileBlock);
   }
