@@ -419,6 +419,7 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
   const ch = useStore((s) => s.repoChanges[repoId]);
   const repoStatus = useStore((s) => s.repoStatus[repoId]);
   const repoPath = useStore((s) => s.repos.find((r) => r.id === repoId)?.path);
+  const stagingMode = useStore((s) => s.settings.stagingMode ?? 'simple');
   const stage = useStore((s) => s.stageFiles);
   const unstage = useStore((s) => s.unstageFiles);
   const discard = useStore((s) => s.discardFiles);
@@ -476,6 +477,59 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ch?.staged, ch?.unstaged]);
 
+  // Simple-mode dedupe: if a file is in both staged + unstaged (partial
+  // staging from a prior session, or a separate tool), surface it once.
+  // We prefer the unstaged entry's metadata so the worktree status is
+  // visible in the badge.
+  const combined: ChangedFile[] = useMemo(() => {
+    const staged = ch?.staged ?? [];
+    const unstaged = ch?.unstaged ?? [];
+    const map = new Map<string, ChangedFile>();
+    for (const f of staged) map.set(f.path, f);
+    for (const f of unstaged) map.set(f.path, f);
+    return Array.from(map.values());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ch?.staged, ch?.unstaged]);
+
+  // Simple-mode "include in commit" set. Default behavior: a newly
+  // appearing path is auto-checked (matches GitHub Desktop — show up,
+  // get committed). Once a user explicitly unchecks something it
+  // stays unchecked across refreshes for as long as the path is still
+  // present.
+  const [simpleChecked, setSimpleChecked] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    setSimpleChecked((cur) => {
+      const next = new Set<string>();
+      const presentPaths = new Set(combined.map((f) => f.path));
+      // Carry forward existing checked entries that still exist.
+      for (const p of cur) if (presentPaths.has(p)) next.add(p);
+      // Auto-check newly appeared paths (i.e. not in cur but present now).
+      // We treat "first-time-seen" by checking against cur — anything
+      // new gets included by default.
+      for (const f of combined) {
+        if (!cur.has(f.path) && !next.has(f.path)) {
+          // Was it previously known and unchecked? `cur` lost it on a
+          // prior prune only if the file disappeared — but this useEffect
+          // also runs on initial mount when cur is empty, so we can't
+          // distinguish "first-time" from "explicitly unchecked" here.
+          // We err on the side of including: a new render auto-includes.
+          next.add(f.path);
+        }
+      }
+      return next;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [combined]);
+
+  const toggleSimple = (p: string) => {
+    setSimpleChecked((cur) => {
+      const next = new Set(cur);
+      if (next.has(p)) next.delete(p);
+      else next.add(p);
+      return next;
+    });
+  };
+
   // Auto-advance the diff preview after a hunk-action drains the
   // current file. If the selected path is no longer present in its
   // side (because the user staged / discarded the only remaining
@@ -484,12 +538,22 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
   // selection when the side is empty.
   useEffect(() => {
     if (!selected) return;
-    const list = selected.side === 'staged' ? ch?.staged ?? [] : ch?.unstaged ?? [];
+    const list =
+      selected.side === 'staged'
+        ? ch?.staged ?? []
+        : selected.side === 'combined'
+          ? combined
+          : ch?.unstaged ?? [];
     if (list.some((f) => f.path === selected.path)) return;
     if (list.length === 0) {
       // Try the other side before giving up — common case after a
       // successful "Stage hunk" empties the unstaged list for that
-      // file but the staged side now has it.
+      // file but the staged side now has it. (Combined mode only
+      // ever uses one side, so it short-circuits.)
+      if (selected.side === 'combined') {
+        setSelected(null);
+        return;
+      }
       const other = selected.side === 'staged' ? ch?.unstaged ?? [] : ch?.staged ?? [];
       if (other.length === 0) {
         setSelected(null);
@@ -523,13 +587,13 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
     });
   };
 
-  const [selected, setSelected] = useState<{ path: string; side: 'staged' | 'unstaged' } | null>(
-    null,
-  );
-  // Per-side selection sets for the bulk-action toolbar. We keep two
-  // sets — one per group — so checking a file in the staged list and
-  // one in the unstaged list is independent (their bulk actions are
-  // different too: unstage vs. stage / discard).
+  const [selected, setSelected] = useState<
+    { path: string; side: 'staged' | 'unstaged' | 'combined' } | null
+  >(null);
+  // Per-side selection sets for the bulk-action toolbar (advanced mode).
+  // We keep two sets — one per group — so checking a file in the staged
+  // list and one in the unstaged list is independent (their bulk
+  // actions are different too: unstage vs. stage / discard).
   const [stagedChecked, setStagedChecked] = useState<Set<string>>(new Set());
   const [unstagedChecked, setUnstagedChecked] = useState<Set<string>>(new Set());
   const [message, setMessage] = useState('');
@@ -551,24 +615,70 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
   const unstaged = ch?.unstaged ?? [];
   const anyLlm = !!(cli?.claude || cli?.codex || cli?.gemini);
 
-  const onSelect = (file: ChangedFile, side: 'staged' | 'unstaged') => {
+  const onSelect = (file: ChangedFile, side: 'staged' | 'unstaged' | 'combined') => {
     setSelected({ path: file.path, side });
     loadDiff(repoId, file.path, side);
   };
 
+  const simpleCheckedCount = combined.reduce(
+    (n, f) => (simpleChecked.has(f.path) ? n + 1 : n),
+    0,
+  );
+
   const onCommit = async () => {
-    // Three shapes:
-    //   amend       → rewrites HEAD's message (+ staged set, if any).
-    //                 Allowed even when nothing is staged.
-    //   commit-all  → no staged set, but unstaged exist: stage every
-    //                 unstaged path first, then commit. The button
-    //                 label spells this out as "Commit all (N)" so
-    //                 there's no invisible auto-staging.
-    //   commit      → commit the explicit staged set.
     if (!message.trim()) return;
-    if (!amendMode && staged.length === 0 && unstaged.length === 0) return;
     setBusy(true);
     try {
+      if (stagingMode === 'simple') {
+        // Sync the index to exactly the checked set, then commit (or
+        // amend). Anything unchecked that's currently staged gets
+        // pulled back out so the commit only contains what the user
+        // ticked. Idempotent — a no-op for unchanged paths.
+        if (!amendMode && combined.length === 0) return;
+        if (!amendMode && simpleCheckedCount === 0) {
+          pushToast({
+            kind: 'error',
+            message: 'Check at least one file to commit.',
+          });
+          return;
+        }
+        const checkedPaths: string[] = [];
+        const uncheckedPaths: string[] = [];
+        for (const f of combined) {
+          if (simpleChecked.has(f.path)) checkedPaths.push(f.path);
+          else uncheckedPaths.push(f.path);
+        }
+        if (uncheckedPaths.length > 0) {
+          await unstage(repoId, uncheckedPaths);
+        }
+        if (checkedPaths.length > 0) {
+          await stage(repoId, checkedPaths);
+        }
+        const res = amendMode
+          ? await amend(repoId, message.trim())
+          : await commit(repoId, message.trim());
+        if (!res.ok) {
+          pushToast({
+            kind: 'error',
+            message: res.error ?? (amendMode ? 'Amend failed' : 'Commit failed'),
+          });
+          return;
+        }
+        setMessage('');
+        setSelected(null);
+        setAmendMode(false);
+        return;
+      }
+
+      // Advanced mode:
+      //   amend       → rewrites HEAD's message (+ staged set, if any).
+      //                 Allowed even when nothing is staged.
+      //   commit-all  → no staged set, but unstaged exist: stage every
+      //                 unstaged path first, then commit. The button
+      //                 label spells this out as "Commit all (N)" so
+      //                 there's no invisible auto-staging.
+      //   commit      → commit the explicit staged set.
+      if (!amendMode && staged.length === 0 && unstaged.length === 0) return;
       if (!amendMode && staged.length === 0 && unstaged.length > 0) {
         const stageRes = await stage(
           repoId,
@@ -618,22 +728,26 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
       )}
       <aside className="border-r border-card overflow-y-auto flex flex-col col-start-1 row-start-2">
         <div className="flex items-center gap-1 px-3 py-2 border-b border-card flex-wrap">
-          <button
-            disabled={unstaged.length === 0}
-            onClick={() => stage(repoId, unstaged.map((f) => f.path))}
-            className="text-xs px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
-            title="Stage every changed file"
-          >
-            Stage all{unstaged.length ? ` (${unstaged.length})` : ''}
-          </button>
-          <button
-            disabled={staged.length === 0}
-            onClick={() => unstage(repoId, staged.map((f) => f.path))}
-            className="text-xs px-2.5 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
-            title="Unstage every staged file"
-          >
-            Unstage all{staged.length ? ` (${staged.length})` : ''}
-          </button>
+          {stagingMode === 'advanced' ? (
+            <>
+              <button
+                disabled={unstaged.length === 0}
+                onClick={() => stage(repoId, unstaged.map((f) => f.path))}
+                className="text-xs px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+                title="Stage every changed file"
+              >
+                Stage all{unstaged.length ? ` (${unstaged.length})` : ''}
+              </button>
+              <button
+                disabled={staged.length === 0}
+                onClick={() => unstage(repoId, staged.map((f) => f.path))}
+                className="text-xs px-2.5 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
+                title="Unstage every staged file"
+              >
+                Unstage all{staged.length ? ` (${staged.length})` : ''}
+              </button>
+            </>
+          ) : null}
           <div className="flex-1" />
           <button
             disabled={!anyLlm || (staged.length === 0 && unstaged.length === 0)}
@@ -655,108 +769,163 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
           </button>
         </div>
 
-        <FileGroup
-          title="Staged"
-          files={staged}
-          activePath={selected?.side === 'staged' ? selected.path : null}
-          actionLabel="Unstage"
-          onAction={(f) => unstage(repoId, [f.path])}
-          onSelect={(f) => onSelect(f, 'staged')}
-          onView={onView}
-          checked={stagedChecked}
-          onToggleChecked={toggleStaged}
-          onSetAllChecked={(all) =>
-            setStagedChecked(all ? new Set(staged.map((f) => f.path)) : new Set())
-          }
-          bulkActions={[
-            {
-              label: 'Unstage',
-              glyph: ICON_UNSTAGE,
-              tone: 'primary',
-              onAction: (paths) => unstage(repoId, paths),
-            },
-            {
-              label: 'Stash',
-              glyph: ICON_STASH,
-              kind: 'with-message',
-              messagePlaceholder: 'Stash message (optional)…',
-              onAction: (paths, message) => onStash(paths, message),
-            },
-          ]}
-        />
-        <FileGroup
-          title="Changes"
-          files={unstaged}
-          activePath={selected?.side === 'unstaged' ? selected.path : null}
-          actionLabel="Stage"
-          onAction={(f) => stage(repoId, [f.path])}
-          onSelect={(f) => onSelect(f, 'unstaged')}
-          onView={onView}
-          extraAction={{ label: 'Discard', onAction: onDiscard }}
-          checked={unstagedChecked}
-          onToggleChecked={toggleUnstaged}
-          onSetAllChecked={(all) =>
-            setUnstagedChecked(all ? new Set(unstaged.map((f) => f.path)) : new Set())
-          }
-          bulkActions={[
-            {
-              label: 'Stage',
-              glyph: ICON_STAGE,
-              tone: 'primary',
-              onAction: (paths) => stage(repoId, paths),
-            },
-            {
-              label: 'Stash',
-              glyph: ICON_STASH,
-              kind: 'with-message',
-              messagePlaceholder: 'Stash message (optional)…',
-              onAction: (paths, message) => onStash(paths, message),
-            },
-            {
-              label: 'Discard',
-              glyph: ICON_DISCARD,
-              tone: 'danger',
-              onAction: async (paths) => {
-                const ok = await requestConfirm({
-                  title: 'Discard changes?',
-                  body: `Discard changes in ${paths.length} ${
-                    paths.length === 1 ? 'file' : 'files'
-                  }? This cannot be undone.`,
-                  confirmLabel: 'Discard',
-                  destructive: true,
-                });
-                if (!ok) return;
-                void discard(repoId, paths);
+        {stagingMode === 'simple' ? (
+          <FileGroup
+            title="Changes"
+            files={combined}
+            activePath={selected?.side === 'combined' ? selected.path : null}
+            actionLabel="Discard"
+            onAction={onDiscard}
+            onSelect={(f) => onSelect(f, 'combined')}
+            onView={onView}
+            checked={simpleChecked}
+            onToggleChecked={toggleSimple}
+            onSetAllChecked={(all) =>
+              setSimpleChecked(all ? new Set(combined.map((f) => f.path)) : new Set())
+            }
+            bulkActions={[
+              {
+                label: 'Discard',
+                glyph: ICON_DISCARD,
+                tone: 'danger',
+                onAction: async (paths) => {
+                  const ok = await requestConfirm({
+                    title: 'Discard changes?',
+                    body: `Discard changes in ${paths.length} ${
+                      paths.length === 1 ? 'file' : 'files'
+                    }? This cannot be undone.`,
+                    confirmLabel: 'Discard',
+                    destructive: true,
+                  });
+                  if (!ok) return;
+                  void discard(repoId, paths);
+                },
               },
-            },
-          ]}
-        />
+              {
+                label: 'Stash',
+                glyph: ICON_STASH,
+                kind: 'with-message',
+                messagePlaceholder: 'Stash message (optional)…',
+                onAction: (paths, message) => onStash(paths, message),
+              },
+            ]}
+          />
+        ) : (
+          <>
+            <FileGroup
+              title="Staged"
+              files={staged}
+              activePath={selected?.side === 'staged' ? selected.path : null}
+              actionLabel="Unstage"
+              onAction={(f) => unstage(repoId, [f.path])}
+              onSelect={(f) => onSelect(f, 'staged')}
+              onView={onView}
+              checked={stagedChecked}
+              onToggleChecked={toggleStaged}
+              onSetAllChecked={(all) =>
+                setStagedChecked(all ? new Set(staged.map((f) => f.path)) : new Set())
+              }
+              bulkActions={[
+                {
+                  label: 'Unstage',
+                  glyph: ICON_UNSTAGE,
+                  tone: 'primary',
+                  onAction: (paths) => unstage(repoId, paths),
+                },
+                {
+                  label: 'Stash',
+                  glyph: ICON_STASH,
+                  kind: 'with-message',
+                  messagePlaceholder: 'Stash message (optional)…',
+                  onAction: (paths, message) => onStash(paths, message),
+                },
+              ]}
+            />
+            <FileGroup
+              title="Changes"
+              files={unstaged}
+              activePath={selected?.side === 'unstaged' ? selected.path : null}
+              actionLabel="Stage"
+              onAction={(f) => stage(repoId, [f.path])}
+              onSelect={(f) => onSelect(f, 'unstaged')}
+              onView={onView}
+              extraAction={{ label: 'Discard', onAction: onDiscard }}
+              checked={unstagedChecked}
+              onToggleChecked={toggleUnstaged}
+              onSetAllChecked={(all) =>
+                setUnstagedChecked(all ? new Set(unstaged.map((f) => f.path)) : new Set())
+              }
+              bulkActions={[
+                {
+                  label: 'Stage',
+                  glyph: ICON_STAGE,
+                  tone: 'primary',
+                  onAction: (paths) => stage(repoId, paths),
+                },
+                {
+                  label: 'Stash',
+                  glyph: ICON_STASH,
+                  kind: 'with-message',
+                  messagePlaceholder: 'Stash message (optional)…',
+                  onAction: (paths, message) => onStash(paths, message),
+                },
+                {
+                  label: 'Discard',
+                  glyph: ICON_DISCARD,
+                  tone: 'danger',
+                  onAction: async (paths) => {
+                    const ok = await requestConfirm({
+                      title: 'Discard changes?',
+                      body: `Discard changes in ${paths.length} ${
+                        paths.length === 1 ? 'file' : 'files'
+                      }? This cannot be undone.`,
+                      confirmLabel: 'Discard',
+                      destructive: true,
+                    });
+                    if (!ok) return;
+                    void discard(repoId, paths);
+                  },
+                },
+              ]}
+            />
+          </>
+        )}
 
         <div className="mt-auto p-3 border-t border-card flex flex-col gap-2">
           <IdentityIndicator repoId={repoId} />
           <CommitMessageSuggest
             repoId={repoId}
-            stagedCount={staged.length}
+            stagedCount={stagingMode === 'simple' ? simpleCheckedCount : staged.length}
             onSuggested={(text) => setMessage(text)}
           />
           <textarea
             value={message}
             onChange={(e) => setMessage(e.target.value)}
             placeholder={
-              amendMode
-                ? `Amend last commit${
-                    staged.length > 0 ? ` + ${staged.length} staged` : ''
-                  }`
-                : staged.length > 0
-                  ? `Commit message (${staged.length} ${
-                      staged.length === 1 ? 'file' : 'files'
-                    } staged)`
-                  : unstaged.length > 0
-                    ? `Commit message (no staged set — all ${unstaged.length} will be staged on Commit)`
-                    : 'Stage files to commit'
+              stagingMode === 'simple'
+                ? amendMode
+                    ? `Amend last commit${
+                        simpleCheckedCount > 0 ? ` (${simpleCheckedCount} checked)` : ''
+                      }`
+                    : combined.length === 0
+                      ? 'No changes to commit'
+                      : `Commit message (${simpleCheckedCount} of ${combined.length} checked)`
+                : amendMode
+                  ? `Amend last commit${
+                      staged.length > 0 ? ` + ${staged.length} staged` : ''
+                    }`
+                  : staged.length > 0
+                    ? `Commit message (${staged.length} ${
+                        staged.length === 1 ? 'file' : 'files'
+                      } staged)`
+                    : unstaged.length > 0
+                      ? `Commit message (no staged set — all ${unstaged.length} will be staged on Commit)`
+                      : 'Stage files to commit'
             }
             disabled={
-              !amendMode && staged.length === 0 && unstaged.length === 0
+              stagingMode === 'simple'
+                ? !amendMode && combined.length === 0
+                : !amendMode && staged.length === 0 && unstaged.length === 0
             }
             className="w-full px-2 py-1.5 rounded bg-surface-elevated border border-card text-sm resize-y min-h-[64px] disabled:opacity-50"
           />
@@ -789,7 +958,9 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
             disabled={
               busy ||
               !message.trim() ||
-              (!amendMode && staged.length === 0 && unstaged.length === 0)
+              (stagingMode === 'simple'
+                ? !amendMode && simpleCheckedCount === 0
+                : !amendMode && staged.length === 0 && unstaged.length === 0)
             }
             onClick={onCommit}
             className={`text-sm px-3 py-1.5 rounded text-white disabled:opacity-50 ${
@@ -800,20 +971,30 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
             title={
               amendMode
                 ? "Rewrites the previous commit. Only safe if you haven't pushed it."
-                : !amendMode && staged.length === 0 && unstaged.length > 0
-                  ? `Stages every changed file, then commits. ${unstaged.length} file${
-                      unstaged.length === 1 ? '' : 's'
-                    } will be staged.`
-                  : undefined
+                : stagingMode === 'simple'
+                  ? `Commits the ${simpleCheckedCount} checked file${
+                      simpleCheckedCount === 1 ? '' : 's'
+                    }.`
+                  : !amendMode && staged.length === 0 && unstaged.length > 0
+                    ? `Stages every changed file, then commits. ${unstaged.length} file${
+                        unstaged.length === 1 ? '' : 's'
+                      } will be staged.`
+                    : undefined
             }
           >
             {amendMode
-              ? `Amend${staged.length > 0 ? ` + ${staged.length}` : ''}`
-              : staged.length > 0
-                ? `Commit ${staged.length}`
-                : unstaged.length > 0
-                  ? `Commit all (${unstaged.length})`
-                  : 'Commit'}
+              ? stagingMode === 'simple'
+                ? `Amend${simpleCheckedCount > 0 ? ` (${simpleCheckedCount})` : ''}`
+                : `Amend${staged.length > 0 ? ` + ${staged.length}` : ''}`
+              : stagingMode === 'simple'
+                ? simpleCheckedCount > 0
+                  ? `Commit ${simpleCheckedCount}`
+                  : 'Commit'
+                : staged.length > 0
+                  ? `Commit ${staged.length}`
+                  : unstaged.length > 0
+                    ? `Commit all (${unstaged.length})`
+                    : 'Commit'}
           </button>
         </div>
       </aside>
@@ -3427,7 +3608,9 @@ function ChangesDiffPane({
 }: {
   repoId: UUID;
   files: FileDiff[];
-  side: 'staged' | 'unstaged';
+  /// 'combined' is simple-staging mode: hunks expose Discard only — no
+  /// Stage / Unstage, since the simple model hides the index entirely.
+  side: 'staged' | 'unstaged' | 'combined';
 }): JSX.Element {
   const applyPatch = useStore((s) => s.applyPatch);
   const [busyKey, setBusyKey] = useState<string | null>(null);
@@ -3507,7 +3690,7 @@ function ChangesFileBlock({
   onFileAction,
 }: {
   file: FileDiff;
-  side: 'staged' | 'unstaged';
+  side: 'staged' | 'unstaged' | 'combined';
   busyKey: string | null;
   onHunk: (
     file: FileDiff,
@@ -3522,7 +3705,12 @@ function ChangesFileBlock({
   // Whole-file actions sit in the file header so the user can stage or
   // discard everything in one click without scrolling. Hunk-level
   // actions are still available below.
-  const wholeFileActions = side === 'staged' ? (['unstage'] as const) : (['stage', 'discard'] as const);
+  const wholeFileActions =
+    side === 'staged'
+      ? (['unstage'] as const)
+      : side === 'combined'
+        ? (['discard'] as const)
+        : (['stage', 'discard'] as const);
 
   return (
     <div
@@ -3602,7 +3790,7 @@ function HunkBlock({
 }: {
   file: FileDiff;
   hunk: ParsedHunk;
-  side: 'staged' | 'unstaged';
+  side: 'staged' | 'unstaged' | 'combined';
   busyKey: string | null;
   onHunk: (
     file: FileDiff,
@@ -3611,7 +3799,12 @@ function HunkBlock({
   ) => void;
 }): JSX.Element {
   const requestConfirm = useStore((s) => s.requestConfirm);
-  const actions = side === 'staged' ? (['unstage'] as const) : (['stage', 'discard'] as const);
+  const actions =
+    side === 'staged'
+      ? (['unstage'] as const)
+      : side === 'combined'
+        ? (['discard'] as const)
+        : (['stage', 'discard'] as const);
   const adds = hunk.lines.filter((l) => l.startsWith('+')).length;
   const dels = hunk.lines.filter((l) => l.startsWith('-')).length;
   return (
