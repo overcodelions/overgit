@@ -73,6 +73,7 @@ import { listFilesUnder, readFileUnderRoot, writeFileUnderRoot } from './fs';
 import {
   aggregateWorkspaceDirtyDiff,
   workspaceActivity,
+  workspaceBranchSuggestions,
   workspaceCheckout,
   workspaceCommitAll,
   workspaceFetch,
@@ -835,6 +836,11 @@ function registerIpc(): void {
     return workspaceFetch(workspaceId, workspaces, repos);
   });
 
+  ipcMain.handle('workspace:branchSuggestions', async (_e, workspaceId: string) => {
+    const { workspaces, repos } = Store.load();
+    return workspaceBranchSuggestions(workspaceId, workspaces, repos);
+  });
+
   ipcMain.handle('workspace:listPRs', async (_e, workspaceId: string) => {
     const { workspaces, repos } = Store.load();
     return workspaceListPRs(workspaceId, workspaces, repos);
@@ -981,14 +987,28 @@ function registerIpc(): void {
 
   ipcMain.handle(
     'cli:suggestCommitMessage',
-    async (_e, args: { repoId: string; tool: 'claude' | 'codex' | 'gemini' }) => {
+    async (
+      _e,
+      args: { repoId: string; tool: 'claude' | 'codex' | 'gemini'; paths?: string[] },
+    ) => {
       const repo = repoFromArg(args);
       if (!repo) {
         return { ok: false, error: 'Unknown repo', tool: args.tool };
       }
-      const diff = await rawDiff(repo.path, 'staged');
+      // When a path list is provided (simple/select-vs-stage mode), diff
+      // those paths vs HEAD so we summarize what the user will commit,
+      // not what happens to be staged. Without paths we keep the old
+      // behavior — diff `--cached` for advanced staging users.
+      const diff = await rawDiff(repo.path, 'staged', args.paths);
       if (!diff.ok) {
         return { ok: false, error: diff.error ?? 'Could not read staged diff', tool: args.tool };
+      }
+      if (!diff.text.trim()) {
+        const empty =
+          args.paths && args.paths.length > 0
+            ? 'Selected files have no changes vs HEAD.'
+            : 'No staged changes to summarize.';
+        return { ok: false, error: empty, tool: args.tool };
       }
       return suggestCommitMessage(args.tool, diff.text);
     },

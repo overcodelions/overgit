@@ -182,6 +182,11 @@ interface UiState {
 
   refreshRepoChanges: (id: UUID) => Promise<void>;
   refreshRepoStatus: (id: UUID) => Promise<void>;
+  /// Fan out `repo:status` for every known repo so the sidebar can flag
+  /// dirty / ahead / behind state without the user having to click into
+  /// each one. Failures on individual repos are swallowed — a single
+  /// broken repo shouldn't blank out the markers for the rest.
+  refreshAllRepoStatuses: () => Promise<void>;
   refreshRepoBranches: (id: UUID) => Promise<void>;
   refreshRepoBranchSummaries: (id: UUID) => Promise<void>;
   refreshRepoGraph: (id: UUID) => Promise<void>;
@@ -344,6 +349,11 @@ export const useStore = create<UiState>((set, get) => ({
         get().selectWorkspace(snap.workspaces[0].id);
       }
     }
+    // Background-refresh statuses for every repo so the sidebar can
+    // surface dirty / ahead / behind dots without waiting for the user
+    // to click each one. Don't await — the rest of the UI should render
+    // immediately even if this fan-out is slow on a big library.
+    void get().refreshAllRepoStatuses();
   },
 
   pickAndAddRepo: async () => {
@@ -384,6 +394,9 @@ export const useStore = create<UiState>((set, get) => ({
     // Auto-select the first newly added repo so the detail pane
     // populates immediately, matching the previous single-pick UX.
     if (result.repos[0]) get().selectRepo(result.repos[0].id);
+    // Pick up sidebar dirty/upstream markers for the freshly added
+    // repos without waiting for the next launch.
+    void get().refreshAllRepoStatuses();
   },
 
   createWorkspace: async (name, repoIds) => {
@@ -599,6 +612,25 @@ export const useStore = create<UiState>((set, get) => ({
   refreshRepoStatus: async (id) => {
     const st = await window.overgit.invoke('repo:status', id);
     set({ repoStatus: { ...get().repoStatus, [id]: st } });
+  },
+
+  refreshAllRepoStatuses: async () => {
+    const ids = get().repos.map((r) => r.id);
+    if (ids.length === 0) return;
+    const results = await Promise.all(
+      ids.map((id) =>
+        window.overgit
+          .invoke('repo:status', id)
+          .then((st) => [id, st] as const)
+          .catch(() => null),
+      ),
+    );
+    const next = { ...get().repoStatus };
+    for (const row of results) {
+      if (!row) continue;
+      next[row[0]] = row[1];
+    }
+    set({ repoStatus: next });
   },
 
   refreshRepoBranches: async (id) => {

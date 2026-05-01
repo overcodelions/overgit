@@ -242,13 +242,36 @@ function useGlobalShortcuts(): void {
 
       // Cmd+K → command palette. Wins over the inField guard so the
       // user can summon it from anywhere, including the search box.
-      // Cmd+P is deliberately NOT bound: in an Electron renderer it
-      // also fires the system Print dialog, and we'd rather not
-      // silently steal that on a diff or file view. Cmd+K alone is
-      // the documented shortcut.
       if (e.key === 'k' || e.key === 'K') {
         e.preventDefault();
         togglePalette();
+        return;
+      }
+      // Repo-scoped action shortcuts. Each fires a window event so the
+      // RepoDetail components own the actual git logic; the global
+      // handler just routes the keystroke. We ALWAYS preventDefault for
+      // Cmd+P even when no repo is open — Electron will otherwise pop
+      // the print dialog over the renderer, which is never useful here.
+      if ((e.key === 'p' || e.key === 'P') && !e.shiftKey) {
+        e.preventDefault();
+        if (selectedRepoId) {
+          window.dispatchEvent(new CustomEvent('overgit:repoPush'));
+        }
+        return;
+      }
+      if ((e.key === 'f' || e.key === 'F') && !e.shiftKey) {
+        if (selectedRepoId) {
+          e.preventDefault();
+          window.dispatchEvent(new CustomEvent('overgit:repoFetch'));
+          return;
+        }
+      }
+      // Cmd+Enter from inside the commit textarea (or anywhere) →
+      // commit the current selection. Pass through inField — that's
+      // exactly where the shortcut is most useful.
+      if (e.key === 'Enter' && selectedRepoId) {
+        e.preventDefault();
+        window.dispatchEvent(new CustomEvent('overgit:repoCommit'));
         return;
       }
       // Cmd+, → Settings (matches macOS convention).
@@ -276,12 +299,22 @@ function useGlobalShortcuts(): void {
         }
         return;
       }
-      // Cmd+N → New branch (workspace-wide if a workspace is open;
-      // otherwise we let the repo's BranchPicker handle it via Cmd+B).
-      if ((e.key === 'n' || e.key === 'N') && !e.shiftKey && !inField && selectedWsId) {
-        e.preventDefault();
-        setSheet({ kind: 'newBranchInWorkspace', workspaceId: selectedWsId });
-        return;
+      // Cmd+N → New branch. Prefer the focused repo when one is open —
+      // even if a workspace is also selected in the sidebar, the user
+      // is looking at the repo detail pane and expects the shortcut to
+      // act on what they see. Falls back to the workspace-wide sheet
+      // only when no repo is selected.
+      if ((e.key === 'n' || e.key === 'N') && !e.shiftKey && !inField) {
+        if (selectedRepoId) {
+          e.preventDefault();
+          window.dispatchEvent(new CustomEvent('overgit:newRepoBranch'));
+          return;
+        }
+        if (selectedWsId) {
+          e.preventDefault();
+          setSheet({ kind: 'newBranchInWorkspace', workspaceId: selectedWsId });
+          return;
+        }
       }
       // Cmd+1..5 dispatch a custom event that RepoDetail listens for.
       // Done this way so the shortcut works regardless of focus and
@@ -663,6 +696,7 @@ function RepoRow({
   onRemove: () => void;
 }): JSX.Element {
   const ref = useRef<HTMLDivElement | null>(null);
+  const status = useStore((s) => s.repoStatus[repo.id]);
   // Keep the keyboard-active row in view as the cursor moves through
   // a long list. `nearest` avoids jumpy auto-scrolls when the row is
   // already visible.
@@ -689,6 +723,7 @@ function RepoRow({
       >
         <RepoIcon />
         <span className="truncate">{repo.name}</span>
+        <RepoStatusBadge status={status} />
       </button>
       <button
         onClick={onRemove}
@@ -698,6 +733,40 @@ function RepoRow({
         <span className="text-[11px]">×</span>
       </button>
     </div>
+  );
+}
+
+/// Compact dirty / upstream indicator for the sidebar. Shown only when
+/// there's something to flag — a clean, in-sync repo gets nothing so
+/// the list stays quiet. We split the visual treatment so the user can
+/// scan: amber dot = local changes, ↑/↓ counts = drift vs upstream,
+/// red ⚠ = an in-progress merge/rebase the user paused on.
+function RepoStatusBadge({ status }: { status?: RepoStatus }): JSX.Element | null {
+  if (!status) return null;
+  const dirty = status.dirtyCount > 0;
+  const ahead = status.ahead ?? 0;
+  const behind = status.behind ?? 0;
+  const inProgress = !!status.inProgress;
+  if (!dirty && ahead === 0 && behind === 0 && !inProgress) return null;
+
+  const tip: string[] = [];
+  if (dirty) tip.push(`${status.dirtyCount} uncommitted ${status.dirtyCount === 1 ? 'change' : 'changes'}`);
+  if (ahead > 0) tip.push(`${ahead} ahead of upstream`);
+  if (behind > 0) tip.push(`${behind} behind upstream`);
+  if (inProgress) tip.push(`${status.inProgress} in progress`);
+
+  return (
+    <span
+      className="ml-auto flex items-center gap-1 shrink-0 text-[10px] font-mono"
+      title={tip.join(' · ')}
+    >
+      {inProgress && <span className="text-red-400">⚠</span>}
+      {dirty && (
+        <span className="w-1.5 h-1.5 rounded-full bg-amber-400" aria-label="dirty" />
+      )}
+      {ahead > 0 && <span className="text-emerald-400">↑{ahead}</span>}
+      {behind > 0 && <span className="text-sky-400">↓{behind}</span>}
+    </span>
   );
 }
 
@@ -853,6 +922,41 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
   const [branch, setBranch] = useState('');
   const [createIfMissing, setCreateIfMissing] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [branchPool, setBranchPool] = useState<
+    { branch: string; repoCount: number; total: number }[]
+  >([]);
+  const [suggestOpen, setSuggestOpen] = useState(false);
+
+  // Pull the cross-repo branch list once per workspace open. Refreshed
+  // explicitly via Refresh / Fetch all (those buttons already cause a
+  // workspace status reload, which is plenty of churn for the UI to
+  // also re-pull suggestions on top of).
+  useEffect(() => {
+    let cancelled = false;
+    window.overgit
+      .invoke('workspace:branchSuggestions', workspaceId)
+      .then((rows) => {
+        if (!cancelled) setBranchPool(rows);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId]);
+
+  // Filter to up to 8 matches as the user types. Empty input shows the
+  // top branches by repo coverage so an explorer can find candidates.
+  const filteredSuggestions = useMemo(() => {
+    const q = branch.trim().toLowerCase();
+    const rows = q
+      ? branchPool.filter((r) => r.branch.toLowerCase().includes(q))
+      : branchPool;
+    return rows.slice(0, 8);
+  }, [branch, branchPool]);
+
+  const exactMatch = useMemo(
+    () => branchPool.find((r) => r.branch === branch.trim()),
+    [branch, branchPool],
+  );
   /// `seenAtOpen` freezes the lastSeen value at mount so the "new
   /// since" pip remains visible while the user is on the pane. Without
   /// this, marking-seen on open would immediately wipe the indicators
@@ -1054,12 +1158,45 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
           Bring workspace to a branch
         </div>
         <div className="flex gap-2 items-center">
-          <input
-            value={branch}
-            onChange={(e) => setBranch(e.target.value)}
-            placeholder="branch name"
-            className="field flex-1 px-2 py-1.5 text-xs"
-          />
+          <div className="relative flex-1">
+            <input
+              value={branch}
+              onChange={(e) => {
+                setBranch(e.target.value);
+                setSuggestOpen(true);
+              }}
+              onFocus={() => setSuggestOpen(true)}
+              onBlur={() => {
+                // Defer so a click on a suggestion lands before the
+                // dropdown closes.
+                setTimeout(() => setSuggestOpen(false), 120);
+              }}
+              placeholder="branch name"
+              className="field w-full px-2 py-1.5 text-xs"
+            />
+            {suggestOpen && filteredSuggestions.length > 0 && (
+              <ul className="absolute left-0 right-0 top-full mt-1 z-20 max-h-64 overflow-y-auto rounded border border-card bg-surface-elevated shadow-lg">
+                {filteredSuggestions.map((row) => (
+                  <li key={row.branch}>
+                    <button
+                      type="button"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => {
+                        setBranch(row.branch);
+                        setSuggestOpen(false);
+                      }}
+                      className="w-full flex items-center justify-between gap-3 px-2 py-1.5 text-xs text-left hover:bg-card"
+                    >
+                      <span className="font-mono truncate">{row.branch}</span>
+                      <span className="text-[10px] text-ink-faint shrink-0">
+                        {row.repoCount}/{row.total} repos
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
           <label className="flex items-center gap-1 text-[11px] text-ink-muted">
             <input
               type="checkbox"
@@ -1074,6 +1211,12 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
               setBusy(true);
               try {
                 await checkout(workspaceId, branch.trim(), createIfMissing);
+                // Refresh the suggestion pool — newly fetched/created
+                // tracking refs should show up next time without
+                // requiring the user to re-open the workspace.
+                window.overgit
+                  .invoke('workspace:branchSuggestions', workspaceId)
+                  .then(setBranchPool);
               } finally {
                 setBusy(false);
               }
@@ -1083,6 +1226,17 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
             Switch all
           </button>
         </div>
+        {branch.trim() && (
+          <div className="mt-2 text-[11px] text-ink-faint">
+            {exactMatch
+              ? `${exactMatch.repoCount}/${exactMatch.total} repos have "${exactMatch.branch}"${
+                  exactMatch.repoCount < exactMatch.total
+                    ? ' — toggle "create if missing" to branch the rest from HEAD'
+                    : ''
+                }`
+              : `No repo in this workspace has "${branch.trim()}" yet — toggle "create if missing" to make it.`}
+          </div>
+        )}
         {lastCheckout && lastCheckout.workspaceId === workspaceId && lastCheckout.outcomes.length > 0 && (
           <ul className="mt-3 flex flex-col gap-1.5">
             {lastCheckout.outcomes.map((o) => (
