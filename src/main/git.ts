@@ -15,6 +15,7 @@ import {
   FileDiff,
   FileLogCommit,
   GraphCommit,
+  Identity,
   LfsStatus,
   RepoChanges,
   RepoStatus,
@@ -59,6 +60,47 @@ function run(
     });
   });
 }
+
+/// Build the env override that pins author + committer for a single
+/// `git commit`. Returns undefined when no identity is supplied so
+/// `run()` falls through to its default (process.env), letting git
+/// resolve user.name / user.email itself.
+function identityEnv(identity?: Identity): Record<string, string> | undefined {
+  if (!identity) return undefined;
+  return {
+    GIT_AUTHOR_NAME: identity.name,
+    GIT_AUTHOR_EMAIL: identity.email,
+    GIT_COMMITTER_NAME: identity.name,
+    GIT_COMMITTER_EMAIL: identity.email,
+  };
+}
+
+/// Read the identity that git would resolve for `git commit` in this
+/// repo right now. `scope: 'local'` only consults .git/config (returns
+/// nulls when no local override exists); `scope: 'effective'` returns
+/// whatever git resolves through its precedence chain (local → global
+/// → system). The renderer uses both: local to detect "the repo set
+/// itself up", effective as the fallback display value.
+async function readGitConfigIdentity(
+  repoPath: string,
+  scope: 'local' | 'effective',
+): Promise<{ name: string | null; email: string | null }> {
+  const args = scope === 'local'
+    ? ['config', '--local', '--get']
+    : ['config', '--get'];
+  const [nameRes, emailRes] = await Promise.all([
+    run(repoPath, [...args, 'user.name']),
+    run(repoPath, [...args, 'user.email']),
+  ]);
+  const name = nameRes.ok ? nameRes.stdout.trim() : '';
+  const email = emailRes.ok ? emailRes.stdout.trim() : '';
+  return {
+    name: name.length > 0 ? name : null,
+    email: email.length > 0 ? email : null,
+  };
+}
+
+export { readGitConfigIdentity };
 
 /// Sanity check before we record a path as a repo: it must exist and
 /// have a .git entry (directory for normal repos, file for worktrees).
@@ -429,6 +471,7 @@ export async function adoptWorktreeBranch(
   branch: string,
   forceRemove: boolean,
   commitMessage?: string,
+  identity?: Identity,
 ): Promise<
   { ok: true } | { ok: false; step: 'precheck' | 'commit' | 'remove' | 'checkout'; error: string }
 > {
@@ -476,7 +519,7 @@ export async function adoptWorktreeBranch(
     const wtStatus = await run(worktreePath, ['status', '--porcelain=v1']);
     const dirty = wtStatus.ok && wtStatus.stdout.trim().length > 0;
     if (dirty) {
-      const commitRes = await commitAll(worktreePath, commitMessage.trim());
+      const commitRes = await commitAll(worktreePath, commitMessage.trim(), identity);
       if (!commitRes.ok) {
         return {
           ok: false,
@@ -1316,13 +1359,19 @@ async function resolveStatus(
 export async function amendCommit(
   repoPath: string,
   message: string | null,
+  identity?: Identity,
 ): Promise<{ ok: boolean; error?: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
   const args = ['commit', '--amend'];
   if (message === null) args.push('--no-edit');
   else if (!message.trim()) return { ok: false, error: 'Commit message required' };
   else args.push('-m', message.trim());
-  const res = await run(repoPath, args);
+  // Amend with an identity override needs --reset-author too — without
+  // it, git reuses the original author and only the committer fields
+  // (which the user can't see in the log) reflect the env. The user
+  // expects "amend as me" to update what's visible in `git log`.
+  if (identity) args.push('--reset-author');
+  const res = await run(repoPath, args, identityEnv(identity));
   if (res.ok) return { ok: true };
   return { ok: false, error: res.stderr.trim() || `git commit --amend exited ${res.code}` };
 }
@@ -1330,6 +1379,7 @@ export async function amendCommit(
 export async function commitAll(
   repoPath: string,
   message: string,
+  identity?: Identity,
 ): Promise<{ ok: boolean; error?: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
   if (!message.trim()) return { ok: false, error: 'Commit message required' };
@@ -1341,7 +1391,7 @@ export async function commitAll(
   if (!addRes.ok) {
     return { ok: false, error: addRes.stderr.trim() || `git add exited ${addRes.code}` };
   }
-  const commitRes = await run(repoPath, ['commit', '-m', message.trim()]);
+  const commitRes = await run(repoPath, ['commit', '-m', message.trim()], identityEnv(identity));
   if (commitRes.ok) return { ok: true };
   return { ok: false, error: commitRes.stderr.trim() || `git commit exited ${commitRes.code}` };
 }
@@ -1457,10 +1507,11 @@ export async function discardFiles(
 export async function commitStaged(
   repoPath: string,
   message: string,
+  identity?: Identity,
 ): Promise<{ ok: boolean; error?: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
   if (!message.trim()) return { ok: false, error: 'Commit message required' };
-  const res = await run(repoPath, ['commit', '-m', message.trim()]);
+  const res = await run(repoPath, ['commit', '-m', message.trim()], identityEnv(identity));
   if (res.ok) return { ok: true };
   return { ok: false, error: res.stderr.trim() || `git commit exited ${res.code}` };
 }

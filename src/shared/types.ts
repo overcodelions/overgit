@@ -23,6 +23,49 @@ export interface Repo {
   /// abandons a feature branch. Auto-detected from `origin/HEAD` at add
   /// time; user-overridable in settings.
   defaultBranch?: string;
+  /// Per-repo author/committer override. When set, every commit/amend
+  /// overgit makes in this repo runs with GIT_AUTHOR_* and
+  /// GIT_COMMITTER_* env so the recorded identity is exactly this — no
+  /// matter what the repo's local git config or the user's global
+  /// ~/.gitconfig says. Lets users belonging to multiple orgs (work,
+  /// open source, personal) keep one identity per repo without manually
+  /// running `git config user.email …` after each clone.
+  identity?: Identity;
+}
+
+/// Author / committer identity overgit can apply when running git
+/// commit on the user's behalf. Mirrors what git's `user.name` /
+/// `user.email` config would set — same fields, same expectations.
+export interface Identity {
+  name: string;
+  email: string;
+}
+
+/// What identity a future commit in this repo will actually use, and
+/// where that identity comes from. Surfaced above the commit composer
+/// so the user can never silently push as the wrong person again.
+///   override     — overgit's per-repo Repo.identity is set; we'll pass
+///                  GIT_AUTHOR_*/GIT_COMMITTER_* env on commit.
+///   repo-config  — repo's local .git/config has user.name + user.email
+///                  set; git uses those naturally.
+///   global-default — no per-repo overgit override and no repo-local
+///                  config, but the user has set a global default in
+///                  overgit settings; we'll pass that via env.
+///   system       — falls through to whatever `git config --get
+///                  user.email` resolves (usually ~/.gitconfig). This
+///                  is the case where the wrong-user bug used to bite.
+///   unset        — git can't resolve any identity; commit will fail.
+export type IdentitySource =
+  | 'override'
+  | 'repo-config'
+  | 'global-default'
+  | 'system'
+  | 'unset';
+
+export interface ResolvedIdentity {
+  source: IdentitySource;
+  name: string;
+  email: string;
 }
 
 export interface Workspace {
@@ -345,6 +388,12 @@ export interface AppSettings {
   /// last opened the workspace pane. Wiped when a workspace is
   /// removed; never written for repos (workspace-scoped only).
   workspaceLastSeen?: Record<UUID, string>;
+  /// Global default identity overgit will use for commits when a repo
+  /// has neither a per-repo override nor a local git config. Lets users
+  /// who keep one canonical "this is me" identity skip per-repo setup
+  /// while still getting the protection of a known author/committer on
+  /// every push.
+  defaultIdentity?: Identity;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -370,7 +419,17 @@ export interface IPCInvokeMap {
   'store:saveSettings': (settings: AppSettings) => void;
 
   'repo:add': (path: string) => { ok: true; repo: Repo } | { ok: false; error: string };
-  'repo:pickAndAdd': () => { ok: true; repo: Repo } | { ok: false; error: string } | { ok: false; cancelled: true };
+  /// Open a folder picker (multi-select enabled) and add every git repo
+  /// found among the chosen paths. A chosen path that isn't itself a
+  /// repo is scanned one level deep — picking a parent like ~/code adds
+  /// every immediate child that contains a `.git`. `repos` is the union
+  /// of newly added and pre-existing matches; `skipped` lists picked
+  /// paths that contained no repos so the renderer can surface the
+  /// reason without a separate UI for it.
+  'repo:pickAndAdd': () =>
+    | { ok: true; repos: Repo[]; skipped: { path: string; reason: string }[] }
+    | { ok: false; error: string }
+    | { ok: false; cancelled: true };
   'repo:status': (repoId: UUID) => RepoStatus;
   'repo:listBranches': (repoId: UUID) => { local: string[]; remote: string[] };
   'repo:log': (args: { repoId: UUID; limit?: number }) => Commit[];
@@ -505,6 +564,18 @@ export interface IPCInvokeMap {
   /// Returns one BlameLine per line of the file at HEAD.
   'repo:fileBlame': (args: { repoId: UUID; path: string }) => BlameLine[];
   'repo:setDefaultBranch': (args: { repoId: UUID; branch: string | null }) => void;
+  /// Set or clear the per-repo identity override. Pass `identity: null`
+  /// to clear it (commit will fall back to repo-local config / global
+  /// default / system git).
+  'repo:setIdentity': (args: { repoId: UUID; identity: Identity | null }) => void;
+  /// What identity a commit in this repo would use right now, and the
+  /// source of that identity. The commit composer surfaces this above
+  /// the message box so the user sees what'll land before pressing
+  /// Commit.
+  'repo:resolveIdentity': (repoId: UUID) => ResolvedIdentity;
+  /// Batch version for the Settings → Identity table. One round-trip
+  /// for the whole library instead of N parallel resolveIdentity calls.
+  'repo:resolveAllIdentities': () => Record<UUID, ResolvedIdentity>;
   'repo:worktrees': (repoId: UUID) => Worktree[];
   /// Move a linked worktree's branch into the main checkout. Removes
   /// the worktree at `worktreePath` first (with `--force` if

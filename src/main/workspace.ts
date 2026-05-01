@@ -5,8 +5,10 @@
 // store. A repo opened in another tool sees no trace of overgit.
 
 import {
+  AppSettings,
   CheckoutOutcome,
   CommitAllOutcome,
+  Identity,
   Repo,
   RepoPRs,
   RepoStatus,
@@ -31,9 +33,20 @@ import {
   pull as gitPull,
   push as gitPush,
   rawDiff,
+  readGitConfigIdentity,
   diffStat,
   status as gitStatus,
 } from './git';
+
+/// Same precedence as main/index.ts:pickCommitIdentity, lifted here so
+/// the workspace commit-all loop doesn't need to round-trip through
+/// the IPC layer for every member repo.
+async function pickIdentityFor(repo: Repo, settings: AppSettings): Promise<Identity | undefined> {
+  if (repo.identity) return repo.identity;
+  const local = await readGitConfigIdentity(repo.path, 'local');
+  if (local.name && local.email) return undefined;
+  return settings.defaultIdentity;
+}
 import { createPRWithGh, findOpenPRForCurrentBranch, listOpenPRs } from './cli';
 
 function reposFor(workspace: Workspace, repos: Repo[]): Repo[] {
@@ -199,6 +212,7 @@ export async function workspaceCommitAll(
   message: string,
   workspaces: Workspace[],
   repos: Repo[],
+  settings: AppSettings,
 ): Promise<CommitAllOutcome[]> {
   const ws = workspaces.find((w) => w.id === workspaceId);
   if (!ws) return [];
@@ -214,7 +228,8 @@ export async function workspaceCommitAll(
       out.push({ repoId: r.id, result: 'clean' });
       continue;
     }
-    const res = await gitCommitAll(r.path, message);
+    const identity = await pickIdentityFor(r, settings);
+    const res = await gitCommitAll(r.path, message, identity);
     if (res.ok) out.push({ repoId: r.id, result: 'committed' });
     else out.push({ repoId: r.id, result: 'commit-failed', message: res.error });
   }

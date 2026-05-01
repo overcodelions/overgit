@@ -3,6 +3,7 @@
 // the Store (persisted) and the cached CliPresence probe.
 
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
+import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Store } from './store';
@@ -58,6 +59,7 @@ import {
   pullForce as gitPullForce,
   push as gitPush,
   rawDiff,
+  readGitConfigIdentity,
   rebaseOnto,
   setRemoteUrl,
   stageFiles,
@@ -82,7 +84,49 @@ import {
   workspaceWorktrees,
 } from './workspace';
 import { detectCliPresence, reviewDiffWithLlm, suggestCommitMessage } from './cli';
-import { Repo } from '../shared/types';
+import { Identity, Repo, ResolvedIdentity } from '../shared/types';
+
+/// Resolve which identity should be applied (via env override) when
+/// committing in this repo. Mirrors the precedence the renderer
+/// surfaces in the commit composer:
+///   1. per-repo overgit override (Repo.identity)        → return it
+///   2. repo's local .git/config user.name + user.email  → null (let
+///      git pick it up naturally; no env override needed)
+///   3. global default in settings.defaultIdentity       → return it
+///   4. otherwise                                        → null (git
+///      resolves through global ~/.gitconfig itself)
+async function pickCommitIdentity(repo: Repo): Promise<Identity | undefined> {
+  if (repo.identity) return repo.identity;
+  const local = await readGitConfigIdentity(repo.path, 'local');
+  if (local.name && local.email) return undefined;
+  const global = Store.load().settings.defaultIdentity;
+  if (global) return global;
+  return undefined;
+}
+
+/// Compute the ResolvedIdentity object the renderer renders above the
+/// commit composer. Same precedence as pickCommitIdentity but returns
+/// the source label and best-effort name/email for display in every
+/// branch — including the `system` and `unset` branches where commit
+/// itself wouldn't pass an env override.
+async function resolveDisplayIdentity(repo: Repo): Promise<ResolvedIdentity> {
+  if (repo.identity) {
+    return { source: 'override', name: repo.identity.name, email: repo.identity.email };
+  }
+  const local = await readGitConfigIdentity(repo.path, 'local');
+  if (local.name && local.email) {
+    return { source: 'repo-config', name: local.name, email: local.email };
+  }
+  const global = Store.load().settings.defaultIdentity;
+  if (global) {
+    return { source: 'global-default', name: global.name, email: global.email };
+  }
+  const effective = await readGitConfigIdentity(repo.path, 'effective');
+  if (effective.name && effective.email) {
+    return { source: 'system', name: effective.name, email: effective.email };
+  }
+  return { source: 'unset', name: effective.name ?? '', email: effective.email ?? '' };
+}
 
 // Dev vs prod: hit the Vite dev server only when VITE_DEV_SERVER_URL is
 // set (the dev:electron npm script sets it). Anything else — packaged
@@ -194,18 +238,56 @@ function registerIpc(): void {
   ipcMain.handle('repo:pickAndAdd', async () => {
     if (!mainWindow) return { ok: false, error: 'No window' };
     const result = await dialog.showOpenDialog(mainWindow, {
-      properties: ['openDirectory'],
-      title: 'Add a repository',
+      // multiSelections lets the user shift/cmd-click multiple
+      // folders; the loop below also expands a single picked parent
+      // ("~/code") into every immediate child that's a repo.
+      properties: ['openDirectory', 'multiSelections'],
+      title: 'Add repositories',
+      buttonLabel: 'Add',
     });
     if (result.canceled || result.filePaths.length === 0) {
       return { ok: false, cancelled: true };
     }
-    const chosen = result.filePaths[0];
-    if (!looksLikeRepo(chosen)) {
-      return { ok: false, error: 'No .git found at that path' };
+
+    const added: Repo[] = [];
+    const skipped: { path: string; reason: string }[] = [];
+    const seen = new Set<string>();
+
+    for (const chosen of result.filePaths) {
+      if (seen.has(chosen)) continue;
+      seen.add(chosen);
+
+      if (looksLikeRepo(chosen)) {
+        added.push(await addRepoFromPath(chosen));
+        continue;
+      }
+      // Not a repo itself — try one level deep. Common case: the user
+      // picked their `~/code` parent and wants every repo inside.
+      let children: string[];
+      try {
+        children = fs.readdirSync(chosen);
+      } catch (err) {
+        skipped.push({ path: chosen, reason: `Could not read folder (${String(err)})` });
+        continue;
+      }
+      const childRepos: string[] = [];
+      for (const name of children) {
+        if (name.startsWith('.')) continue;
+        const childPath = path.join(chosen, name);
+        if (looksLikeRepo(childPath)) childRepos.push(childPath);
+      }
+      if (childRepos.length === 0) {
+        skipped.push({ path: chosen, reason: 'No .git found here or in any direct child' });
+        continue;
+      }
+      for (const r of childRepos) {
+        if (seen.has(r)) continue;
+        seen.add(r);
+        added.push(await addRepoFromPath(r));
+      }
     }
-    const repo = await addRepoFromPath(chosen);
-    return { ok: true, repo };
+
+    return { ok: true as const, repos: added, skipped };
   });
 
   ipcMain.handle('repo:status', async (_e, repoId: string) => {
@@ -266,7 +348,8 @@ function registerIpc(): void {
   ipcMain.handle('repo:commitAll', async (_e, args: { repoId: string; message: string }) => {
     const repo = Store.load().repos.find((r) => r.id === args.repoId);
     if (!repo) return { ok: false, error: 'Unknown repo' };
-    return commitAll(repo.path, args.message);
+    const identity = await pickCommitIdentity(repo);
+    return commitAll(repo.path, args.message, identity);
   });
 
   // `retryCheckout` and `checkout` are the same primitive — `checkout` is
@@ -323,7 +406,8 @@ function registerIpc(): void {
   ipcMain.handle('repo:commit', async (_e, args: { repoId: string; message: string }) => {
     const repo = repoFromArg(args);
     if (!repo) return { ok: false, error: 'Unknown repo' };
-    return commitStaged(repo.path, args.message);
+    const identity = await pickCommitIdentity(repo);
+    return commitStaged(repo.path, args.message, identity);
   });
 
   ipcMain.handle('repo:push', async (_e, repoId: string) => {
@@ -398,7 +482,8 @@ function registerIpc(): void {
     async (_e, args: { repoId: string; message: string | null }) => {
       const repo = repoFromArg(args);
       if (!repo) return { ok: false, error: 'Unknown repo' };
-      return amendCommit(repo.path, args.message);
+      const identity = await pickCommitIdentity(repo);
+      return amendCommit(repo.path, args.message, identity);
     },
   );
 
@@ -675,6 +760,39 @@ function registerIpc(): void {
     },
   );
 
+  ipcMain.handle(
+    'repo:setIdentity',
+    (_e, args: { repoId: string; identity: Identity | null }) => {
+      const state = Store.load();
+      const updated = state.repos.map((r) =>
+        r.id === args.repoId ? { ...r, identity: args.identity ?? undefined } : r,
+      );
+      Store.saveRepos(updated);
+    },
+  );
+
+  ipcMain.handle('repo:resolveIdentity', async (_e, repoId: string) => {
+    const repo = Store.load().repos.find((r) => r.id === repoId);
+    if (!repo) {
+      return { source: 'unset' as const, name: '', email: '' };
+    }
+    return resolveDisplayIdentity(repo);
+  });
+
+  ipcMain.handle('repo:resolveAllIdentities', async () => {
+    const repos = Store.load().repos;
+    // Fan out — every resolution is independent and the per-repo cost
+    // is two cheap `git config` reads. Keeps the Settings → Identity
+    // table snappy even for users with dozens of repos.
+    const entries = await Promise.all(
+      repos.map(async (r): Promise<[string, ResolvedIdentity]> => [
+        r.id,
+        await resolveDisplayIdentity(r),
+      ]),
+    );
+    return Object.fromEntries(entries);
+  });
+
   ipcMain.handle('fs:listFiles', (_e, repoId: string) => {
     const repo = repoFromArg(repoId);
     if (!repo) return [];
@@ -748,8 +866,8 @@ function registerIpc(): void {
   ipcMain.handle(
     'workspace:commitAll',
     async (_e, args: { workspaceId: string; message: string }) => {
-      const { workspaces, repos } = Store.load();
-      return workspaceCommitAll(args.workspaceId, args.message, workspaces, repos);
+      const { workspaces, repos, settings } = Store.load();
+      return workspaceCommitAll(args.workspaceId, args.message, workspaces, repos, settings);
     },
   );
 
@@ -814,12 +932,14 @@ function registerIpc(): void {
     ) => {
       const repo = Store.load().repos.find((r) => r.id === args.repoId);
       if (!repo) return { ok: false as const, step: 'precheck' as const, error: 'Unknown repo' };
+      const identity = await pickCommitIdentity(repo);
       return adoptWorktreeBranch(
         repo.path,
         args.worktreePath,
         args.branch,
         args.forceRemove,
         args.commitMessage,
+        identity,
       );
     },
   );
