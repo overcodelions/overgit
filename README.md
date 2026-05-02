@@ -69,6 +69,12 @@ If you want to use overgit on its own source tree, run `npm start` rather than `
 
 Missing CLIs hide the relevant UI; nothing else changes.
 
+> Spawned CLIs inherit your shell environment — that's how their auth works. Anything in your env (e.g. `*_API_KEY`, `GITHUB_TOKEN`) is visible to whichever CLI you invoke. overgit itself never reads or transmits those values.
+
+## Security
+
+See [SECURITY.md](./SECURITY.md) for how to report a vulnerability and what overgit does/doesn't send over the network.
+
 ## License
 
 Apache-2.0. Built by Lionel Farr.

@@ -31,13 +31,44 @@ const MAX_TREE_FILES = 20000;
 function normalizeUnderRoot(target: string, root: string): string | null {
   const resolved = path.resolve(target);
   const resolvedRoot = path.resolve(root);
-  // path.relative returns "" for the root itself, "../…" for siblings,
-  // and a valid relative path for descendants — that's the cleanest
-  // "is X under Y" check that handles symlinks and trailing slashes.
-  const rel = path.relative(resolvedRoot, resolved);
-  if (rel === '') return resolved;
-  if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
-  return resolved;
+  // For containment we compare *real* paths so a symlink inside the repo
+  // can't smuggle the editor outside the registered root. We realpath
+  // the deepest existing ancestor of `target` (the file itself may not
+  // exist yet — write-new-file is a legitimate flow) and append the
+  // unresolved tail. The root must already exist on disk.
+  let realRoot: string;
+  try {
+    realRoot = fs.realpathSync(resolvedRoot);
+  } catch {
+    return null;
+  }
+  const realTarget = realpathDeepestExisting(resolved);
+  const rel = path.relative(realRoot, realTarget);
+  if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) {
+    return realTarget;
+  }
+  return null;
+}
+
+/// realpath the longest prefix of `p` that actually exists, then append
+/// the unresolved tail. Lets us safely reject ".." escapes whether the
+/// target file exists yet or not.
+function realpathDeepestExisting(p: string): string {
+  let cur = p;
+  const tail: string[] = [];
+  // Walk up until something resolves. `path.dirname('/')` returns '/',
+  // so the loop terminates at the root.
+  while (true) {
+    try {
+      const real = fs.realpathSync(cur);
+      return tail.length === 0 ? real : path.join(real, ...tail.reverse());
+    } catch {
+      const parent = path.dirname(cur);
+      if (parent === cur) return p;
+      tail.push(path.basename(cur));
+      cur = parent;
+    }
+  }
 }
 
 export function listFilesUnder(root: string): string[] {

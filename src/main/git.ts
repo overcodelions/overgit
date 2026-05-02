@@ -38,6 +38,7 @@ function run(
   cwd: string,
   args: string[],
   envOverride?: Record<string, string>,
+  timeoutMs?: number,
 ): Promise<RunResult> {
   return new Promise((resolve) => {
     const env = envOverride
@@ -46,6 +47,31 @@ function run(
     const child = spawn('git', args, { cwd, env });
     let stdout = '';
     let stderr = '';
+    let settled = false;
+    const done = (r: RunResult) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(r);
+    };
+    // Network-bound ops (fetch/pull/push) pass a timeout so a stalled
+    // remote or a credential prompt can't pin the workspace serial loop
+    // forever. Local ops omit it.
+    const timer = timeoutMs
+      ? setTimeout(() => {
+          try {
+            child.kill('SIGTERM');
+          } catch {
+            /* ignore */
+          }
+          done({
+            ok: false,
+            stdout,
+            stderr: stderr || `git ${args[0] ?? ''} timed out after ${Math.round(timeoutMs / 1000)}s`,
+            code: null,
+          });
+        }, timeoutMs)
+      : null;
     child.stdout.on('data', (b) => {
       stdout += b.toString('utf8');
     });
@@ -53,13 +79,18 @@ function run(
       stderr += b.toString('utf8');
     });
     child.on('close', (code) => {
-      resolve({ ok: code === 0, stdout, stderr, code });
+      done({ ok: code === 0, stdout, stderr, code });
     });
     child.on('error', (err) => {
-      resolve({ ok: false, stdout, stderr: stderr || String(err), code: null });
+      done({ ok: false, stdout, stderr: stderr || String(err), code: null });
     });
   });
 }
+
+// Network-bound git ops get a hard timeout — local git is fast enough
+// that an open-ended wait is fine, but `fetch`/`pull`/`push` can hang on
+// a stalled remote, a slow auth prompt, or a tarpitting host.
+const NETWORK_TIMEOUT_MS = 90_000;
 
 /// Build the env override that pins author + committer for a single
 /// `git commit`. Returns undefined when no identity is supplied so
@@ -433,9 +464,9 @@ export async function checkoutBranch(
   // fetched, so without this probe a workspace checkout would falsely
   // report `missing-branch` for a branch that exists on origin.
   if (!localExists.ok && !remoteExists.ok) {
-    const ls = await run(repoPath, ['ls-remote', '--heads', 'origin', branch]);
+    const ls = await run(repoPath, ['ls-remote', '--heads', 'origin', branch], undefined, NETWORK_TIMEOUT_MS);
     if (ls.ok && ls.stdout.trim().length > 0) {
-      const fetchRes = await run(repoPath, ['fetch', 'origin', branch]);
+      const fetchRes = await run(repoPath, ['fetch', 'origin', branch], undefined, NETWORK_TIMEOUT_MS);
       if (fetchRes.ok) {
         remoteExists = await run(repoPath, [
           'show-ref',
@@ -694,7 +725,7 @@ export function parseLocalChangesBlocked(stderr: string): string[] {
 
 export async function fetch(repoPath: string): Promise<{ ok: boolean; error?: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
-  const res = await run(repoPath, ['fetch', '--all', '--prune']);
+  const res = await run(repoPath, ['fetch', '--all', '--prune'], undefined, NETWORK_TIMEOUT_MS);
   if (res.ok) return { ok: true };
   return { ok: false, error: res.stderr.trim() || `git exited ${res.code}` };
 }
@@ -1567,7 +1598,7 @@ export async function push(
 ): Promise<{ ok: true; setUpstream: boolean } | { ok: false; error: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
   if (await hasUpstream(repoPath)) {
-    const res = await run(repoPath, ['push']);
+    const res = await run(repoPath, ['push'], undefined, NETWORK_TIMEOUT_MS);
     if (res.ok) return { ok: true, setUpstream: false };
     return { ok: false, error: res.stderr.trim() || `git push exited ${res.code}` };
   }
@@ -1575,7 +1606,7 @@ export async function push(
   // work without ceremony. We push to `origin` because that's the
   // overwhelming default; users with a different remote setup can run
   // `git push -u <remote> HEAD` themselves once.
-  const res = await run(repoPath, ['push', '-u', 'origin', 'HEAD']);
+  const res = await run(repoPath, ['push', '-u', 'origin', 'HEAD'], undefined, NETWORK_TIMEOUT_MS);
   if (res.ok) return { ok: true, setUpstream: true };
   return { ok: false, error: res.stderr.trim() || `git push exited ${res.code}` };
 }
@@ -1619,7 +1650,7 @@ export async function pull(
     }
   }
 
-  const res = await run(repoPath, ['pull', '--no-rebase']);
+  const res = await run(repoPath, ['pull', '--no-rebase'], undefined, NETWORK_TIMEOUT_MS);
   if (res.ok) return { ok: true };
   // Detect "would be overwritten" so the renderer can offer recovery
   // (stash & retry / discard & retry) instead of just dumping git's
@@ -1682,7 +1713,7 @@ export async function pullForce(
     }
   }
 
-  const pullRes = await run(repoPath, ['pull', '--no-rebase']);
+  const pullRes = await run(repoPath, ['pull', '--no-rebase'], undefined, NETWORK_TIMEOUT_MS);
   if (pullRes.ok) {
     return { ok: true, stashed: strategy === 'stash' };
   }
@@ -2232,7 +2263,7 @@ export async function pushTag(
   remote: string,
 ): Promise<{ ok: boolean; error?: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
-  const res = await run(repoPath, ['push', remote, `refs/tags/${name}`]);
+  const res = await run(repoPath, ['push', remote, `refs/tags/${name}`], undefined, NETWORK_TIMEOUT_MS);
   if (res.ok) return { ok: true };
   return { ok: false, error: res.stderr.trim() || `git push exited ${res.code}` };
 }
