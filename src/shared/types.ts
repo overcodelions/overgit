@@ -425,6 +425,12 @@ export interface IPCInvokeMap {
   'store:saveSettings': (settings: AppSettings) => void;
 
   'repo:add': (path: string) => { ok: true; repo: Repo } | { ok: false; error: string };
+  /// Run `git init` (optionally with `-b <initialBranch>`) at the given
+  /// path, then register it as a repo. The renderer offers this when a
+  /// folder picked from "Add repo" is not yet a git repo.
+  'repo:init': (args: { path: string; initialBranch?: string }) =>
+    | { ok: true; repo: Repo }
+    | { ok: false; error: string };
   /// Open a folder picker (multi-select enabled) and add every git repo
   /// found among the chosen paths. A chosen path that isn't itself a
   /// repo is scanned one level deep — picking a parent like ~/code adds
@@ -640,6 +646,14 @@ export interface IPCInvokeMap {
     syncDefault: boolean;
     pullBeforeBranch: boolean;
   }) => SyncAndBranchOutcome[];
+  /// Bring a single repo into a workspace's shared branch: fetch, sync
+  /// default, pull, then create-or-checkout `branch`. Used to catch up a
+  /// project that was just added to a workspace whose other members are
+  /// already on a common feature branch.
+  'workspace:syncMemberToBranch': (args: {
+    repoId: UUID;
+    branch: string;
+  }) => SyncAndBranchOutcome | { result: 'unknown-repo' };
   /// Stage and commit every dirty repo in the workspace with a shared
   /// message. Repos in detached-HEAD state are skipped (returned as
   /// `detached`) — committing onto a detached HEAD orphans the commit.

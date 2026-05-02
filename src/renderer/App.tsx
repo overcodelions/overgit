@@ -5,12 +5,14 @@ import { TitleBar } from './TitleBar';
 import { SheetHost } from './Sheets';
 import { CommandPalette } from './CommandPalette';
 import type {
+  ChangedFile,
   CheckoutOutcome,
   CliPresence,
   PullRequest,
   Repo,
   RepoPRs,
   RepoStatus,
+  SyncAndBranchOutcome,
   UUID,
   Workspace,
   WorkspaceActivity,
@@ -975,6 +977,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
     { branch: string; repoCount: number; total: number }[]
   >([]);
   const [suggestOpen, setSuggestOpen] = useState(false);
+  const [view, setView] = useState<'overview' | 'commit'>('overview');
 
   // Pull the cross-repo branch list once per workspace open. Refreshed
   // explicitly via Refresh / Fetch all (those buttons already cause a
@@ -1060,6 +1063,23 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
   if (!ws) return <main className="flex-1" />;
 
   const reposById = new Map(repos.map((r) => [r.id, r]));
+
+  // The workspace's "common branch" — the branch the user is treating
+  // as the workspace's coordinated feature branch. Prefer the explicit
+  // preferredBranch if set; else infer from the dominant branch held by
+  // a majority of loaded statuses. Returns null when no clear winner
+  // exists so we don't mistake "everyone happens to be on main" for an
+  // intentional cross-repo branch.
+  const commonBranch: string | null = (() => {
+    if (ws.preferredBranch) return ws.preferredBranch;
+    if (summary.sortedBranches.length === 0) return null;
+    const [topBranch, topCount] = summary.sortedBranches[0];
+    if (topBranch === '(detached)') return null;
+    // Need at least 2 repos and a majority for it to count as "common".
+    if (topCount < 2) return null;
+    if (topCount * 2 < summary.loaded) return null;
+    return topBranch;
+  })();
 
   return (
     <main className="flex-1 overflow-y-auto p-6">
@@ -1148,6 +1168,27 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
           </button>
         </div>
       </header>
+
+      <div className="mb-4 flex gap-1 border-b border-card">
+        {(['overview', 'commit'] as const).map((v) => (
+          <button
+            key={v}
+            onClick={() => setView(v)}
+            className={`text-xs px-3 py-1.5 -mb-px border-b-2 ${
+              view === v
+                ? 'border-accent text-ink'
+                : 'border-transparent text-ink-muted hover:text-ink'
+            }`}
+          >
+            {v === 'overview' ? 'Overview' : `Commit${summary.dirty > 0 ? ` (${summary.dirty})` : ''}`}
+          </button>
+        ))}
+      </div>
+
+      {view === 'commit' ? (
+        <WorkspaceUnifiedCommit workspaceId={workspaceId} />
+      ) : (
+        <>
 
       {/* Overview tiles. Always render so a freshly-created workspace
           has visible content while statuses load. */}
@@ -1301,14 +1342,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
 
       {prs.length > 0 && <PRSection prs={prs} reposById={reposById} cli={cli} />}
 
-      <ActivitySection
-        items={activity}
-        reposById={reposById}
-        seenAtOpen={seenAtOpen}
-        onSelectRepo={selectRepo}
-      />
-
-      <section>
+      <section className="mb-6">
         <h2 className="text-[10px] uppercase tracking-wide text-ink-faint mb-2">Status</h2>
         {ws.repoIds.length === 0 && (
           <div className="text-xs text-ink-faint p-3 rounded border border-card bg-card">
@@ -1334,6 +1368,12 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
                     <div className="text-[11px] text-ink-faint truncate font-mono">{repo?.path}</div>
                   </button>
                   <StatusCell status={st} />
+                  <SyncToCommonBranchButton
+                    repoId={id}
+                    workspaceId={workspaceId}
+                    currentBranch={st?.branch ?? null}
+                    commonBranch={commonBranch}
+                  />
                 </div>
                 <WorktreeList repoId={id} mainPath={repo?.path} />
               </li>
@@ -1341,7 +1381,422 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
           })}
         </ul>
       </section>
+
+      <ActivitySection
+        items={activity}
+        reposById={reposById}
+        seenAtOpen={seenAtOpen}
+        onSelectRepo={selectRepo}
+      />
+        </>
+      )}
     </main>
+  );
+}
+
+/// Unified commit view across every dirty repo in the workspace.
+///
+/// Goal: one pane to stage and commit instead of clicking into each
+/// repo. Each repo gets its own collapsible card with a checklist of
+/// changed files; a top "broadcast message" textarea is the default
+/// (shared across all selected repos), but each card can opt into a
+/// per-repo override when the change story differs.
+///
+/// Detached-HEAD repos are skipped — committing onto a detached HEAD
+/// orphans the commit, same rule the existing WorkspaceCommitAllSheet
+/// follows. Clean repos are not shown.
+function WorkspaceUnifiedCommit({
+  workspaceId,
+}: {
+  workspaceId: UUID;
+}): JSX.Element {
+  const repos = useStore((s) => s.repos);
+  const statuses = useStore((s) => s.workspaceStatuses[workspaceId] ?? EMPTY_STATUSES);
+  const repoChanges = useStore((s) => s.repoChanges);
+  const refreshRepoChanges = useStore((s) => s.refreshRepoChanges);
+  const refreshWorkspaceStatus = useStore((s) => s.refreshWorkspaceStatus);
+  const stage = useStore((s) => s.stageFiles);
+  const unstage = useStore((s) => s.unstageFiles);
+  const commitRepo = useStore((s) => s.commitRepo);
+  const pushToast = useStore((s) => s.pushToast);
+
+  const dirtyOnBranch = useMemo(
+    () => statuses.filter((s) => s.dirtyCount > 0 && s.branch !== null),
+    [statuses],
+  );
+  const dirtyDetached = useMemo(
+    () => statuses.filter((s) => s.dirtyCount > 0 && s.branch === null),
+    [statuses],
+  );
+  const reposById = useMemo(() => new Map(repos.map((r) => [r.id, r])), [repos]);
+
+  // Pull each dirty repo's file list once on mount, and after each
+  // commit run finishes. We don't subscribe to per-keystroke changes —
+  // a manual refresh button covers the "I just edited a file" case.
+  useEffect(() => {
+    for (const s of dirtyOnBranch) void refreshRepoChanges(s.repoId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dirtyOnBranch.map((s) => s.repoId).join(',')]);
+
+  // Per-repo: which file paths to include in this commit. Default: all
+  // files for the repo. As files appear (e.g. user edits more), they
+  // auto-include — same behavior as ChangesTab simple mode.
+  const [checked, setChecked] = useState<Record<UUID, Set<string>>>({});
+  useEffect(() => {
+    setChecked((cur) => {
+      const next: Record<UUID, Set<string>> = {};
+      for (const s of dirtyOnBranch) {
+        const ch = repoChanges[s.repoId];
+        if (!ch) {
+          next[s.repoId] = cur[s.repoId] ?? new Set();
+          continue;
+        }
+        const present = new Set<string>();
+        for (const f of ch.staged) present.add(f.path);
+        for (const f of ch.unstaged) present.add(f.path);
+        const prior = cur[s.repoId] ?? new Set();
+        const merged = new Set<string>();
+        for (const p of prior) if (present.has(p)) merged.add(p);
+        for (const p of present) if (!prior.has(p)) merged.add(p);
+        next[s.repoId] = merged;
+      }
+      return next;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repoChanges, dirtyOnBranch.map((s) => s.repoId).join(',')]);
+
+  const [collapsed, setCollapsed] = useState<Set<UUID>>(new Set());
+  const toggleCollapsed = (id: UUID) => {
+    setCollapsed((cur) => {
+      const next = new Set(cur);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const [sharedMessage, setSharedMessage] = useState('');
+  const [perRepoMessage, setPerRepoMessage] = useState<Record<UUID, string>>({});
+  // When a repo overrides the shared message it appears in this set.
+  // Non-overriding repos commit with whatever's in `sharedMessage`.
+  const [overrides, setOverrides] = useState<Set<UUID>>(new Set());
+  const toggleOverride = (id: UUID) => {
+    setOverrides((cur) => {
+      const next = new Set(cur);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  type Outcome =
+    | { kind: 'committed' }
+    | { kind: 'skipped-empty' }
+    | { kind: 'failed'; message: string };
+  const [outcomes, setOutcomes] = useState<Record<UUID, Outcome>>({});
+  const [busy, setBusy] = useState(false);
+
+  const messageFor = (id: UUID) =>
+    overrides.has(id) ? perRepoMessage[id] ?? '' : sharedMessage;
+
+  // A repo is committable iff it has at least one checked file AND
+  // either a shared or override message that's non-empty.
+  const committable = useMemo(() => {
+    return dirtyOnBranch.filter((s) => {
+      const ck = checked[s.repoId];
+      if (!ck || ck.size === 0) return false;
+      return messageFor(s.repoId).trim().length > 0;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dirtyOnBranch, checked, sharedMessage, perRepoMessage, overrides]);
+
+  const onCommitAll = async () => {
+    if (committable.length === 0) return;
+    setBusy(true);
+    setOutcomes({});
+    try {
+      for (const s of committable) {
+        const ch = repoChanges[s.repoId];
+        if (!ch) {
+          setOutcomes((o) => ({ ...o, [s.repoId]: { kind: 'failed', message: 'changes not loaded' } }));
+          continue;
+        }
+        const checkedSet = checked[s.repoId] ?? new Set<string>();
+        // Build the union of every changed path so we can sync the
+        // index to exactly the checked set — anything checked gets
+        // staged, anything not checked but currently in the index gets
+        // pulled out. Same idea as ChangesTab simple mode.
+        const allPaths = new Set<string>();
+        for (const f of ch.staged) allPaths.add(f.path);
+        for (const f of ch.unstaged) allPaths.add(f.path);
+        const toStage: string[] = [];
+        const toUnstage: string[] = [];
+        for (const p of allPaths) {
+          if (checkedSet.has(p)) toStage.push(p);
+          else toUnstage.push(p);
+        }
+        try {
+          if (toUnstage.length > 0) await unstage(s.repoId, toUnstage);
+          if (toStage.length > 0) await stage(s.repoId, toStage);
+          const res = await commitRepo(s.repoId, messageFor(s.repoId).trim());
+          if (!res.ok) {
+            setOutcomes((o) => ({
+              ...o,
+              [s.repoId]: { kind: 'failed', message: res.error ?? 'Commit failed' },
+            }));
+            continue;
+          }
+          setOutcomes((o) => ({ ...o, [s.repoId]: { kind: 'committed' } }));
+        } catch (err: unknown) {
+          setOutcomes((o) => ({
+            ...o,
+            [s.repoId]: { kind: 'failed', message: String(err) },
+          }));
+        }
+      }
+      // After running, refresh the workspace + per-repo changes so the
+      // pane reflects what's left (clean repos drop off the list).
+      await refreshWorkspaceStatus(workspaceId);
+      await Promise.all(
+        committable.map((s) => refreshRepoChanges(s.repoId)),
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (dirtyOnBranch.length === 0 && dirtyDetached.length === 0) {
+    return (
+      <div className="text-xs text-ink-faint p-4 rounded border border-card bg-card">
+        Every repo in this workspace is clean — nothing to commit.
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <section className="p-3 rounded-lg border border-card bg-card flex flex-col gap-2">
+        <label className="flex flex-col gap-1">
+          <span className="text-[10px] uppercase tracking-wide text-ink-faint">
+            Shared commit message
+          </span>
+          <textarea
+            value={sharedMessage}
+            onChange={(e) => setSharedMessage(e.target.value)}
+            disabled={busy}
+            rows={3}
+            placeholder="Used for every repo below — toggle a repo to write its own message instead"
+            className="field px-2 py-1.5 text-sm resize-none"
+          />
+        </label>
+        <div className="flex items-center justify-between gap-2 text-[11px] text-ink-faint">
+          <span>
+            {committable.length} of {dirtyOnBranch.length} repos ready to commit
+            {committable.length < dirtyOnBranch.length && ' — check files and add a message for the rest'}
+          </span>
+          <div className="flex gap-2">
+            <button
+              onClick={() => void refreshWorkspaceStatus(workspaceId)}
+              disabled={busy}
+              className="text-[11px] px-2 py-1 rounded border border-card hover:bg-surface-elevated disabled:opacity-50"
+            >
+              Refresh
+            </button>
+            <button
+              onClick={() => void onCommitAll()}
+              disabled={busy || committable.length === 0}
+              className="text-xs px-3 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+            >
+              {busy
+                ? 'Committing…'
+                : `Commit ${committable.length} ${committable.length === 1 ? 'repo' : 'repos'}`}
+            </button>
+          </div>
+        </div>
+      </section>
+
+      {dirtyDetached.length > 0 && (
+        <div className="text-[11px] text-amber-400 bg-amber-500/[0.06] border border-amber-700/40 rounded px-3 py-2">
+          Skipping {dirtyDetached.length} detached-HEAD{' '}
+          {dirtyDetached.length === 1 ? 'repo' : 'repos'} —{' '}
+          {dirtyDetached.map((s) => reposById.get(s.repoId)?.name ?? s.repoId).join(', ')}.
+          Committing onto detached HEAD orphans the commit; resolve
+          manually.
+        </div>
+      )}
+
+      <ul className="flex flex-col gap-2">
+        {dirtyOnBranch.map((s) => {
+          const repo = reposById.get(s.repoId);
+          const ch = repoChanges[s.repoId];
+          const allFiles: ChangedFile[] = ch
+            ? (() => {
+                const map = new Map<string, ChangedFile>();
+                for (const f of ch.staged) map.set(f.path, f);
+                for (const f of ch.unstaged) map.set(f.path, f);
+                return [...map.values()].sort((a, b) => a.path.localeCompare(b.path));
+              })()
+            : [];
+          const ck = checked[s.repoId] ?? new Set<string>();
+          const outcome = outcomes[s.repoId];
+          const isCollapsed = collapsed.has(s.repoId);
+          const overrideOn = overrides.has(s.repoId);
+
+          const allChecked = allFiles.length > 0 && allFiles.every((f) => ck.has(f.path));
+          const noneChecked = ck.size === 0;
+          const toggleAll = () => {
+            setChecked((cur) => {
+              const next = { ...cur };
+              if (allChecked) next[s.repoId] = new Set();
+              else next[s.repoId] = new Set(allFiles.map((f) => f.path));
+              return next;
+            });
+          };
+          const toggleOne = (p: string) => {
+            setChecked((cur) => {
+              const next = { ...cur };
+              const set = new Set(next[s.repoId] ?? []);
+              if (set.has(p)) set.delete(p);
+              else set.add(p);
+              next[s.repoId] = set;
+              return next;
+            });
+          };
+
+          return (
+            <li
+              key={s.repoId}
+              className="rounded-lg border border-card bg-card flex flex-col"
+            >
+              <header className="flex items-center gap-2 px-3 py-2">
+                <button
+                  onClick={() => toggleCollapsed(s.repoId)}
+                  className="text-ink-faint hover:text-ink text-xs w-4"
+                  title={isCollapsed ? 'Expand' : 'Collapse'}
+                >
+                  {isCollapsed ? '▸' : '▾'}
+                </button>
+                <div className="min-w-0 flex-1">
+                  <div className="text-sm font-medium truncate">
+                    {repo?.name ?? s.repoId}
+                  </div>
+                  <div className="text-[11px] text-ink-faint truncate font-mono">
+                    {s.branch} · {ck.size}/{allFiles.length} checked
+                  </div>
+                </div>
+                {outcome?.kind === 'committed' && (
+                  <span className="font-mono text-[11px] text-emerald-400">committed</span>
+                )}
+                {outcome?.kind === 'failed' && (
+                  <span
+                    className="font-mono text-[11px] text-red-400 truncate max-w-[40%]"
+                    title={outcome.message}
+                  >
+                    failed: {outcome.message}
+                  </span>
+                )}
+                <label
+                  className="flex items-center gap-1 text-[11px] text-ink-muted cursor-pointer"
+                  title="Write a different commit message just for this repo"
+                >
+                  <input
+                    type="checkbox"
+                    checked={overrideOn}
+                    onChange={() => toggleOverride(s.repoId)}
+                    disabled={busy}
+                  />
+                  own message
+                </label>
+              </header>
+
+              {!isCollapsed && (
+                <div className="px-3 pb-3 flex flex-col gap-2">
+                  {overrideOn && (
+                    <textarea
+                      value={perRepoMessage[s.repoId] ?? ''}
+                      onChange={(e) =>
+                        setPerRepoMessage((cur) => ({ ...cur, [s.repoId]: e.target.value }))
+                      }
+                      disabled={busy}
+                      rows={2}
+                      placeholder={`Commit message for ${repo?.name ?? 'this repo'}`}
+                      className="field px-2 py-1.5 text-xs resize-none"
+                    />
+                  )}
+                  {!ch && (
+                    <div className="text-[11px] text-ink-faint">Loading changes…</div>
+                  )}
+                  {ch && allFiles.length === 0 && (
+                    <div className="text-[11px] text-ink-faint">No changed files.</div>
+                  )}
+                  {ch && allFiles.length > 0 && (
+                    <>
+                      <div className="flex items-center gap-2 text-[11px]">
+                        <button
+                          onClick={toggleAll}
+                          disabled={busy}
+                          className="px-2 py-0.5 rounded border border-card hover:bg-surface-elevated disabled:opacity-50"
+                        >
+                          {allChecked ? 'Uncheck all' : noneChecked ? 'Check all' : 'Check all'}
+                        </button>
+                        <span className="text-ink-faint">
+                          {ck.size} of {allFiles.length} files included
+                        </span>
+                      </div>
+                      <ul className="flex flex-col">
+                        {allFiles.map((f) => (
+                          <li
+                            key={f.path}
+                            className="flex items-center gap-2 py-0.5 text-[12px]"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={ck.has(f.path)}
+                              onChange={() => toggleOne(f.path)}
+                              disabled={busy}
+                            />
+                            <UnifiedFileBadge file={f} />
+                            <span className="font-mono truncate" title={f.path}>
+                              {f.path}
+                            </span>
+                            {f.origPath && (
+                              <span className="text-[11px] text-ink-faint italic truncate">
+                                ← {f.origPath}
+                              </span>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  )}
+                </div>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
+function UnifiedFileBadge({ file }: { file: ChangedFile }): JSX.Element {
+  const ch =
+    file.indexStatus !== ' ' && file.indexStatus !== '?'
+      ? file.indexStatus
+      : file.worktreeStatus;
+  const map: Record<string, string> = {
+    A: 'bg-emerald-500/20 text-emerald-300',
+    M: 'bg-amber-500/20 text-amber-300',
+    D: 'bg-red-500/20 text-red-300',
+    R: 'bg-sky-500/20 text-sky-300',
+    C: 'bg-sky-500/20 text-sky-300',
+    '?': 'bg-card text-ink-muted',
+  };
+  const cls = map[ch] ?? 'bg-card text-ink-muted';
+  return (
+    <span className={`inline-block px-1.5 rounded text-[10px] font-mono ${cls}`}>
+      {ch === '?' ? 'U' : ch}
+    </span>
   );
 }
 
@@ -1568,7 +2023,9 @@ function ActivitySection({
   if (items.length === 0) return null;
   // Cap rendered rows. The backend can return up to N×perRepo commits
   // plus PRs, which is a lot of DOM if a workspace has 20 repos.
-  const MAX = 60;
+  // Recent is a glance — scoped to a small window so it doesn't crowd
+  // the Status section above it.
+  const MAX = 20;
   const visible = items.slice(0, MAX);
   const newSinceLast = seenAtOpen
     ? items.filter((it) => it.at > seenAtOpen).length
@@ -1718,6 +2175,61 @@ function WorktreeList({
         </li>
       ))}
     </ul>
+  );
+}
+
+/// Compact "Sync to <branch>" action shown next to a repo whose
+/// current branch differs from the workspace's common branch. Runs the
+/// fetch → switch default → pull → create/checkout flow for that one
+/// repo and refreshes status when done.
+function SyncToCommonBranchButton({
+  repoId,
+  workspaceId,
+  currentBranch,
+  commonBranch,
+}: {
+  repoId: UUID;
+  workspaceId: UUID;
+  currentBranch: string | null;
+  commonBranch: string | null;
+}): JSX.Element | null {
+  const refresh = useStore((s) => s.refreshWorkspaceStatus);
+  const [busy, setBusy] = useState(false);
+  const [outcome, setOutcome] = useState<SyncAndBranchOutcome | null>(null);
+  if (!commonBranch) return null;
+  if (currentBranch === commonBranch) return null;
+  return (
+    <div className="flex items-center gap-2 shrink-0">
+      <button
+        disabled={busy}
+        onClick={async () => {
+          setBusy(true);
+          setOutcome(null);
+          try {
+            const res = await window.overgit.invoke('workspace:syncMemberToBranch', {
+              repoId,
+              branch: commonBranch,
+            });
+            if ('repoId' in res) setOutcome(res);
+            await refresh(workspaceId);
+          } finally {
+            setBusy(false);
+          }
+        }}
+        title={`Fetch, sync default, pull, then check out ${commonBranch} in this repo`}
+        className="text-[10px] px-2 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
+      >
+        {busy ? 'Syncing…' : `Sync to ${commonBranch}`}
+      </button>
+      {outcome && outcome.result !== 'created' && (
+        <span
+          className="text-[10px] text-amber-400 max-w-[200px] truncate"
+          title={outcome.message ?? outcome.result}
+        >
+          {outcome.result}
+        </span>
+      )}
+    </div>
   );
 }
 
