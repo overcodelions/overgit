@@ -13,6 +13,9 @@
     "url": "https://github.com/lionelfarr/overgit/issues"
   },
   "main": "dist/main/index.js",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "dev": "concurrently -k -n vite,tsc,electron -c cyan,yellow,magenta \"npm:dev:renderer\" \"npm:dev:tsc\" \"npm:dev:electron\"",
     "dev:renderer": "vite",
