@@ -44,7 +44,8 @@ export type Sheet =
   | { kind: 'openPRsInWorkspace'; workspaceId: UUID }
   | { kind: 'fileHistory'; repoId: UUID; path: string; tab: 'history' | 'blame' }
   | { kind: 'manageRepo'; repoId: UUID; tab: 'tags' | 'remotes' | 'submodules' | 'identity' }
-  | { kind: 'pullConflict'; repoId: UUID; conflicts: string[]; rawError: string };
+  | { kind: 'pullConflict'; repoId: UUID; conflicts: string[]; rawError: string }
+  | { kind: 'initRepo'; path: string; reason: string };
 
 interface OpenFile {
   repoId: UUID;
@@ -138,6 +139,13 @@ interface UiState {
 
   hydrate: () => Promise<void>;
   pickAndAddRepo: () => Promise<void>;
+  /// Run `git init` at `path` (with optional initial branch) and add the
+  /// resulting repo to the library. Used by the InitRepo sheet that the
+  /// "Add repo" flow opens when the picked folder is not yet a git repo.
+  initAndAddRepo: (
+    path: string,
+    initialBranch: string,
+  ) => Promise<{ ok: boolean; error?: string }>;
   createWorkspace: (name: string, repoIds: UUID[]) => Promise<void>;
   selectWorkspace: (id: UUID | null) => void;
   selectRepo: (id: UUID | null) => void;
@@ -364,10 +372,21 @@ export const useStore = create<UiState>((set, get) => ({
       return;
     }
     if (result.repos.length === 0) {
-      // Nothing matched — surface the first reason so the user
-      // understands why their pick produced no rows.
-      const why = result.skipped[0]?.reason ?? 'No repositories found in the chosen folders.';
-      get().pushToast({ kind: 'warn', message: why });
+      // Nothing matched. If the user picked a single folder that just
+      // isn't a git repo yet, offer to `git init` it instead of just
+      // toasting why nothing was added.
+      const first = result.skipped[0];
+      if (first) {
+        get().setSheet({ kind: 'initRepo', path: first.path, reason: first.reason });
+        if (result.skipped.length > 1) {
+          get().pushToast({
+            kind: 'warn',
+            message: `${result.skipped.length - 1} other folder(s) skipped — re-add to initialize.`,
+          });
+        }
+        return;
+      }
+      get().pushToast({ kind: 'warn', message: 'No repositories found in the chosen folders.' });
       return;
     }
     // Merge: drop any existing entries with the same ids (the main
@@ -397,6 +416,25 @@ export const useStore = create<UiState>((set, get) => ({
     // Pick up sidebar dirty/upstream markers for the freshly added
     // repos without waiting for the next launch.
     void get().refreshAllRepoStatuses();
+  },
+
+  initAndAddRepo: async (path, initialBranch) => {
+    const res = await window.overgit.invoke('repo:init', {
+      path,
+      initialBranch: initialBranch.trim() || undefined,
+    });
+    if (!res.ok) {
+      get().pushToast({ kind: 'error', message: res.error });
+      return { ok: false, error: res.error };
+    }
+    const ids = new Set([res.repo.id]);
+    const merged = [...get().repos.filter((r) => !ids.has(r.id)), res.repo];
+    set({ repos: merged });
+    await window.overgit.invoke('store:saveRepos', merged);
+    get().pushToast({ kind: 'success', message: `Initialized ${res.repo.name}.` });
+    get().selectRepo(res.repo.id);
+    void get().refreshAllRepoStatuses();
+    return { ok: true };
   },
 
   createWorkspace: async (name, repoIds) => {

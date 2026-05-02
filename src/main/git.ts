@@ -144,6 +144,27 @@ export function looksLikeRepo(repoPath: string): boolean {
   }
 }
 
+export async function initRepo(
+  repoPath: string,
+  opts: { initialBranch?: string },
+): Promise<{ ok: boolean; error?: string }> {
+  if (!fs.existsSync(repoPath)) return { ok: false, error: 'Folder does not exist' };
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(repoPath);
+  } catch (err) {
+    return { ok: false, error: `Cannot stat folder (${String(err)})` };
+  }
+  if (!stat.isDirectory()) return { ok: false, error: 'Path is not a folder' };
+  if (looksLikeRepo(repoPath)) return { ok: true };
+  const args = ['init'];
+  const branch = opts.initialBranch?.trim();
+  if (branch) args.push('-b', branch);
+  const r = await run(repoPath, args);
+  if (!r.ok) return { ok: false, error: r.stderr.trim() || `git init exited ${r.code}` };
+  return { ok: true };
+}
+
 export async function status(
   repoId: UUID,
   repoPath: string,

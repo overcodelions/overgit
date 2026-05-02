@@ -10,6 +10,7 @@ import type {
   LlmTool,
   Remote,
   Repo,
+  RepoStatus,
   ResolvedIdentity,
   ReviewResult,
   Submodule,
@@ -21,6 +22,12 @@ import type {
   WorkspacePushOutcome,
 } from '@shared/types';
 import { sanitizeBranchName } from '@shared/branch-name';
+
+/// Stable empty-array reference used as the fallback for selectors that
+/// read `s.workspaceStatuses[id]`. Returning a fresh `[]` from a zustand
+/// selector fails React's `useSyncExternalStore` snapshot equality and
+/// loops with "Maximum update depth exceeded".
+const EMPTY_STATUSES: RepoStatus[] = [];
 
 /// Top-level sheet host. Picks which sheet (modal) to render based on
 /// `store.sheet` and provides the common backdrop + escape-to-close.
@@ -101,6 +108,9 @@ export function SheetHost(): JSX.Element | null {
             rawError={sheet.rawError}
           />
         )}
+        {sheet.kind === 'initRepo' && (
+          <InitRepoSheet path={sheet.path} reason={sheet.reason} />
+        )}
       </div>
     </div>
   );
@@ -120,6 +130,92 @@ function SheetHeader({ title, onClose }: { title: string; onClose: () => void })
         </svg>
       </button>
     </div>
+  );
+}
+
+function InitRepoSheet({ path, reason }: { path: string; reason: string }): JSX.Element {
+  const setSheet = useStore((s) => s.setSheet);
+  const initAndAddRepo = useStore((s) => s.initAndAddRepo);
+  const [branch, setBranch] = useState('main');
+  const [busy, setBusy] = useState(false);
+  const folderName = useMemo(() => {
+    const trimmed = path.replace(/[/\\]+$/, '');
+    const lastSlash = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));
+    return lastSlash >= 0 ? trimmed.slice(lastSlash + 1) : trimmed;
+  }, [path]);
+
+  const trimmedBranch = branch.trim();
+  const branchError =
+    trimmedBranch.length > 0 && /[\s~^:?*\[\\]/.test(trimmedBranch)
+      ? 'Branch name contains an illegal character.'
+      : null;
+
+  const onInit = async () => {
+    if (busy || branchError) return;
+    setBusy(true);
+    try {
+      const res = await initAndAddRepo(path, trimmedBranch);
+      if (res.ok) setSheet(null);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <SheetHeader title="Initialize as git repo" onClose={() => setSheet(null)} />
+      <div className="flex-1 min-h-0 p-5 flex flex-col gap-4 text-sm overflow-y-auto">
+        <div className="text-ink-muted">
+          <p>
+            <span className="font-mono text-ink">{folderName}</span> isn't a git repo yet.
+          </p>
+          <p className="text-[11px] text-ink-faint mt-1">
+            {reason} · Run <span className="font-mono">git init</span> here?
+          </p>
+          <p className="text-[11px] text-ink-faint mt-2 break-all font-mono">{path}</p>
+        </div>
+
+        <label className="flex flex-col gap-1">
+          <span className="text-[10px] uppercase tracking-wide text-ink-faint">
+            Initial branch name
+          </span>
+          <input
+            autoFocus
+            value={branch}
+            onChange={(e) => setBranch(e.target.value)}
+            disabled={busy}
+            placeholder="main"
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !branchError && !busy) void onInit();
+            }}
+            className="field px-2 py-1.5 text-sm font-mono"
+          />
+          {branchError ? (
+            <span className="text-[11px] text-red-400">{branchError}</span>
+          ) : (
+            <span className="text-[11px] text-ink-faint">
+              Leave blank to use git's <span className="font-mono">init.defaultBranch</span>.
+            </span>
+          )}
+        </label>
+      </div>
+      <div className="flex-shrink-0 flex items-center justify-end gap-2 border-t border-card px-5 py-3">
+        <button
+          onClick={() => setSheet(null)}
+          disabled={busy}
+          className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={onInit}
+          disabled={busy || !!branchError}
+          className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+        >
+          {busy ? 'Initializing…' : 'Initialize and add'}
+        </button>
+      </div>
+    </>
   );
 }
 
@@ -1357,6 +1453,11 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
   const setSheet = useStore((s) => s.setSheet);
   const createWorkspace = useStore((s) => s.createWorkspace);
   const updateWorkspace = useStore((s) => s.updateWorkspace);
+  const editingId = workspaceId ?? null;
+  const existingStatuses = useStore((s) =>
+    editingId ? s.workspaceStatuses[editingId] ?? EMPTY_STATUSES : EMPTY_STATUSES,
+  );
+  const refreshWorkspaceStatus = useStore((s) => s.refreshWorkspaceStatus);
 
   const editing = workspaceId
     ? workspaces.find((w) => w.id === workspaceId) ?? null
@@ -1367,6 +1468,44 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
     new Set(editing?.repoIds ?? []),
   );
   const [busy, setBusy] = useState(false);
+
+  // Common branch of the workspace as it stands today: explicit
+  // preferredBranch wins; otherwise the dominant branch among loaded
+  // members iff it's held by 2+ repos and a majority. Used to offer a
+  // post-save sync for any newly-added project.
+  const commonBranch: string | null = useMemo(() => {
+    if (!editing) return null;
+    if (editing.preferredBranch) return editing.preferredBranch;
+    const tally = new Map<string, number>();
+    for (const s of existingStatuses) {
+      const b = s.branch;
+      if (!b) continue;
+      tally.set(b, (tally.get(b) ?? 0) + 1);
+    }
+    if (tally.size === 0) return null;
+    const sorted = [...tally.entries()].sort((a, b) => b[1] - a[1]);
+    const [topBranch, topCount] = sorted[0];
+    if (topCount < 2) return null;
+    if (topCount * 2 < existingStatuses.length) return null;
+    return topBranch;
+  }, [editing, existingStatuses]);
+
+  // Newly-added repos: in `picked` but not previously a member. These
+  // are the rows we'll offer to sync to commonBranch after save.
+  const newlyAdded = useMemo<UUID[]>(() => {
+    const before = new Set(editing?.repoIds ?? []);
+    return [...picked].filter((id) => !before.has(id));
+  }, [editing, picked]);
+
+  // After the save, the user can choose to bring each new repo up to
+  // commonBranch. We track per-repo state so the same row can show
+  // "syncing", an outcome badge, or a retry.
+  type SyncState =
+    | { kind: 'idle' }
+    | { kind: 'syncing' }
+    | { kind: 'done'; outcome: SyncAndBranchOutcome | { result: 'unknown-repo' } };
+  const [showSync, setShowSync] = useState(false);
+  const [syncState, setSyncState] = useState<Record<UUID, SyncState>>({});
 
   const toggle = (id: UUID) => {
     setPicked((cur) => {
@@ -1386,11 +1525,40 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
       } else {
         await createWorkspace(name.trim(), [...picked]);
       }
-      setSheet(null);
+      // Editing flow with new members + a common branch: stay in the
+      // sheet and reveal the sync panel so the user can bring each
+      // new repo up to the workspace's branch in one click. Otherwise
+      // close as before.
+      if (editing && newlyAdded.length > 0 && commonBranch) {
+        setShowSync(true);
+      } else {
+        setSheet(null);
+      }
     } finally {
       setBusy(false);
     }
   };
+
+  const runSyncFor = async (repoId: UUID) => {
+    if (!commonBranch || !editingId) return;
+    setSyncState((s) => ({ ...s, [repoId]: { kind: 'syncing' } }));
+    const outcome = await window.overgit.invoke('workspace:syncMemberToBranch', {
+      repoId,
+      branch: commonBranch,
+    });
+    setSyncState((s) => ({ ...s, [repoId]: { kind: 'done', outcome } }));
+    await refreshWorkspaceStatus(editingId);
+  };
+
+  const runSyncAll = async () => {
+    for (const id of newlyAdded) {
+      const cur = syncState[id];
+      if (cur && cur.kind !== 'idle') continue;
+      await runSyncFor(id);
+    }
+  };
+
+  const reposById = useMemo(() => new Map(repos.map((r) => [r.id, r])), [repos]);
 
   return (
     <>
@@ -1399,59 +1567,173 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
         onClose={() => setSheet(null)}
       />
       <div className="flex-1 min-h-0 p-5 flex flex-col gap-4 text-sm overflow-y-auto">
-        <label className="flex flex-col gap-1">
-          <span className="text-xs uppercase tracking-wide text-ink-faint">Name</span>
-          <input
-            autoFocus
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="e.g. service-platform, marketing-site, polyrepo-stack"
-            className="field px-2 py-1.5 text-sm"
-          />
-        </label>
+        {!showSync && (
+          <>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs uppercase tracking-wide text-ink-faint">Name</span>
+              <input
+                autoFocus
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="e.g. service-platform, marketing-site, polyrepo-stack"
+                className="field px-2 py-1.5 text-sm"
+              />
+            </label>
 
-        <div>
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-xs uppercase tracking-wide text-ink-faint">Repos</span>
-            <span className="text-[11px] text-ink-faint">
-              {picked.size} of {repos.length} selected
-            </span>
-          </div>
-          {repos.length === 0 ? (
-            <div className="text-xs text-ink-faint p-3 rounded border border-card bg-card">
-              Add a repo first — workspaces are built from repos already in
-              overgit.
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs uppercase tracking-wide text-ink-faint">Repos</span>
+                <span className="text-[11px] text-ink-faint">
+                  {picked.size} of {repos.length} selected
+                </span>
+              </div>
+              {repos.length === 0 ? (
+                <div className="text-xs text-ink-faint p-3 rounded border border-card bg-card">
+                  Add a repo first — workspaces are built from repos already in
+                  overgit.
+                </div>
+              ) : (
+                <ul className="border border-card rounded overflow-hidden max-h-[40vh] overflow-y-auto">
+                  {repos.map((r) => {
+                    const isPicked = picked.has(r.id);
+                    const previously = (editing?.repoIds ?? []).includes(r.id);
+                    return (
+                      <li key={r.id} className="border-b border-card last:border-0">
+                        <RepoPickRow
+                          repo={r}
+                          picked={isPicked}
+                          onToggle={() => toggle(r.id)}
+                          tag={
+                            isPicked && !previously && commonBranch
+                              ? `will sync to ${commonBranch}`
+                              : null
+                          }
+                        />
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
             </div>
-          ) : (
-            <ul className="border border-card rounded overflow-hidden max-h-[40vh] overflow-y-auto">
-              {repos.map((r) => {
-                const isPicked = picked.has(r.id);
+
+            {editing && commonBranch && newlyAdded.length > 0 && (
+              <div className="rounded border border-accent/40 bg-accent/10 px-3 py-2 text-[11px] text-ink">
+                After saving, you'll be offered to sync the {newlyAdded.length}{' '}
+                new {newlyAdded.length === 1 ? 'repo' : 'repos'} to{' '}
+                <span className="font-mono">{commonBranch}</span> (fetch → switch
+                default → pull → check out the workspace branch).
+              </div>
+            )}
+          </>
+        )}
+        {showSync && commonBranch && (
+          <div className="flex flex-col gap-3">
+            <div className="text-xs text-ink-muted">
+              Workspace common branch:{' '}
+              <span className="font-mono text-ink">{commonBranch}</span>. Sync
+              each new repo to bring it onto that branch off the latest default.
+            </div>
+            <ul className="flex flex-col gap-1.5">
+              {newlyAdded.map((id) => {
+                const r = reposById.get(id);
+                const st = syncState[id] ?? { kind: 'idle' };
                 return (
-                  <li key={r.id} className="border-b border-card last:border-0">
-                    <RepoPickRow repo={r} picked={isPicked} onToggle={() => toggle(r.id)} />
+                  <li
+                    key={id}
+                    className="flex items-center gap-3 px-3 py-2 rounded border border-card bg-card"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm font-medium truncate">
+                        {r?.name ?? id}
+                      </div>
+                      <div className="text-[11px] text-ink-faint truncate font-mono">
+                        {r?.path}
+                      </div>
+                    </div>
+                    {st.kind === 'idle' && (
+                      <button
+                        onClick={() => runSyncFor(id)}
+                        className="text-[11px] px-2 py-1 rounded border border-card hover:bg-card"
+                      >
+                        Sync to {commonBranch}
+                      </button>
+                    )}
+                    {st.kind === 'syncing' && (
+                      <span className="text-[11px] text-ink-faint">syncing…</span>
+                    )}
+                    {st.kind === 'done' && (
+                      <SyncOutcomeBadge outcome={st.outcome} />
+                    )}
                   </li>
                 );
               })}
             </ul>
-          )}
-        </div>
+          </div>
+        )}
       </div>
       <div className="px-5 py-3 border-t border-card flex justify-end gap-2">
-        <button
-          onClick={() => setSheet(null)}
-          className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
-        >
-          Cancel
-        </button>
-        <button
-          disabled={busy || !name.trim() || picked.size === 0}
-          onClick={onSave}
-          className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
-        >
-          {editing ? 'Save changes' : `Create workspace`}
-        </button>
+        {!showSync && (
+          <>
+            <button
+              onClick={() => setSheet(null)}
+              className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
+            >
+              Cancel
+            </button>
+            <button
+              disabled={busy || !name.trim() || picked.size === 0}
+              onClick={onSave}
+              className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+            >
+              {editing ? 'Save changes' : `Create workspace`}
+            </button>
+          </>
+        )}
+        {showSync && (
+          <>
+            <button
+              onClick={() => setSheet(null)}
+              className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
+            >
+              Done
+            </button>
+            <button
+              onClick={runSyncAll}
+              disabled={newlyAdded.every(
+                (id) => (syncState[id]?.kind ?? 'idle') !== 'idle',
+              )}
+              className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+            >
+              Sync all
+            </button>
+          </>
+        )}
       </div>
     </>
+  );
+}
+
+function SyncOutcomeBadge({
+  outcome,
+}: {
+  outcome: SyncAndBranchOutcome | { result: 'unknown-repo' };
+}): JSX.Element {
+  const result = outcome.result;
+  const tone =
+    result === 'created'
+      ? 'text-emerald-400'
+      : result === 'no-default-branch'
+        ? 'text-amber-400'
+        : 'text-red-400';
+  const message = 'message' in outcome ? outcome.message : undefined;
+  return (
+    <span
+      className={`text-[11px] font-mono ${tone} max-w-[260px] truncate`}
+      title={message ?? result}
+    >
+      {result}
+      {message ? ` — ${message}` : ''}
+    </span>
   );
 }
 
@@ -1922,7 +2204,7 @@ type DirtyResolution = 'stash' | 'commit' | 'skip';
 function WorkspaceBranchSheet({ workspaceId }: { workspaceId: UUID }): JSX.Element {
   const ws = useStore((s) => s.workspaces.find((w) => w.id === workspaceId));
   const repos = useStore((s) => s.repos);
-  const statuses = useStore((s) => s.workspaceStatuses[workspaceId] ?? []);
+  const statuses = useStore((s) => s.workspaceStatuses[workspaceId] ?? EMPTY_STATUSES);
   const refreshStatus = useStore((s) => s.refreshWorkspaceStatus);
   const stashRepo = useStore((s) => s.stashRepo);
   const commitAllWorkspace = useStore((s) => s.commitAllWorkspace);
@@ -2269,7 +2551,7 @@ function DirtyChoice({
 function WorkspaceCommitAllSheet({ workspaceId }: { workspaceId: UUID }): JSX.Element {
   const ws = useStore((s) => s.workspaces.find((w) => w.id === workspaceId));
   const repos = useStore((s) => s.repos);
-  const statuses = useStore((s) => s.workspaceStatuses[workspaceId] ?? []);
+  const statuses = useStore((s) => s.workspaceStatuses[workspaceId] ?? EMPTY_STATUSES);
   const refreshStatus = useStore((s) => s.refreshWorkspaceStatus);
   const commitAllWorkspace = useStore((s) => s.commitAllWorkspace);
   const cli = useStore((s) => s.cliPresence);
@@ -2616,7 +2898,7 @@ function BranchOutcomeBadge({
 function WorkspacePushAllSheet({ workspaceId }: { workspaceId: UUID }): JSX.Element {
   const ws = useStore((s) => s.workspaces.find((w) => w.id === workspaceId));
   const repos = useStore((s) => s.repos);
-  const statuses = useStore((s) => s.workspaceStatuses[workspaceId] ?? []);
+  const statuses = useStore((s) => s.workspaceStatuses[workspaceId] ?? EMPTY_STATUSES);
   const refreshStatus = useStore((s) => s.refreshWorkspaceStatus);
   const pushAllWorkspace = useStore((s) => s.pushAllWorkspace);
   const setSheet = useStore((s) => s.setSheet);
@@ -2761,7 +3043,7 @@ function PushOutcomeBadge({ result }: { result: WorkspacePushOutcome['result'] }
 function WorkspaceOpenPRsSheet({ workspaceId }: { workspaceId: UUID }): JSX.Element {
   const ws = useStore((s) => s.workspaces.find((w) => w.id === workspaceId));
   const repos = useStore((s) => s.repos);
-  const statuses = useStore((s) => s.workspaceStatuses[workspaceId] ?? []);
+  const statuses = useStore((s) => s.workspaceStatuses[workspaceId] ?? EMPTY_STATUSES);
   const cli = useStore((s) => s.cliPresence);
   const refreshStatus = useStore((s) => s.refreshWorkspaceStatus);
   const openPRsWorkspace = useStore((s) => s.openPRsWorkspace);
@@ -3855,10 +4137,12 @@ function RepoPickRow({
   repo,
   picked,
   onToggle,
+  tag,
 }: {
   repo: Repo;
   picked: boolean;
   onToggle: () => void;
+  tag?: string | null;
 }): JSX.Element {
   return (
     <label
@@ -3876,6 +4160,11 @@ function RepoPickRow({
         <div className="font-medium truncate">{repo.name}</div>
         <div className="text-[11px] text-ink-faint truncate font-mono">{repo.path}</div>
       </div>
+      {tag && (
+        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-accent/20 text-accent shrink-0">
+          {tag}
+        </span>
+      )}
     </label>
   );
 }

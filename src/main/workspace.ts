@@ -158,6 +158,109 @@ export async function workspaceFetch(
   );
 }
 
+/// Single-repo "sync default branch and switch/create the workspace
+/// branch" step. Shared between the workspace-wide syncAndBranch loop
+/// and the "bring this one new member into the workspace's common
+/// branch" flow used after adding a project to a live workspace.
+///
+/// `existingBranchAction` controls what happens if `branch` already
+/// exists in the repo: 'checkout' switches to it (used when a workspace
+/// is already on a shared branch and the new member just needs to
+/// catch up), 'skip-create' returns 'created' without re-creating it.
+async function syncRepoToBranchStep(
+  repo: Repo,
+  branch: string,
+  syncDefault: boolean,
+  pullBeforeBranch: boolean,
+  existingBranchAction: 'create-fail' | 'checkout' = 'create-fail',
+): Promise<SyncAndBranchOutcome> {
+  // Resolve the default branch: trust the user's saved value, else
+  // probe the repo. A repo with no detected default still proceeds —
+  // we'll create the new branch off whatever HEAD is, which is the
+  // documented "no default" fallback in the renderer.
+  const defaultBranch =
+    repo.defaultBranch ?? (await detectDefaultBranch(repo.path)) ?? null;
+
+  let warning: SyncAndBranchOutcome | null = null;
+
+  if (syncDefault && defaultBranch) {
+    const switchRes = await checkoutBranch(repo.id, repo.path, defaultBranch, false);
+    if (switchRes.result === 'dirty') {
+      return {
+        repoId: repo.id,
+        branch,
+        defaultBranch,
+        result: 'dirty',
+        message: switchRes.message,
+      };
+    }
+    if (switchRes.result === 'error' || switchRes.result === 'missing-branch') {
+      return {
+        repoId: repo.id,
+        branch,
+        defaultBranch,
+        result: 'switch-failed',
+        message: switchRes.message ?? `Could not switch to ${defaultBranch}`,
+      };
+    }
+  } else if (syncDefault && !defaultBranch) {
+    // We were asked to sync default, but no default exists. Skip the
+    // sync and let the create still happen from the current HEAD —
+    // the user can revisit the default-branch setting later.
+    warning = {
+      repoId: repo.id,
+      branch,
+      defaultBranch: null,
+      result: 'no-default-branch',
+      message: 'No default branch configured — branched from current HEAD instead.',
+    };
+  }
+
+  if (pullBeforeBranch) {
+    const pullRes = await gitPull(repo.path);
+    if (!pullRes.ok) {
+      return {
+        repoId: repo.id,
+        branch,
+        defaultBranch,
+        result: 'pull-failed',
+        message: pullRes.error,
+      };
+    }
+  }
+
+  const createRes = await createBranch(repo.path, branch, true);
+  if (!createRes.ok) {
+    // If the branch already exists locally, optionally just check it
+    // out instead of failing — that's the "new member catching up to
+    // an existing workspace branch" case.
+    if (
+      existingBranchAction === 'checkout' &&
+      /already exists/i.test(createRes.error ?? '')
+    ) {
+      const co = await checkoutBranch(repo.id, repo.path, branch, false);
+      if (co.result === 'switched' || co.result === 'already-on-branch') {
+        return warning ?? { repoId: repo.id, branch, defaultBranch, result: 'created' };
+      }
+      return {
+        repoId: repo.id,
+        branch,
+        defaultBranch,
+        result: 'switch-failed',
+        message: co.message ?? `Could not switch to ${branch}`,
+      };
+    }
+    return {
+      repoId: repo.id,
+      branch,
+      defaultBranch,
+      result: 'create-failed',
+      message: createRes.error,
+    };
+  }
+  return warning ?? { repoId: repo.id, branch, defaultBranch, result: 'created' };
+}
+
 /// "Get latest, then branch" workflow for a workspace. For each repo,
 /// optionally switch to its default branch, optionally pull, then
 /// create the new branch from there. We run repos sequentially (not
@@ -176,84 +279,29 @@ export async function workspaceSyncAndBranch(
   if (!ws) return [];
   const members = reposFor(ws, repos);
   const out: SyncAndBranchOutcome[] = [];
-
   for (const r of members) {
-    // Resolve the default branch: trust the user's saved value, else
-    // probe the repo. A repo with no detected default still proceeds —
-    // we'll create the new branch off whatever HEAD is, which is the
-    // documented "no default" fallback in the renderer.
-    const defaultBranch =
-      r.defaultBranch ?? (await detectDefaultBranch(r.path)) ?? null;
-
-    if (syncDefault && defaultBranch) {
-      const switchRes = await checkoutBranch(r.id, r.path, defaultBranch, false);
-      if (switchRes.result === 'dirty') {
-        out.push({
-          repoId: r.id,
-          branch,
-          defaultBranch,
-          result: 'dirty',
-          message: switchRes.message,
-        });
-        continue;
-      }
-      if (switchRes.result === 'error' || switchRes.result === 'missing-branch') {
-        out.push({
-          repoId: r.id,
-          branch,
-          defaultBranch,
-          result: 'switch-failed',
-          message: switchRes.message ?? `Could not switch to ${defaultBranch}`,
-        });
-        continue;
-      }
-    } else if (syncDefault && !defaultBranch) {
-      // We were asked to sync default, but no default exists. Skip the
-      // sync and let the create still happen from the current HEAD —
-      // the user can revisit the default-branch setting later.
-      out.push({
-        repoId: r.id,
-        branch,
-        defaultBranch: null,
-        result: 'no-default-branch',
-        message: 'No default branch configured — branched from current HEAD instead.',
-      });
-      // Don't `continue` — we still want the create to run.
-    }
-
-    if (pullBeforeBranch) {
-      const pullRes = await gitPull(r.path);
-      if (!pullRes.ok) {
-        out.push({
-          repoId: r.id,
-          branch,
-          defaultBranch,
-          result: 'pull-failed',
-          message: pullRes.error,
-        });
-        continue;
-      }
-    }
-
-    const createRes = await createBranch(r.path, branch, true);
-    if (!createRes.ok) {
-      out.push({
-        repoId: r.id,
-        branch,
-        defaultBranch,
-        result: 'create-failed',
-        message: createRes.error,
-      });
-      continue;
-    }
-    // Push a "created" outcome only if we didn't already push a
-    // "no-default-branch" warning — the warning IS the outcome in that
-    // path, since the new branch was still made.
-    if (!out.some((o) => o.repoId === r.id)) {
-      out.push({ repoId: r.id, branch, defaultBranch, result: 'created' });
-    }
+    out.push(await syncRepoToBranchStep(r, branch, syncDefault, pullBeforeBranch));
   }
   return out;
+}
+
+/// Bring a single repo into the workspace's common branch. Used after
+/// a new project is added to a workspace that's already coordinating
+/// on a shared feature branch: fetch, sync default, pull, then create
+/// (or check out, if it exists) the workspace branch. Returns the same
+/// per-repo outcome shape so the renderer can reuse the result row.
+export async function workspaceSyncMemberToBranch(
+  repoId: UUID,
+  branch: string,
+  repos: Repo[],
+): Promise<SyncAndBranchOutcome | { result: 'unknown-repo' }> {
+  const repo = repos.find((r) => r.id === repoId);
+  if (!repo) return { result: 'unknown-repo' };
+  // Best-effort fetch first so the default branch and the workspace
+  // branch can both reach origin's tip. A failed fetch isn't fatal —
+  // pull will surface the same network problem with a better message.
+  await gitFetch(repo.path);
+  return syncRepoToBranchStep(repo, branch, true, true, 'checkout');
 }
 
 /// Stage and commit every dirty repo with a shared message. Detached-

@@ -51,6 +51,7 @@ import {
   pushTag,
   removeRemote,
   removeWorktree,
+  initRepo,
   log as gitLog,
   looksLikeRepo,
   markResolved,
@@ -82,6 +83,7 @@ import {
   workspacePushAll,
   workspaceStatus,
   workspaceSyncAndBranch,
+  workspaceSyncMemberToBranch,
   workspaceWorktrees,
 } from './workspace';
 import { detectCliPresence, reviewDiffWithLlm, suggestCommitMessage } from './cli';
@@ -235,6 +237,18 @@ function registerIpc(): void {
     const repo = await addRepoFromPath(repoPath);
     return { ok: true, repo };
   });
+
+  ipcMain.handle(
+    'repo:init',
+    async (_e, args: { path: string; initialBranch?: string }) => {
+      const init = await initRepo(args.path, { initialBranch: args.initialBranch });
+      if (!init.ok) {
+        return { ok: false as const, error: init.error ?? 'git init failed' };
+      }
+      const repo = await addRepoFromPath(args.path);
+      return { ok: true as const, repo };
+    },
+  );
 
   ipcMain.handle('repo:pickAndAdd', async () => {
     if (!mainWindow) return { ok: false, error: 'No window' };
@@ -866,6 +880,14 @@ function registerIpc(): void {
         workspaces,
         repos,
       );
+    },
+  );
+
+  ipcMain.handle(
+    'workspace:syncMemberToBranch',
+    async (_e, args: { repoId: string; branch: string }) => {
+      const { repos } = Store.load();
+      return workspaceSyncMemberToBranch(args.repoId, args.branch, repos);
     },
   );
 
