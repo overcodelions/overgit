@@ -19,6 +19,7 @@ import {
   WorkspaceDiffTruncation,
   WorkspaceOpenPROutcome,
   WorkspacePushOutcome,
+  WorkspaceResetOutcome,
   Worktree,
 } from '../shared/types';
 import {
@@ -281,6 +282,79 @@ export async function workspaceSyncAndBranch(
   const out: SyncAndBranchOutcome[] = [];
   for (const r of members) {
     out.push(await syncRepoToBranchStep(r, branch, syncDefault, pullBeforeBranch));
+  }
+  return out;
+}
+
+/// "Reset to default" workflow for the Archive flow. For each member,
+/// fetch → switch to its detected default branch → pull. Result is each
+/// repo on a clean tip-of-default state, ready for the next workset.
+/// Sequential per-repo so partial failures (no default, dirty, pull
+/// conflict) read in order. The Archive button is gated on the workset
+/// being clean + pushed, so dirty/conflict outcomes here are exceptional
+/// — but we surface them rather than failing silently because a stash
+/// the user forgot about could still be in play.
+export async function workspaceResetToDefault(
+  workspaceId: UUID,
+  workspaces: Workspace[],
+  repos: Repo[],
+): Promise<WorkspaceResetOutcome[]> {
+  const ws = workspaces.find((w) => w.id === workspaceId);
+  if (!ws) return [];
+  const members = reposFor(ws, repos);
+  const out: WorkspaceResetOutcome[] = [];
+  for (const r of members) {
+    const defaultBranch =
+      r.defaultBranch ?? (await detectDefaultBranch(r.path)) ?? null;
+    if (!defaultBranch) {
+      out.push({
+        repoId: r.id,
+        defaultBranch: null,
+        result: 'no-default-branch',
+        message: 'No default branch detected — set one in repo identity settings.',
+      });
+      continue;
+    }
+    const fetchRes = await gitFetch(r.path);
+    if (!fetchRes.ok) {
+      out.push({
+        repoId: r.id,
+        defaultBranch,
+        result: 'fetch-failed',
+        message: fetchRes.error,
+      });
+      continue;
+    }
+    const switchRes = await checkoutBranch(r.id, r.path, defaultBranch, false);
+    if (switchRes.result === 'dirty') {
+      out.push({
+        repoId: r.id,
+        defaultBranch,
+        result: 'dirty',
+        message: switchRes.message,
+      });
+      continue;
+    }
+    if (switchRes.result === 'error' || switchRes.result === 'missing-branch') {
+      out.push({
+        repoId: r.id,
+        defaultBranch,
+        result: 'switch-failed',
+        message: switchRes.message ?? `Could not switch to ${defaultBranch}`,
+      });
+      continue;
+    }
+    const pullRes = await gitPull(r.path);
+    if (!pullRes.ok) {
+      out.push({
+        repoId: r.id,
+        defaultBranch,
+        result: 'pull-failed',
+        message: pullRes.error,
+      });
+      continue;
+    }
+    out.push({ repoId: r.id, defaultBranch, result: 'reset' });
   }
   return out;
 }

@@ -1230,6 +1230,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
   const setSheet = useStore((s) => s.setSheet);
   const archiveWs = useStore((s) => s.archiveWorkspace);
   const requestConfirm = useStore((s) => s.requestConfirm);
+  const pushToast = useStore((s) => s.pushToast);
 
   const [busy, setBusy] = useState(false);
   const [view, setView] = useState<'overview' | 'commit'>('overview');
@@ -1493,12 +1494,41 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
         }
         summary={summary}
         onArchive={async () => {
+          const memberCount = ws.repoIds.length;
           const ok = await requestConfirm({
             title: 'Archive workset?',
-            body: `Hide "${ws.name}" from the active list. Member repos are unchanged on disk; reactivate from the sidebar to bring it back.`,
-            confirmLabel: 'Archive',
+            body: `Reset all ${memberCount} ${memberCount === 1 ? 'repo' : 'repos'} to its default branch with a fresh pull, then hide "${ws.name}" from the active list. Reactivate from the sidebar to bring the workset back (members stay on default).`,
+            confirmLabel: 'Reset & archive',
           });
-          if (ok) void archiveWs(workspaceId);
+          if (!ok) return;
+          const outcomes = await window.overgit.invoke(
+            'workspace:resetToDefault',
+            workspaceId,
+          );
+          const failed = outcomes.filter((o) => o.result !== 'reset');
+          if (failed.length > 0) {
+            const summaryStr = failed
+              .map((o) => {
+                const name = reposById.get(o.repoId)?.name ?? o.repoId;
+                return `${name}: ${o.result}`;
+              })
+              .join(', ');
+            pushToast({
+              kind: 'warn',
+              message: `Archived. ${failed.length} of ${outcomes.length} ${
+                failed.length === 1 ? 'repo' : 'repos'
+              } not reset — ${summaryStr}.`,
+              sticky: true,
+            });
+          } else {
+            pushToast({
+              kind: 'success',
+              message: `Archived. All ${outcomes.length} ${
+                outcomes.length === 1 ? 'repo is' : 'repos are'
+              } back on default.`,
+            });
+          }
+          void archiveWs(workspaceId);
         }}
       />
 
