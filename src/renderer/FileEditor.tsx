@@ -141,25 +141,64 @@ function Editor({
   language: string | null;
 }): JSX.Element {
   const lines = content.split('\n');
+  // Pin font metrics shared by gutter / highlight pre / textarea so the
+  // selection rectangle the textarea draws lines up exactly with the
+  // glyphs from the pre underneath. Browsers default textareas to
+  // `line-height: normal` (~1.2) which doesn't match the pre's inherited
+  // 1.5, so without explicit values selections drift by ~1px per line and
+  // diverge into the multi-line rectangle the user reported.
+  const FONT_SIZE = 12;
+  const LINE_HEIGHT = 18; // 1.5× font-size — keeps the math simple.
+  const PAD_TOP = 8; // matches Tailwind `pt-2` (0.5rem @ 16px base).
+  const PAD_X = 8;
+  const sharedTypography: React.CSSProperties = {
+    fontSize: FONT_SIZE,
+    lineHeight: `${LINE_HEIGHT}px`,
+    fontFamily:
+      'ui-monospace, SFMono-Regular, Menlo, Monaco, "Cascadia Code", "Roboto Mono", monospace',
+    tabSize: 4,
+  };
   return (
-    <div className="flex text-[12px] font-mono">
-      <div className="select-none text-right pr-2 pt-2 text-ink-faint sticky left-0 bg-surface-muted min-w-[3.5em]">
+    <div className="flex">
+      <div
+        className="select-none text-right text-ink-faint sticky left-0 bg-surface-muted"
+        style={{
+          ...sharedTypography,
+          paddingTop: PAD_TOP,
+          paddingRight: PAD_X,
+          minWidth: '3.5em',
+        }}
+      >
         {lines.map((_, i) => (
-          <div key={i + 1}>{i + 1}</div>
+          <div key={i + 1} style={{ height: LINE_HEIGHT, lineHeight: `${LINE_HEIGHT}px` }}>
+            {i + 1}
+          </div>
         ))}
       </div>
       <div className="flex-1 relative">
         <pre
           aria-hidden
-          className="absolute inset-0 pt-2 px-2 m-0 pointer-events-none whitespace-pre overflow-visible"
+          className="absolute inset-0 m-0 pointer-events-none whitespace-pre overflow-visible"
+          style={{
+            ...sharedTypography,
+            paddingTop: PAD_TOP,
+            paddingLeft: PAD_X,
+            paddingRight: PAD_X,
+          }}
           dangerouslySetInnerHTML={{ __html: highlight(content, language) }}
         />
         <textarea
           value={content}
           onChange={(e) => onChange(e.target.value)}
           spellCheck={false}
-          className="relative w-full min-h-full bg-transparent text-transparent caret-ink pt-2 px-2 select-text outline-none whitespace-pre resize-none"
-          style={{ minHeight: `${Math.max(lines.length, 8) * 1.5}em` }}
+          className="relative w-full min-h-full bg-transparent text-transparent caret-ink select-text outline-none whitespace-pre resize-none border-0"
+          style={{
+            ...sharedTypography,
+            paddingTop: PAD_TOP,
+            paddingLeft: PAD_X,
+            paddingRight: PAD_X,
+            minHeight: Math.max(lines.length, 8) * LINE_HEIGHT + PAD_TOP * 2,
+          }}
         />
       </div>
     </div>

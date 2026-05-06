@@ -6,7 +6,7 @@ import type { BranchSummary, Repo, UUID, Workspace } from '@shared/types';
 // See App.tsx — stable empty fallback for Zustand selectors so React's
 // useSyncExternalStore snapshot equality holds across renders.
 const EMPTY_BRANCHES: BranchSummary[] = [];
-const EMPTY_FILES: string[] = [];
+const EMPTY_FILES: Array<{ path: string; ignored: boolean }> = [];
 
 /// Cmd+K command palette. One overlay, one search box, one list. The
 /// list is built by concatenating heterogenous sections (Actions,
@@ -103,7 +103,9 @@ export function CommandPalette(): JSX.Element | null {
         repos,
         workspaces,
         branches: branchSummaries,
-        files: fileList,
+        // Command palette only proposes non-ignored files — opening a
+        // build artifact via the palette is rarely intentional.
+        files: fileList.filter((f) => !f.ignored).map((f) => f.path),
         stagedPaths,
         unstagedPaths,
         cli,
@@ -247,8 +249,8 @@ export function CommandPalette(): JSX.Element | null {
             disabled={busy}
             placeholder={
               selectedRepoId
-                ? 'Switch branch · run command · jump to repo / workspace'
-                : 'Jump to repo / workspace · run command'
+                ? 'Switch branch · run command · jump to repo / workset'
+                : 'Jump to repo / workset · run command'
             }
             className="field flex-1 px-2 py-1.5 text-sm"
           />
@@ -584,7 +586,7 @@ function buildSections(args: BuildArgs): PaletteSection[] {
   if (selectedWsId && q) {
     repoActionItems.push({
       id: `create-branch-ws:${q}`,
-      title: `Create branch "${query.trim()}" across workspace`,
+      title: `Create branch "${query.trim()}" across workset`,
       glyph: '⎇',
       perform: () => {
         actions.setSheet({ kind: 'newBranchInWorkspace', workspaceId: selectedWsId });
@@ -596,7 +598,7 @@ function buildSections(args: BuildArgs): PaletteSection[] {
     const wsActions: PaletteItem[] = [
       {
         id: 'commit-all-ws',
-        title: 'Commit all across workspace',
+        title: 'Commit all across workset',
         hint: 'Shared message · skips detached HEAD',
         glyph: '✓',
         perform: () => {
@@ -606,7 +608,7 @@ function buildSections(args: BuildArgs): PaletteSection[] {
       },
       {
         id: 'push-all-ws',
-        title: 'Push all across workspace',
+        title: 'Push all across workset',
         hint: 'Push every repo whose branch is ahead of upstream',
         glyph: '↑',
         perform: () => {
@@ -616,7 +618,7 @@ function buildSections(args: BuildArgs): PaletteSection[] {
       },
       {
         id: 'open-prs-ws',
-        title: 'Open PRs across workspace',
+        title: 'Open PRs across workset',
         hint: cli?.gh ? 'Shared title and body · gh pr create per repo' : 'Install gh first',
         glyph: '⇧',
         perform: () => {
@@ -648,7 +650,7 @@ function buildSections(args: BuildArgs): PaletteSection[] {
     },
     {
       id: 'new-workspace',
-      title: 'New workspace…',
+      title: 'New workset…',
       glyph: '+',
       perform: () => {
         actions.setSheet({ kind: 'newWorkspace' });
@@ -750,9 +752,10 @@ function buildSections(args: BuildArgs): PaletteSection[] {
     }));
   if (repoItems.length) sections.push({ label: 'Repos', items: repoItems });
 
-  // Workspaces to jump to.
+  // Workspaces to jump to. Archived workspaces are intentionally excluded —
+  // the palette is for active work; reactivating happens from the sidebar.
   const wsItems: PaletteItem[] = workspaces
-    .filter((w) => w.id !== selectedWsId && matches(w.name))
+    .filter((w) => !w.archived && w.id !== selectedWsId && matches(w.name))
     .slice(0, 30)
     .map((w) => ({
       id: `ws:${w.id}`,
@@ -764,7 +767,7 @@ function buildSections(args: BuildArgs): PaletteSection[] {
         actions.close();
       },
     }));
-  if (wsItems.length) sections.push({ label: 'Workspaces', items: wsItems });
+  if (wsItems.length) sections.push({ label: 'Worksets', items: wsItems });
 
   return sections;
 }

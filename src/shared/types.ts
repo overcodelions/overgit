@@ -76,6 +76,13 @@ export interface Workspace {
   /// Optional: the branch the user wants the workspace pinned to. Used
   /// by the "checkout everywhere" action as a default.
   preferredBranch?: string;
+  /// When set, the workspace is hidden from the active sidebar list and
+  /// tucked under the collapsed "Archived" section. Reversible — the
+  /// workspace and its member repos are unchanged on disk; reactivate
+  /// clears this and re-selects the workspace. Mental model: a "working
+  /// set is done — committed and pushed across all repos — put it away
+  /// without losing it."
+  archived?: boolean;
 }
 
 export interface RepoStatus {
@@ -399,6 +406,11 @@ export interface AppSettings {
   /// the index is synced to match on commit. 'advanced' restores the two
   /// groups, the Stage/Unstage toolbar, and the index-side diff toggle.
   stagingMode: 'simple' | 'advanced';
+  /// Tutorial mode. When on, action buttons surface the underlying `git`
+  /// command and a one-line plain-English caption so newcomers can learn
+  /// what overgit is doing on their behalf. Off by default to avoid
+  /// cluttering the UI for fluent users.
+  explainMode?: boolean;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -408,6 +420,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   historyAsideWidth: 480,
   workspaceLastSeen: {},
   stagingMode: 'simple',
+  explainMode: true,
 };
 
 export const SIDEBAR_MIN_WIDTH = 200;
@@ -482,6 +495,14 @@ export interface IPCInvokeMap {
     from?: string;
   }) => { ok: boolean; error?: string };
   'repo:deleteBranch': (args: { repoId: UUID; name: string; force: boolean }) => { ok: boolean; error?: string };
+  /// Rename a branch via `git branch -m` (or `-M` when `force`).
+  /// `from === null` renames the current branch.
+  'repo:renameBranch': (args: {
+    repoId: UUID;
+    from: string | null;
+    to: string;
+    force: boolean;
+  }) => { ok: boolean; error?: string };
   /// Diff for a single path, scoped to either the index (staged vs HEAD),
   /// the working tree (unstaged vs index), or both combined (working tree
   /// vs HEAD — used by simple staging mode where the staged/unstaged
@@ -539,8 +560,28 @@ export interface IPCInvokeMap {
     repoId: UUID;
     branch: string;
     mode: 'merge' | 'ff-only' | 'squash';
-  }) => { ok: boolean; error?: string };
+  }) => { ok: boolean; error?: string; output?: string; alreadyUpToDate?: boolean };
   'repo:abortMerge': (repoId: UUID) => { ok: boolean; error?: string };
+  /// Resolve a conflict by taking one side wholesale. `ours` keeps the
+  /// current branch's version, `theirs` takes the version from the
+  /// branch being merged. The path is staged on success so the conflict
+  /// banner ticks down.
+  'repo:resolveConflictSide': (args: {
+    repoId: UUID;
+    path: string;
+    side: 'ours' | 'theirs';
+  }) => { ok: boolean; error?: string };
+  /// Read `.git/MERGE_MSG` so the commit form can pre-fill git's
+  /// auto-generated merge commit message ("Merge branch 'X' into Y" plus
+  /// any conflict summary).
+  'repo:readMergeMsg': (repoId: UUID) => { ok: boolean; message: string | null; error?: string };
+  /// Finalize an in-progress merge by running `git commit --no-edit`
+  /// (uses the MERGE_MSG git wrote), or `-m <msg>` when the user
+  /// supplied a custom message.
+  'repo:commitMerge': (args: {
+    repoId: UUID;
+    message: string | null;
+  }) => { ok: boolean; error?: string };
   /// `git rebase <onto>`. Starts the rebase; if conflicts arise the
   /// renderer surfaces them via the in-progress + conflicts fields on
   /// repo:status, and the user resolves + calls continueRebase.
@@ -615,6 +656,11 @@ export interface IPCInvokeMap {
   'repo:pruneWorktrees': (repoId: UUID) => { ok: boolean; error?: string; output?: string };
 
   'fs:listFiles': (repoId: UUID) => string[];
+  /// Git-aware file list: includes tracked + untracked-not-ignored
+  /// entries with `ignored: false`, plus ignored entries with
+  /// `ignored: true`. The renderer hides ignored by default and offers
+  /// a "Show ignored" toggle that surfaces them with a muted style.
+  'fs:listRepoFiles': (repoId: UUID) => Array<{ path: string; ignored: boolean }>;
   'fs:readFile': (args: {
     repoId: UUID;
     path: string;

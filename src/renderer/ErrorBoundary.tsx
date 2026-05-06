@@ -32,7 +32,7 @@ export class ErrorBoundary extends React.Component<
         <h1 className="text-lg font-semibold mb-2">Something broke in the renderer.</h1>
         <p className="text-xs text-ink-faint mb-4">
           The error is shown below. Click Reload to restart the renderer
-          process — your repos and workspaces are persisted on disk so
+          process — your repos and worksets are persisted on disk so
           nothing is lost.
         </p>
         <pre className="text-xs font-mono whitespace-pre-wrap p-3 rounded border border-card bg-card text-red-300">

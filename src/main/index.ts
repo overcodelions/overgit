@@ -31,6 +31,7 @@ import {
   commitStaged,
   createBranch,
   deleteBranch,
+  renameBranch,
   deleteTag,
   detectDefaultBranch,
   diff as gitDiff,
@@ -56,6 +57,9 @@ import {
   looksLikeRepo,
   markResolved,
   mergeBranch,
+  resolveConflictSide,
+  readMergeMsg,
+  commitMerge,
   pull as gitPull,
   pullForce as gitPullForce,
   push as gitPush,
@@ -70,7 +74,7 @@ import {
   status as gitStatus,
   unstageFiles,
 } from './git';
-import { listFilesUnder, readFileUnderRoot, writeFileUnderRoot } from './fs';
+import { listFilesUnder, listRepoFiles, readFileUnderRoot, writeFileUnderRoot } from './fs';
 import {
   aggregateWorkspaceDirtyDiff,
   workspaceActivity,
@@ -520,6 +524,30 @@ function registerIpc(): void {
     return abortMerge(repo.path);
   });
 
+  ipcMain.handle(
+    'repo:resolveConflictSide',
+    async (_e, args: { repoId: string; path: string; side: 'ours' | 'theirs' }) => {
+      const repo = repoFromArg(args);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return resolveConflictSide(repo.path, args.path, args.side);
+    },
+  );
+
+  ipcMain.handle('repo:readMergeMsg', async (_e, repoId: string) => {
+    const repo = repoFromArg(repoId);
+    if (!repo) return { ok: false, message: null, error: 'Unknown repo' };
+    return readMergeMsg(repo.path);
+  });
+
+  ipcMain.handle(
+    'repo:commitMerge',
+    async (_e, args: { repoId: string; message: string | null }) => {
+      const repo = repoFromArg(args);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return commitMerge(repo.path, args.message);
+    },
+  );
+
   ipcMain.handle('repo:rebase', async (_e, args: { repoId: string; onto: string }) => {
     const repo = repoFromArg(args);
     if (!repo) return { ok: false, error: 'Unknown repo' };
@@ -565,6 +593,18 @@ function registerIpc(): void {
       const repo = repoFromArg(args);
       if (!repo) return { ok: false, error: 'Unknown repo' };
       return deleteBranch(repo.path, args.name, args.force);
+    },
+  );
+
+  ipcMain.handle(
+    'repo:renameBranch',
+    async (
+      _e,
+      args: { repoId: string; from: string | null; to: string; force: boolean },
+    ) => {
+      const repo = repoFromArg(args);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return renameBranch(repo.path, args.to, args.from, args.force);
     },
   );
 
@@ -812,6 +852,12 @@ function registerIpc(): void {
     const repo = repoFromArg(repoId);
     if (!repo) return [];
     return listFilesUnder(repo.path);
+  });
+
+  ipcMain.handle('fs:listRepoFiles', async (_e, repoId: string) => {
+    const repo = repoFromArg(repoId);
+    if (!repo) return [];
+    return listRepoFiles(repo.path);
   });
 
   ipcMain.handle('fs:readFile', (_e, args: { repoId: string; path: string }) => {

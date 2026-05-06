@@ -4,6 +4,7 @@ import { RepoDetail } from './RepoDetail';
 import { TitleBar } from './TitleBar';
 import { SheetHost } from './Sheets';
 import { CommandPalette } from './CommandPalette';
+import { Explain } from './Explain';
 import type {
   ChangedFile,
   CheckoutOutcome,
@@ -41,6 +42,7 @@ export function App(): JSX.Element {
 
   useGlobalShortcuts();
   useSidebarStatusRefresh();
+  useSidebarBackgroundFetch();
 
   if (!loaded) {
     return (
@@ -58,10 +60,47 @@ export function App(): JSX.Element {
         {sidebarVisible && <SidebarWithResize />}
         <Main />
       </div>
+      <LearningBar />
       <SheetHost />
       <CommandPalette />
       <ConfirmHost />
       <ToastHost />
+    </div>
+  );
+}
+
+/// Persistent thin strip pinned to the bottom of the app shell. Visible
+/// only when Settings → Explain mode is on. Reads `learningHint` from
+/// the store, which is pushed by `<Explain>` wrappers on hover and by
+/// the store after an action runs (so the bar briefly mirrors the last
+/// command executed too).
+function LearningBar(): JSX.Element | null {
+  const explain = useStore((s) => s.settings.explainMode);
+  const hint = useStore((s) => s.learningHint);
+  if (!explain) return null;
+  const idle = !hint;
+  const command = hint?.command ?? '';
+  const plain = hint?.plain ?? 'Hover any control to see the git command it runs and what it does.';
+  return (
+    <div
+      className={`flex-shrink-0 h-[34px] border-t border-card px-4 flex items-center gap-3 text-[12px] ${
+        idle ? 'bg-accent/[0.03]' : 'bg-accent/10'
+      }`}
+    >
+      <span className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-accent shrink-0">
+        <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent" />
+        Learn
+      </span>
+      <code
+        className={`font-mono text-ink bg-card/80 px-2 py-0.5 rounded border border-card shrink-0 max-w-[50%] truncate ${
+          command ? '' : 'invisible'
+        }`}
+      >
+        {command || 'placeholder'}
+      </code>
+      <span className={`min-w-0 truncate ${idle ? 'text-ink-faint italic' : 'text-ink-muted'}`}>
+        {plain}
+      </span>
     </div>
   );
 }
@@ -263,6 +302,66 @@ function useSidebarStatusRefresh(): void {
   }, [loaded, refreshAll]);
 }
 
+/// Background fetch so the sidebar's ahead/behind dots reflect the
+/// remote, not just stale local tracking refs. `useSidebarStatusRefresh`
+/// alone only re-reads `git rev-list @{u}...HEAD` — it never asks the
+/// remote what's new, so a PR merged upstream is invisible until you
+/// manually fetch. This hook runs `git fetch` across all repos on a
+/// slower cadence (network calls + possible auth prompts make 60s too
+/// aggressive), then triggers the existing status fan-out so the dots
+/// move. Cadence:
+///   - Every 5min while the window is visible.
+///   - On focus, but only if the last run was >2min ago. Quick alt-tabs
+///     shouldn't kick off a fetch every time.
+/// Errors are swallowed in the store action — a flaky remote shouldn't
+/// surface as a toast for a background sync.
+function useSidebarBackgroundFetch(): void {
+  const fetchAll = useStore((s) => s.fetchAllReposQuiet);
+  const loaded = useStore((s) => s.loaded);
+
+  useEffect(() => {
+    if (!loaded) return;
+    const FOCUS_MIN_GAP_MS = 2 * 60_000;
+    const INTERVAL_MS = 5 * 60_000;
+    let lastRun = 0;
+    let inFlight = false;
+    const run = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      lastRun = Date.now();
+      try {
+        await fetchAll();
+      } finally {
+        inFlight = false;
+      }
+    };
+    const onFocus = () => {
+      if (Date.now() - lastRun < FOCUS_MIN_GAP_MS) return;
+      void run();
+    };
+    const onVisibility = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (Date.now() - lastRun < FOCUS_MIN_GAP_MS) return;
+      void run();
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
+    const interval = window.setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      void run();
+    }, INTERVAL_MS);
+    // Kick off one shortly after launch so the dots are honest within a
+    // few seconds of opening the app, not 5 minutes later.
+    const kickoff = window.setTimeout(() => void run(), 3_000);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.clearInterval(interval);
+      window.clearTimeout(kickoff);
+    };
+  }, [loaded, fetchAll]);
+}
+
 /// Global keyboard shortcuts. We attach one keydown listener and
 /// dispatch on Cmd/Ctrl + key. Inputs and textareas are NOT skipped for
 /// nav-like shortcuts on purpose — Cmd+1..4 should always switch the
@@ -412,10 +511,13 @@ function Sidebar(): JSX.Element {
   const setSheet = useStore((s) => s.setSheet);
   const removeRepo = useStore((s) => s.removeRepo);
   const removeWorkspace = useStore((s) => s.removeWorkspace);
+  const archiveWorkspace = useStore((s) => s.archiveWorkspace);
+  const unarchiveWorkspace = useStore((s) => s.unarchiveWorkspace);
   const requestConfirm = useStore((s) => s.requestConfirm);
 
   const [search, setSearch] = useState('');
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set());
+  const [archivedExpanded, setArchivedExpanded] = useState(false);
   const query = search.trim().toLowerCase();
   const navRef = useRef<HTMLElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -444,6 +546,19 @@ function Sidebar(): JSX.Element {
     [workspaces, query],
   );
 
+  const activeWorkspaces = useMemo(
+    () => visibleWorkspaces.filter((w) => !w.archived),
+    [visibleWorkspaces],
+  );
+  const archivedWorkspaces = useMemo(
+    () => visibleWorkspaces.filter((w) => w.archived),
+    [visibleWorkspaces],
+  );
+  // Auto-expand the Archived section when a search query has narrowed the
+  // sidebar to archived matches — otherwise the user typed a name they
+  // recognize and would just see "no workspaces match" while it's there.
+  const showArchivedRows = archivedExpanded || query.length > 0;
+
   // Implicit folder grouping. When the user has a non-trivial number
   // of repos that span multiple parent directories, group the repo list
   // by parent directory. Cheap heuristic — no schema changes — and
@@ -470,9 +585,12 @@ function Sidebar(): JSX.Element {
         for (const r of g.repos) rows.push({ kind: 'repo', id: r.id });
       }
     }
-    for (const w of visibleWorkspaces) rows.push({ kind: 'workspace', id: w.id });
+    for (const w of activeWorkspaces) rows.push({ kind: 'workspace', id: w.id });
+    if (showArchivedRows) {
+      for (const w of archivedWorkspaces) rows.push({ kind: 'workspace', id: w.id });
+    }
     return rows;
-  }, [repoGroups, visibleWorkspaces, collapsedFolders]);
+  }, [repoGroups, activeWorkspaces, archivedWorkspaces, showArchivedRows, collapsedFolders]);
 
   useEffect(() => {
     if (activeIdx >= flatRows.length) setActiveIdx(flatRows.length - 1);
@@ -609,17 +727,17 @@ function Sidebar(): JSX.Element {
           })
         )}
 
-        <SectionHeader label="Workspaces" count={visibleWorkspaces.length} />
-        {visibleWorkspaces.length === 0 ? (
+        <SectionHeader label="Worksets" count={activeWorkspaces.length} />
+        {activeWorkspaces.length === 0 ? (
           <EmptyHint
             text={
               query
-                ? 'No workspaces match.'
-                : 'Group repos that you switch together.'
+                ? 'No worksets match.'
+                : 'A unit of work across repos — branch, commit, push together. Archive when shipped.'
             }
           />
         ) : (
-          visibleWorkspaces.map((w) => {
+          activeWorkspaces.map((w) => {
             const idx = rowIndex.get(`workspace:${w.id}`) ?? -1;
             return (
               <WorkspaceRow
@@ -629,6 +747,7 @@ function Sidebar(): JSX.Element {
                 keyboardActive={idx === activeIdx}
                 onSelect={() => selectWs(w.id)}
                 onEdit={() => setSheet({ kind: 'editWorkspace', workspaceId: w.id })}
+                onArchive={() => void archiveWorkspace(w.id)}
                 onRemove={async () => {
                   const ok = await requestConfirm({
                     title: `Remove workspace?`,
@@ -640,6 +759,43 @@ function Sidebar(): JSX.Element {
               />
             );
           })
+        )}
+
+        {archivedWorkspaces.length > 0 && (
+          <>
+            <button
+              onClick={() => setArchivedExpanded((v) => !v)}
+              className="w-full mt-3 px-2 py-1 flex items-center gap-2 text-[10px] uppercase tracking-wide text-ink-faint hover:text-ink"
+              title={showArchivedRows ? 'Collapse archived' : 'Expand archived'}
+            >
+              <span className="font-mono">{showArchivedRows ? '▾' : '▸'}</span>
+              <span>Archived</span>
+              <span className="ml-auto">{archivedWorkspaces.length}</span>
+            </button>
+            {showArchivedRows &&
+              archivedWorkspaces.map((w) => {
+                const idx = rowIndex.get(`workspace:${w.id}`) ?? -1;
+                return (
+                  <WorkspaceRow
+                    key={w.id}
+                    workspace={w}
+                    archived
+                    selected={selectedWs === w.id && !selectedRepo}
+                    keyboardActive={idx === activeIdx}
+                    onSelect={() => selectWs(w.id)}
+                    onReactivate={() => void unarchiveWorkspace(w.id)}
+                    onRemove={async () => {
+                      const ok = await requestConfirm({
+                        title: `Remove workspace?`,
+                        body: `Remove workspace "${w.name}"?`,
+                        confirmLabel: 'Remove',
+                      });
+                      if (ok) void removeWorkspace(w.id);
+                    }}
+                  />
+                );
+              })}
+          </>
         )}
       </nav>
 
@@ -655,7 +811,7 @@ function Sidebar(): JSX.Element {
           disabled={repos.length === 0}
           className="text-xs text-ink-muted hover:text-ink py-1 px-2 rounded hover:bg-card text-left disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-ink-muted"
         >
-          + New workspace
+          + New workset
         </button>
       </div>
     </aside>
@@ -765,17 +921,22 @@ function RepoRow({
             : 'text-ink-muted hover:bg-card hover:text-ink'
       }`}
     >
-      <button
-        onClick={onSelect}
-        className={`flex items-center gap-1.5 flex-1 min-w-0 text-left py-1 ${
-          indent ? 'pl-5 pr-2' : 'px-2'
-        }`}
-        title={repo.path}
+      <Explain
+        command={`cd ${repo.path}`}
+        plain={`Open ${repo.name} — switch the detail pane to this repository's status, history, and branches.`}
       >
-        <RepoIcon />
-        <span className="truncate">{repo.name}</span>
-        <RepoStatusBadge status={status} />
-      </button>
+        <button
+          onClick={onSelect}
+          className={`flex items-center gap-1.5 flex-1 min-w-0 text-left py-1 ${
+            indent ? 'pl-5 pr-2' : 'px-2'
+          }`}
+          title={repo.path}
+        >
+          <RepoIcon />
+          <span className="truncate">{repo.name}</span>
+          <RepoStatusBadge status={status} />
+        </button>
+      </Explain>
       <button
         onClick={onRemove}
         title="Remove from overgit"
@@ -825,15 +986,24 @@ function WorkspaceRow({
   workspace,
   selected,
   keyboardActive = false,
+  archived = false,
   onSelect,
   onEdit,
+  onArchive,
+  onReactivate,
   onRemove,
 }: {
   workspace: Workspace;
   selected: boolean;
   keyboardActive?: boolean;
+  /// Render in muted "archived" treatment with a Reactivate button instead
+  /// of Edit/Archive. Archived rows are still selectable so a power user
+  /// who expanded the section can peek at one without reactivating first.
+  archived?: boolean;
   onSelect: () => void;
-  onEdit: () => void;
+  onEdit?: () => void;
+  onArchive?: () => void;
+  onReactivate?: () => void;
   onRemove: () => void;
 }): JSX.Element {
   const ref = useRef<HTMLDivElement | null>(null);
@@ -848,34 +1018,105 @@ function WorkspaceRow({
           ? 'sidebar-row-selected text-ink'
           : keyboardActive
             ? 'bg-card text-ink ring-1 ring-accent/40'
-            : 'text-ink-muted hover:bg-card hover:text-ink'
+            : archived
+              ? 'text-ink-faint hover:bg-card hover:text-ink-muted'
+              : 'text-ink-muted hover:bg-card hover:text-ink'
       }`}
     >
       <button
         onClick={onSelect}
-        className="flex items-center gap-1.5 flex-1 min-w-0 text-left px-2 py-1"
+        className="flex items-center gap-2 flex-1 min-w-0 text-left px-2 py-1.5"
+        title={
+          workspace.preferredBranch
+            ? `${workspace.name} · ${workspace.preferredBranch}`
+            : workspace.name
+        }
       >
         <WorkspaceIcon />
-        <span className="truncate">{workspace.name}</span>
-        <span className="text-[10px] text-ink-faint">
+        <div className="flex-1 min-w-0 flex flex-col leading-tight">
+          <span className="truncate font-medium">{workspace.name}</span>
+          {workspace.preferredBranch && (
+            <span className="truncate font-mono text-[10px] text-ink-faint mt-0.5">
+              {workspace.preferredBranch}
+            </span>
+          )}
+        </div>
+        <span className="shrink-0 text-[10px] tabular-nums text-ink-faint">
           {workspace.repoIds.length}
         </span>
       </button>
-      <button
-        onClick={onEdit}
-        title="Edit workspace"
-        className="w-5 h-5 flex items-center justify-center rounded text-ink-faint opacity-0 group-hover:opacity-100 hover:text-ink hover:bg-card"
-      >
-        <PencilIcon />
-      </button>
+      {archived ? (
+        onReactivate && (
+          <button
+            onClick={onReactivate}
+            title="Reactivate workset"
+            className="w-5 h-5 flex items-center justify-center rounded text-ink-faint opacity-0 group-hover:opacity-100 hover:text-ink hover:bg-card"
+          >
+            <ReactivateIcon />
+          </button>
+        )
+      ) : (
+        <>
+          {onEdit && (
+            <button
+              onClick={onEdit}
+              title="Edit workset"
+              className="w-5 h-5 flex items-center justify-center rounded text-ink-faint opacity-0 group-hover:opacity-100 hover:text-ink hover:bg-card"
+            >
+              <PencilIcon />
+            </button>
+          )}
+          {onArchive && (
+            <button
+              onClick={onArchive}
+              title="Archive workset"
+              className="w-5 h-5 flex items-center justify-center rounded text-ink-faint opacity-0 group-hover:opacity-100 hover:text-ink hover:bg-card"
+            >
+              <ArchiveIcon />
+            </button>
+          )}
+        </>
+      )}
       <button
         onClick={onRemove}
-        title="Remove workspace"
+        title="Remove workset"
         className="w-5 h-5 flex items-center justify-center rounded text-ink-faint opacity-0 group-hover:opacity-100 hover:text-red-300 hover:bg-card"
       >
         <span className="text-[11px]">×</span>
       </button>
     </div>
+  );
+}
+
+function ArchiveIcon(): JSX.Element {
+  return (
+    <svg width="11" height="11" viewBox="0 0 16 16" fill="none" className="flex-shrink-0">
+      <rect x="2" y="3" width="12" height="3" rx="0.5" stroke="currentColor" strokeWidth="1.2" />
+      <path d="M3 6.5v6a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-6" stroke="currentColor" strokeWidth="1.2" />
+      <path d="M6.5 9h3" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function ReactivateIcon(): JSX.Element {
+  return (
+    <svg width="11" height="11" viewBox="0 0 16 16" fill="none" className="flex-shrink-0">
+      <path
+        d="M3 8a5 5 0 1 1 1.5 3.5"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+        fill="none"
+      />
+      <path
+        d="M3 5v3h3"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        fill="none"
+      />
+    </svg>
   );
 }
 
@@ -913,6 +1154,24 @@ function WorkspaceIcon(): JSX.Element {
   );
 }
 
+function BranchGlyph(): JSX.Element {
+  return (
+    <svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden className="shrink-0">
+      <circle cx="4" cy="3.5" r="1.4" stroke="currentColor" strokeWidth="1.3" />
+      <circle cx="4" cy="12.5" r="1.4" stroke="currentColor" strokeWidth="1.3" />
+      <circle cx="11.5" cy="6.5" r="1.4" stroke="currentColor" strokeWidth="1.3" />
+      <path d="M4 5v6" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+      <path
+        d="M11.5 8c0 2.2-1.8 4-4 4H6"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+        fill="none"
+      />
+    </svg>
+  );
+}
+
 function PencilIcon(): JSX.Element {
   return (
     <svg width="11" height="11" viewBox="0 0 20 20" fill="currentColor" className="flex-shrink-0">
@@ -936,10 +1195,11 @@ function Main(): JSX.Element {
     return (
       <main className="flex-1 flex items-center justify-center text-ink-muted">
         <div className="text-center max-w-sm">
-          <div className="text-base font-medium mb-1">Pick a repo or a workspace</div>
+          <div className="text-base font-medium mb-1">Pick a repo or a workset</div>
           <p className="text-xs text-ink-faint">
             Repos give you a single-repo working pane (changes, history, files,
-            graph). Workspaces fan operations across many repos at once.
+            graph). A workset is a unit of work across repos — branch, commit,
+            and push together, then archive when the work ships.
           </p>
         </div>
       </main>
@@ -966,49 +1226,14 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
   const refreshActivity = useStore((s) => s.refreshWorkspaceActivity);
   const markSeen = useStore((s) => s.markWorkspaceSeen);
   const fetchWs = useStore((s) => s.fetchWorkspace);
-  const checkout = useStore((s) => s.checkoutWorkspaceBranch);
   const selectRepo = useStore((s) => s.selectRepo);
   const setSheet = useStore((s) => s.setSheet);
+  const archiveWs = useStore((s) => s.archiveWorkspace);
+  const requestConfirm = useStore((s) => s.requestConfirm);
 
-  const [branch, setBranch] = useState('');
-  const [createIfMissing, setCreateIfMissing] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [branchPool, setBranchPool] = useState<
-    { branch: string; repoCount: number; total: number }[]
-  >([]);
-  const [suggestOpen, setSuggestOpen] = useState(false);
   const [view, setView] = useState<'overview' | 'commit'>('overview');
-
-  // Pull the cross-repo branch list once per workspace open. Refreshed
-  // explicitly via Refresh / Fetch all (those buttons already cause a
-  // workspace status reload, which is plenty of churn for the UI to
-  // also re-pull suggestions on top of).
-  useEffect(() => {
-    let cancelled = false;
-    window.overgit
-      .invoke('workspace:branchSuggestions', workspaceId)
-      .then((rows) => {
-        if (!cancelled) setBranchPool(rows);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [workspaceId]);
-
-  // Filter to up to 8 matches as the user types. Empty input shows the
-  // top branches by repo coverage so an explorer can find candidates.
-  const filteredSuggestions = useMemo(() => {
-    const q = branch.trim().toLowerCase();
-    const rows = q
-      ? branchPool.filter((r) => r.branch.toLowerCase().includes(q))
-      : branchPool;
-    return rows.slice(0, 8);
-  }, [branch, branchPool]);
-
-  const exactMatch = useMemo(
-    () => branchPool.find((r) => r.branch === branch.trim()),
-    [branch, branchPool],
-  );
+  const [showAllWorktrees, setShowAllWorktrees] = useState(false);
   /// `seenAtOpen` freezes the lastSeen value at mount so the "new
   /// since" pip remains visible while the user is on the pane. Without
   /// this, marking-seen on open would immediately wipe the indicators
@@ -1081,107 +1306,224 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
     return topBranch;
   })();
 
+  // Drift gate for the workset-wide write actions (Commit all / Push all
+  // / Open PRs). When a member is off the bound branch, those actions
+  // would commit / push / PR off the wrong branch — almost certainly not
+  // what the workset implies. We disable them and steer the user to
+  // Resume first. Only applies when a branch is explicitly bound — for
+  // legacy worksets relying on inference, behavior stays as before.
+  const drifters =
+    ws.preferredBranch && summary.loaded > 0
+      ? summary.loaded - statuses.filter((s) => s.branch === ws.preferredBranch).length
+      : 0;
+  const hasDrift = ws.preferredBranch !== undefined && drifters > 0;
+  const driftTooltip = hasDrift
+    ? `Resume the workset first — ${drifters} of ${summary.loaded} ${
+        summary.loaded === 1 ? 'repo is' : 'repos are'
+      } off ${ws.preferredBranch}.`
+    : null;
+
   return (
     <main className="flex-1 overflow-y-auto p-6">
-      <header className="flex items-baseline justify-between mb-4">
-        <div>
-          <h1 className="text-base font-semibold">{ws.name}</h1>
-          <p className="text-[11px] text-ink-faint">
-            {ws.repoIds.length} {ws.repoIds.length === 1 ? 'repo' : 'repos'} ·
-            CLIs: {cliSummary(cli)}
-          </p>
+      <header className="flex items-start justify-between mb-4 gap-4">
+        <div className="min-w-0 flex flex-col gap-1.5">
+          <h1 className="text-lg font-semibold truncate">{ws.name}</h1>
+          <div className="flex items-center gap-2 flex-wrap">
+            {commonBranch && (
+              <span
+                className={`inline-flex items-center gap-1.5 text-[12px] font-mono px-2.5 py-1 rounded-md bg-card ${
+                  ws.preferredBranch ? 'text-accent' : 'text-ink-muted'
+                }`}
+                title={
+                  ws.preferredBranch
+                    ? 'Bound branch — workset lives here'
+                    : 'Inferred from members — open Edit to bind it'
+                }
+              >
+                <BranchGlyph />
+                <span className="truncate max-w-[260px]">{commonBranch}</span>
+              </span>
+            )}
+            <span className="text-[11px] text-ink-faint">
+              {ws.repoIds.length} {ws.repoIds.length === 1 ? 'repo' : 'repos'} · CLIs: {cliSummary(cli)}
+            </span>
+          </div>
         </div>
         <div className="flex gap-2">
-          <button
-            onClick={() => setSheet({ kind: 'newBranchInWorkspace', workspaceId })}
-            disabled={ws.repoIds.length === 0}
-            title="Sync each repo to its default branch, pull, and create a new branch — all in one go"
-            className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+          <Explain
+            command="for repo in workspace; do git checkout default && git pull && git checkout -b <new>; done"
+            plain="Sync every repo to its default branch, pull, and create a shared new branch in each."
           >
-            + New branch
-          </button>
-          <button
-            onClick={() => setSheet({ kind: 'commitAllInWorkspace', workspaceId })}
-            disabled={summary.dirty === 0}
-            title={
-              summary.dirty === 0
-                ? 'Nothing to commit — all repos are clean'
-                : `Stage and commit every dirty repo with a shared message (${summary.dirty} dirty)`
-            }
-            className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+            <button
+              onClick={() => setSheet({ kind: 'newBranchInWorkspace', workspaceId })}
+              disabled={ws.repoIds.length === 0}
+              title="Sync each repo to its default branch, pull, and create a new branch — all in one go"
+              className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+            >
+              + New branch
+            </button>
+          </Explain>
+          <Explain
+            command='for repo in dirty; do git add -A && git commit -m "…"; done'
+            plain="Stage every change in every dirty repo and commit them all with a shared message."
           >
-            Commit all
-          </button>
-          <button
-            onClick={() => setSheet({ kind: 'pushAllInWorkspace', workspaceId })}
-            disabled={summary.ahead === 0 && summary.total > 0}
-            title={
-              summary.ahead === 0
-                ? 'Nothing to push — every repo is already in sync'
-                : `Push every repo whose branch is ahead of upstream (${summary.ahead} ahead)`
-            }
-            className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
-          >
-            Push all{summary.ahead > 0 ? ` ↑${summary.ahead}` : ''}
-          </button>
-          <button
-            onClick={() => setSheet({ kind: 'openPRsInWorkspace', workspaceId })}
-            disabled={!cli?.gh || ws.repoIds.length === 0}
-            title={
-              !cli?.gh
-                ? 'Install gh to open PRs from overgit'
-                : 'Open a GitHub PR per repo with a shared title and body'
-            }
-            className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
-          >
-            Open PRs
-          </button>
-          <button
-            onClick={() => setSheet({ kind: 'editWorkspace', workspaceId })}
-            className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
-          >
-            Edit
-          </button>
-          <button
-            disabled={busy}
-            onClick={async () => {
-              setBusy(true);
-              try {
-                await fetchWs(workspaceId);
-              } finally {
-                setBusy(false);
+            <button
+              onClick={() => setSheet({ kind: 'commitAllInWorkspace', workspaceId })}
+              disabled={summary.dirty === 0 || hasDrift}
+              title={
+                hasDrift
+                  ? driftTooltip!
+                  : summary.dirty === 0
+                    ? 'Nothing to commit — all repos are clean'
+                    : `Stage and commit every dirty repo with a shared message (${summary.dirty} dirty)`
               }
-            }}
-            className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+              className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+            >
+              Commit all
+            </button>
+          </Explain>
+          <Explain
+            command="for repo in ahead; do git push; done"
+            plain="Send local commits up to the remote for every repo that's ahead of upstream."
           >
-            Fetch all
-          </button>
-          <button
-            disabled={busy}
-            onClick={() => {
-              refresh(workspaceId);
-              refreshPRs(workspaceId);
-            }}
-            className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+            <button
+              onClick={() => setSheet({ kind: 'pushAllInWorkspace', workspaceId })}
+              disabled={hasDrift || (summary.ahead === 0 && summary.total > 0)}
+              title={
+                hasDrift
+                  ? driftTooltip!
+                  : summary.ahead === 0
+                    ? 'Nothing to push — every repo is already in sync'
+                    : `Push every repo whose branch is ahead of upstream (${summary.ahead} ahead)`
+              }
+              className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+            >
+              Push all{summary.ahead > 0 ? ` ↑${summary.ahead}` : ''}
+            </button>
+          </Explain>
+          <Explain
+            command="gh pr create"
+            plain="Open a GitHub pull request for each repo using a shared title and body."
           >
-            Refresh
-          </button>
+            <button
+              onClick={() => setSheet({ kind: 'openPRsInWorkspace', workspaceId })}
+              disabled={!cli?.gh || ws.repoIds.length === 0 || hasDrift}
+              title={
+                !cli?.gh
+                  ? 'Install gh to open PRs from overgit'
+                  : hasDrift
+                    ? driftTooltip!
+                    : 'Open a GitHub PR per repo with a shared title and body'
+              }
+              className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+            >
+              Open PRs
+            </button>
+          </Explain>
+          <Explain
+            command=""
+            plain="Add or remove repos in this workset, rename it, or pick a default branch."
+          >
+            <button
+              onClick={() => setSheet({ kind: 'editWorkspace', workspaceId })}
+              className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
+            >
+              Edit
+            </button>
+          </Explain>
+          <Explain
+            command="for repo in workspace; do git fetch; done"
+            plain="Ask each remote what's new — doesn't change any branch in any repo."
+          >
+            <button
+              disabled={busy}
+              onClick={async () => {
+                setBusy(true);
+                try {
+                  await fetchWs(workspaceId);
+                } finally {
+                  setBusy(false);
+                }
+              }}
+              className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50 inline-flex items-center gap-1.5"
+            >
+              {busy ? (
+                <>
+                  <svg width="12" height="12" viewBox="0 0 24 24" className="animate-spin" aria-hidden>
+                    <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" opacity="0.25" fill="none" />
+                    <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" strokeWidth="3" fill="none" strokeLinecap="round" />
+                  </svg>
+                  <span>Fetching all…</span>
+                </>
+              ) : (
+                'Fetch all'
+              )}
+            </button>
+          </Explain>
+          <Explain
+            command="git status (per repo)"
+            plain="Re-read every repo's status and re-fetch open PRs without touching git remotes."
+          >
+            <button
+              disabled={busy}
+              onClick={() => {
+                refresh(workspaceId);
+                refreshPRs(workspaceId);
+              }}
+              className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+            >
+              Refresh
+            </button>
+          </Explain>
         </div>
       </header>
 
+      <ResumeBanner
+        workspaceId={workspaceId}
+        boundBranch={ws.preferredBranch ?? null}
+        statuses={statuses}
+      />
+
+      <LifecycleStepper
+        boundBranch={ws.preferredBranch ?? null}
+        onBoundBranchCount={
+          ws.preferredBranch
+            ? statuses.filter((s) => s.branch === ws.preferredBranch).length
+            : 0
+        }
+        summary={summary}
+        onArchive={async () => {
+          const ok = await requestConfirm({
+            title: 'Archive workset?',
+            body: `Hide "${ws.name}" from the active list. Member repos are unchanged on disk; reactivate from the sidebar to bring it back.`,
+            confirmLabel: 'Archive',
+          });
+          if (ok) void archiveWs(workspaceId);
+        }}
+      />
+
       <div className="mb-4 flex gap-1 border-b border-card">
         {(['overview', 'commit'] as const).map((v) => (
-          <button
+          <Explain
             key={v}
-            onClick={() => setView(v)}
-            className={`text-xs px-3 py-1.5 -mb-px border-b-2 ${
-              view === v
-                ? 'border-accent text-ink'
-                : 'border-transparent text-ink-muted hover:text-ink'
-            }`}
+            command={v === 'overview' ? '' : 'git status (per repo)'}
+            plain={
+              v === 'overview'
+                ? 'See workset-wide status, PRs, and recent activity at a glance.'
+                : 'Stage and commit changes across every dirty repo from one pane.'
+            }
           >
-            {v === 'overview' ? 'Overview' : `Commit${summary.dirty > 0 ? ` (${summary.dirty})` : ''}`}
-          </button>
+            <button
+              onClick={() => setView(v)}
+              className={`text-xs px-3 py-1.5 -mb-px border-b-2 ${
+                view === v
+                  ? 'border-accent text-ink'
+                  : 'border-transparent text-ink-muted hover:text-ink'
+              }`}
+            >
+              {v === 'overview' ? 'Overview' : `Commit${summary.dirty > 0 ? ` (${summary.dirty})` : ''}`}
+            </button>
+          </Explain>
         ))}
       </div>
 
@@ -1243,110 +1585,54 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
         )}
       </section>
 
-      <section className="mb-6 p-3 rounded-lg bg-card border border-card">
-        <div className="text-[10px] uppercase tracking-wide text-ink-faint mb-2">
-          Bring workspace to a branch
-        </div>
-        <div className="flex gap-2 items-center">
-          <div className="relative flex-1">
-            <input
-              value={branch}
-              onChange={(e) => {
-                setBranch(e.target.value);
-                setSuggestOpen(true);
-              }}
-              onFocus={() => setSuggestOpen(true)}
-              onBlur={() => {
-                // Defer so a click on a suggestion lands before the
-                // dropdown closes.
-                setTimeout(() => setSuggestOpen(false), 120);
-              }}
-              placeholder="branch name"
-              className="field w-full px-2 py-1.5 text-xs"
-            />
-            {suggestOpen && filteredSuggestions.length > 0 && (
-              <ul className="absolute left-0 right-0 top-full mt-1 z-20 max-h-64 overflow-y-auto rounded border border-card bg-surface-elevated shadow-lg">
-                {filteredSuggestions.map((row) => (
-                  <li key={row.branch}>
-                    <button
-                      type="button"
-                      onMouseDown={(e) => e.preventDefault()}
-                      onClick={() => {
-                        setBranch(row.branch);
-                        setSuggestOpen(false);
-                      }}
-                      className="w-full flex items-center justify-between gap-3 px-2 py-1.5 text-xs text-left hover:bg-card"
-                    >
-                      <span className="font-mono truncate">{row.branch}</span>
-                      <span className="text-[10px] text-ink-faint shrink-0">
-                        {row.repoCount}/{row.total} repos
-                      </span>
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            )}
+      {lastCheckout && lastCheckout.workspaceId === workspaceId && lastCheckout.outcomes.length > 0 && (
+        <section className="mb-6 p-3 rounded-lg bg-card border border-card">
+          <div className="text-[10px] uppercase tracking-wide text-ink-faint mb-2">
+            Last switch · {lastCheckout.branch}
           </div>
-          <label className="flex items-center gap-1 text-[11px] text-ink-muted">
-            <input
-              type="checkbox"
-              checked={createIfMissing}
-              onChange={(e) => setCreateIfMissing(e.target.checked)}
-            />
-            create if missing
-          </label>
-          <button
-            disabled={busy || !branch.trim()}
-            onClick={async () => {
-              setBusy(true);
-              try {
-                await checkout(workspaceId, branch.trim(), createIfMissing);
-                // Refresh the suggestion pool — newly fetched/created
-                // tracking refs should show up next time without
-                // requiring the user to re-open the workspace.
-                window.overgit
-                  .invoke('workspace:branchSuggestions', workspaceId)
-                  .then(setBranchPool);
-              } finally {
-                setBusy(false);
-              }
-            }}
-            className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
-          >
-            Switch all
-          </button>
-        </div>
-        {branch.trim() && (
-          <div className="mt-2 text-[11px] text-ink-faint">
-            {exactMatch
-              ? `${exactMatch.repoCount}/${exactMatch.total} repos have "${exactMatch.branch}"${
-                  exactMatch.repoCount < exactMatch.total
-                    ? ' — toggle "create if missing" to branch the rest from HEAD'
-                    : ''
-                }`
-              : `No repo in this workspace has "${branch.trim()}" yet — toggle "create if missing" to make it.`}
-          </div>
-        )}
-        {lastCheckout && lastCheckout.workspaceId === workspaceId && lastCheckout.outcomes.length > 0 && (
-          <ul className="mt-3 flex flex-col gap-1.5">
+          <ul className="flex flex-col gap-1.5">
             {lastCheckout.outcomes.map((o) => (
               <CheckoutOutcomeRow
                 key={o.repoId}
                 outcome={o}
                 repoName={reposById.get(o.repoId)?.name ?? o.repoId}
+                workspaceId={workspaceId}
+                branch={lastCheckout.branch}
               />
             ))}
           </ul>
-        )}
-      </section>
+        </section>
+      )}
 
-      {prs.length > 0 && <PRSection prs={prs} reposById={reposById} cli={cli} />}
+      {/* PRs only show when gh is installed AND at least one repo
+          successfully returned PR data. If every entry errored (no
+          GitHub remote, gh not authenticated), we can't *determine*
+          PRs — better to hide than misleadingly say "No open PRs". */}
+      {cli?.gh && prs.some((p) => p.prs !== null) && (
+        <PRSection prs={prs} reposById={reposById} cli={cli} />
+      )}
 
       <section className="mb-6">
-        <h2 className="text-[10px] uppercase tracking-wide text-ink-faint mb-2">Status</h2>
+        <div className="mb-2 flex items-center justify-between">
+          <h2 className="text-[10px] uppercase tracking-wide text-ink-faint">Status</h2>
+          {commonBranch && (
+            <label
+              className="text-[10px] text-ink-faint flex items-center gap-1.5 cursor-pointer hover:text-ink-muted"
+              title={`Show worktrees on branches other than ${commonBranch}. Off by default — only worktrees on this workset's branch are relevant to its work.`}
+            >
+              <input
+                type="checkbox"
+                checked={showAllWorktrees}
+                onChange={(e) => setShowAllWorktrees(e.target.checked)}
+                className="accent-accent"
+              />
+              <span>Show all worktrees</span>
+            </label>
+          )}
+        </div>
         {ws.repoIds.length === 0 && (
           <div className="text-xs text-ink-faint p-3 rounded border border-card bg-card">
-            This workspace has no repos yet. Click "Edit" to add some.
+            This workset has no repos yet. Click "Edit" to add some.
           </div>
         )}
         <ul className="flex flex-col gap-1">
@@ -1359,14 +1645,19 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
                 className="flex flex-col gap-1.5 px-3 py-2 rounded border border-card bg-card"
               >
                 <div className="flex items-center gap-3">
-                  <button
-                    onClick={() => selectRepo(id)}
-                    className="min-w-0 flex-1 text-left hover:underline"
-                    title="Open repo detail"
+                  <Explain
+                    command=""
+                    plain="Open this repo's detail view — Changes, History, Files, Stash, Branches."
                   >
-                    <div className="text-sm font-medium truncate">{repo?.name ?? id}</div>
-                    <div className="text-[11px] text-ink-faint truncate font-mono">{repo?.path}</div>
-                  </button>
+                    <button
+                      onClick={() => selectRepo(id)}
+                      className="min-w-0 flex-1 text-left hover:underline"
+                      title="Open repo detail"
+                    >
+                      <div className="text-sm font-medium truncate">{repo?.name ?? id}</div>
+                      <div className="text-[11px] text-ink-faint truncate font-mono">{repo?.path}</div>
+                    </button>
+                  </Explain>
                   <StatusCell status={st} />
                   <SyncToCommonBranchButton
                     repoId={id}
@@ -1375,7 +1666,12 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
                     commonBranch={commonBranch}
                   />
                 </div>
-                <WorktreeList repoId={id} mainPath={repo?.path} />
+                <WorktreeList
+                  repoId={id}
+                  mainPath={repo?.path}
+                  commonBranch={commonBranch}
+                  showAll={showAllWorktrees}
+                />
               </li>
             );
           })}
@@ -1568,7 +1864,7 @@ function WorkspaceUnifiedCommit({
   if (dirtyOnBranch.length === 0 && dirtyDetached.length === 0) {
     return (
       <div className="text-xs text-ink-faint p-4 rounded border border-card bg-card">
-        Every repo in this workspace is clean — nothing to commit.
+        Every repo in this workset is clean — nothing to commit.
       </div>
     );
   }
@@ -1827,21 +2123,223 @@ function OverviewTile({
   );
 }
 
+/// "Pick up where you left off" banner. Shows when entering a workset
+/// whose bound branch differs from where its members currently are. One
+/// click runs `workspace:checkoutBranch` across all members; per-repo
+/// outcomes (dirty / missing-branch / etc) surface in the existing
+/// `lastCheckout` table below the overview, where the user can stash &
+/// retry, commit & retry, or skip.
+function ResumeBanner({
+  workspaceId,
+  boundBranch,
+  statuses,
+}: {
+  workspaceId: UUID;
+  boundBranch: string | null;
+  statuses: RepoStatus[];
+}): JSX.Element | null {
+  const checkout = useStore((s) => s.checkoutWorkspaceBranch);
+  const [busy, setBusy] = useState(false);
+  if (!boundBranch || statuses.length === 0) return null;
+  const drifters = statuses.filter((s) => s.branch !== boundBranch);
+  if (drifters.length === 0) return null;
+  const all = drifters.length === statuses.length;
+  const summary = all
+    ? `All ${statuses.length} ${statuses.length === 1 ? 'repo is' : 'repos are'} on a different branch.`
+    : `${drifters.length} of ${statuses.length} repos drifted off this branch.`;
+  return (
+    <section className="mb-3 px-3 py-2.5 rounded-lg border border-amber-500/30 bg-amber-500/5 flex items-center gap-3">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden className="shrink-0 text-amber-400">
+        <path
+          d="M8 1.5l6.5 11.25H1.5L8 1.5z"
+          stroke="currentColor"
+          strokeWidth="1.3"
+          strokeLinejoin="round"
+        />
+        <path d="M8 6v3.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+        <circle cx="8" cy="11.5" r="0.6" fill="currentColor" />
+      </svg>
+      <div className="min-w-0 flex-1">
+        <div className="text-xs font-medium text-ink">Pick up where you left off</div>
+        <div className="text-[11px] text-ink-faint truncate">
+          {summary} Resume to checkout{' '}
+          <span className="font-mono text-ink-muted">{boundBranch}</span> across them.
+        </div>
+      </div>
+      <button
+        disabled={busy}
+        onClick={async () => {
+          setBusy(true);
+          try {
+            await checkout(workspaceId, boundBranch, false);
+          } finally {
+            setBusy(false);
+          }
+        }}
+        className="shrink-0 text-xs px-3 py-1.5 rounded bg-amber-500/90 text-white hover:bg-amber-500 disabled:opacity-50 inline-flex items-center gap-1.5"
+        title={`Checkout ${boundBranch} across the ${drifters.length} drifted ${drifters.length === 1 ? 'repo' : 'repos'}. Dirty repos surface inline so you can stash, commit, or skip per-repo.`}
+      >
+        {busy && (
+          <svg width="11" height="11" viewBox="0 0 24 24" className="animate-spin" aria-hidden>
+            <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" opacity="0.25" fill="none" />
+            <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" strokeWidth="3" fill="none" strokeLinecap="round" />
+          </svg>
+        )}
+        <span>{busy ? 'Resuming…' : 'Resume'}</span>
+      </button>
+    </section>
+  );
+}
+
+/// Workset lifecycle stepper. Reads cleanly left-to-right as the four
+/// states a workset moves through: Branch (every member on the bound
+/// branch) → Commit (all working trees clean) → Push (all pushed to
+/// upstream) → Archive (work shipped, hide from active list).
+///
+/// Each step is "met" when its predecessor is met AND its own condition
+/// holds. That ordering means the stepper reads as a progress bar rather
+/// than four independent green-lights, which matches the actual workflow.
+///
+/// Branch step is strict: it requires `boundBranch` to be set AND every
+/// loaded member to be on it. A single drifter is what surfaces here — by
+/// design, since the per-row Sync button is the recovery affordance.
+function LifecycleStepper({
+  boundBranch,
+  onBoundBranchCount,
+  summary,
+  onArchive,
+}: {
+  boundBranch: string | null;
+  onBoundBranchCount: number;
+  summary: { dirty: number; ahead: number; loaded: number };
+  onArchive: () => void;
+}): JSX.Element {
+  const branchMet =
+    boundBranch !== null &&
+    summary.loaded > 0 &&
+    onBoundBranchCount === summary.loaded;
+  const commitMet = branchMet && summary.dirty === 0;
+  const pushMet = commitMet && summary.ahead === 0;
+  const canArchive = pushMet;
+
+  const branchHint = !boundBranch
+    ? 'No branch bound — Edit to set'
+    : summary.loaded === 0
+      ? boundBranch
+      : onBoundBranchCount === summary.loaded
+        ? boundBranch
+        : `${onBoundBranchCount}/${summary.loaded} on ${boundBranch}`;
+  const commitHint = !branchMet
+    ? 'Branch first'
+    : summary.dirty > 0
+      ? `${summary.dirty} dirty`
+      : 'all clean';
+  const pushHint = !commitMet
+    ? 'Commit first'
+    : summary.ahead > 0
+      ? `${summary.ahead} ahead`
+      : 'all pushed';
+
+  return (
+    <section className="mb-4 px-3 py-2.5 rounded-lg border border-card bg-card/40 flex items-center gap-3">
+      <Step label="Branch" met={branchMet} hint={branchHint} />
+      <StepConnector met={commitMet} />
+      <Step label="Commit" met={commitMet} hint={commitHint} />
+      <StepConnector met={pushMet} />
+      <Step label="Push" met={pushMet} hint={pushHint} />
+      <StepConnector met={canArchive} />
+      <button
+        onClick={onArchive}
+        disabled={!canArchive}
+        title={
+          canArchive
+            ? 'Archive — hide this workset from the active list (reversible)'
+            : 'Branch, commit, and push everywhere before archiving'
+        }
+        className={`text-xs px-3 py-1.5 rounded font-medium ${
+          canArchive
+            ? 'bg-emerald-600 text-white hover:bg-emerald-500'
+            : 'bg-card text-ink-faint cursor-not-allowed'
+        }`}
+      >
+        Archive
+      </button>
+    </section>
+  );
+}
+
+function Step({
+  label,
+  met,
+  hint,
+}: {
+  label: string;
+  met: boolean;
+  hint: string;
+}): JSX.Element {
+  return (
+    <div className="flex items-center gap-2 min-w-0">
+      <span
+        className={`flex items-center justify-center w-5 h-5 rounded-full text-[10px] font-bold ${
+          met
+            ? 'bg-emerald-600 text-white'
+            : 'bg-card border border-card text-ink-faint'
+        }`}
+      >
+        {met ? '✓' : '·'}
+      </span>
+      <div className="flex flex-col min-w-0">
+        <span className={`text-xs font-medium ${met ? 'text-ink' : 'text-ink-muted'}`}>
+          {label}
+        </span>
+        <span className="text-[10px] text-ink-faint truncate" title={hint}>
+          {hint}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function StepConnector({ met }: { met: boolean }): JSX.Element {
+  return (
+    <span
+      className={`flex-1 h-px ${met ? 'bg-emerald-600/60' : 'bg-card'}`}
+      aria-hidden
+    />
+  );
+}
+
 function CheckoutOutcomeRow({
   outcome,
   repoName,
+  workspaceId,
+  branch,
 }: {
   outcome: CheckoutOutcome;
   repoName: string;
+  /// Optional context: when present, a `missing-branch` row gets a
+  /// "Create from default" action that runs the sync-and-branch flow
+  /// (fetch → switch default → pull → create branch) for just this repo.
+  workspaceId?: UUID;
+  branch?: string;
 }): JSX.Element {
   const stash = useStore((s) => s.stashRepo);
   const commitAll = useStore((s) => s.commitAllRepo);
   const retry = useStore((s) => s.retryCheckoutRepo);
   const pushToast = useStore((s) => s.pushToast);
+  const refreshWs = useStore((s) => s.refreshWorkspaceStatus);
 
   const [showCommit, setShowCommit] = useState(false);
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
+  // Local override so that after a successful "Create from default" the
+  // row updates in place — the lastCheckout entry stored in the renderer
+  // is frozen, so we can't mutate it from here without restructuring
+  // the whole shape. Local state is the cheapest way to reflect the
+  // new state for just this row.
+  const [createdResult, setCreatedResult] = useState<
+    { kind: 'idle' } | { kind: 'creating' } | { kind: 'done'; ok: boolean; label: string; message?: string }
+  >({ kind: 'idle' });
 
   const onStash = async () => {
     setBusy(true);
@@ -1874,15 +2372,57 @@ function CheckoutOutcomeRow({
     }
   };
 
+  const onCreate = async () => {
+    if (!branch) return;
+    setCreatedResult({ kind: 'creating' });
+    const res = await window.overgit.invoke('workspace:syncMemberToBranch', {
+      repoId: outcome.repoId,
+      branch,
+    });
+    if ('result' in res && res.result === 'created') {
+      setCreatedResult({
+        kind: 'done',
+        ok: true,
+        label: 'created',
+        message: 'message' in res ? res.message : undefined,
+      });
+      if (workspaceId) await refreshWs(workspaceId);
+    } else {
+      setCreatedResult({
+        kind: 'done',
+        ok: false,
+        label: res.result,
+        message: 'message' in res ? res.message : undefined,
+      });
+    }
+  };
+
   return (
     <li className="text-[11px] flex flex-col gap-1">
       <div className="flex gap-2 items-center">
         <span className="text-ink-faint w-40 truncate">{repoName}</span>
-        <CheckoutBadge outcome={outcome} />
-        {outcome.message && (
+        {createdResult.kind === 'idle' && <CheckoutBadge outcome={outcome} />}
+        {createdResult.kind === 'creating' && (
+          <span className="text-ink-faint font-mono inline-flex items-center gap-1.5">
+            <svg width="10" height="10" viewBox="0 0 24 24" className="animate-spin" aria-hidden>
+              <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" opacity="0.25" fill="none" />
+              <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" strokeWidth="3" fill="none" strokeLinecap="round" />
+            </svg>
+            creating…
+          </span>
+        )}
+        {createdResult.kind === 'done' && (
+          <span className={`font-mono ${createdResult.ok ? 'text-emerald-400' : 'text-red-400'}`}>
+            {createdResult.label}
+          </span>
+        )}
+        {createdResult.kind === 'idle' && outcome.message && (
           <span className="text-ink-faint truncate flex-1">— {outcome.message}</span>
         )}
-        {outcome.result === 'dirty' && !showCommit && (
+        {createdResult.kind === 'done' && createdResult.message && (
+          <span className="text-ink-faint truncate flex-1">— {createdResult.message}</span>
+        )}
+        {createdResult.kind === 'idle' && outcome.result === 'dirty' && !showCommit && (
           <div className="flex gap-1">
             <button
               disabled={busy}
@@ -1899,6 +2439,15 @@ function CheckoutOutcomeRow({
               Commit & retry
             </button>
           </div>
+        )}
+        {createdResult.kind === 'idle' && outcome.result === 'missing-branch' && branch && (
+          <button
+            onClick={onCreate}
+            title={`Fetch, switch this repo to its default branch, pull, then create ${branch} off it`}
+            className="px-2 py-0.5 rounded border border-card hover:bg-card"
+          >
+            Create from default
+          </button>
         )}
       </div>
       {outcome.result === 'dirty' && showCommit && (
@@ -1962,7 +2511,7 @@ function PRSection({
         </div>
       ) : flat.length === 0 ? (
         <div className="text-[11px] text-ink-faint p-3 rounded border border-card bg-card">
-          No open PRs in this workspace.
+          No open PRs in this workset.
         </div>
       ) : (
         <ul className="flex flex-col gap-1">
@@ -2140,22 +2689,54 @@ function formatDateRelative(iso: string): string {
 /// screen real-estate. The main worktree is omitted from the rendered
 /// list because it's already represented by the row this lives under;
 /// showing it again is redundant and confusing.
+///
+/// In a workset, by default the list filters to worktrees whose branch
+/// matches the workset's `commonBranch` — anything else is unrelated
+/// work and just adds noise to the "what's in flight here" view. The
+/// caller flips `showAll` (a section-level toggle) when the user wants
+/// every worktree regardless of branch.
 function WorktreeList({
   repoId,
   mainPath,
+  commonBranch,
+  showAll,
 }: {
   repoId: UUID;
   mainPath: string | undefined;
+  commonBranch: string | null;
+  showAll: boolean;
 }): JSX.Element | null {
   const wts = useStore((s) => s.workspaceWorktrees[repoId] ?? EMPTY_WORKTREES);
   const siblings = useMemo(() => wts.filter((w) => !w.isMain), [wts]);
+  const visible = useMemo(() => {
+    if (showAll || !commonBranch) return siblings;
+    return siblings.filter((w) => w.branch === commonBranch);
+  }, [siblings, showAll, commonBranch]);
   if (siblings.length === 0) return null;
+  if (visible.length === 0) {
+    // The repo has worktrees, but none on the workset's branch. Tell the
+    // user the row is intentionally empty (vs. broken) so they know the
+    // toggle exists.
+    return (
+      <ul className="flex flex-col gap-0.5 pl-3 border-l border-card ml-1">
+        <li className="text-[10px] text-ink-faint italic">
+          {siblings.length} other {siblings.length === 1 ? 'worktree' : 'worktrees'} hidden — toggle "Show all" to view
+        </li>
+      </ul>
+    );
+  }
   return (
     <ul className="flex flex-col gap-0.5 pl-3 border-l border-card ml-1">
       <li className="text-[10px] uppercase tracking-wide text-ink-faint">
-        {siblings.length} additional {siblings.length === 1 ? 'worktree' : 'worktrees'}
+        {visible.length} {showAll || !commonBranch ? '' : 'matching '}
+        {visible.length === 1 ? 'worktree' : 'worktrees'}
+        {!showAll && commonBranch && visible.length < siblings.length && (
+          <span className="ml-1 normal-case tracking-normal text-ink-faint/70">
+            ({siblings.length - visible.length} hidden)
+          </span>
+        )}
       </li>
-      {siblings.map((w) => (
+      {visible.map((w) => (
         <li
           key={w.path}
           className="flex items-center gap-2 text-[11px] text-ink-faint font-mono"
@@ -2200,27 +2781,38 @@ function SyncToCommonBranchButton({
   if (currentBranch === commonBranch) return null;
   return (
     <div className="flex items-center gap-2 shrink-0">
-      <button
-        disabled={busy}
-        onClick={async () => {
-          setBusy(true);
-          setOutcome(null);
-          try {
-            const res = await window.overgit.invoke('workspace:syncMemberToBranch', {
-              repoId,
-              branch: commonBranch,
-            });
-            if ('repoId' in res) setOutcome(res);
-            await refresh(workspaceId);
-          } finally {
-            setBusy(false);
-          }
-        }}
-        title={`Fetch, sync default, pull, then check out ${commonBranch} in this repo`}
-        className="text-[10px] px-2 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
+      <Explain
+        command={`git fetch && git checkout ${commonBranch} && git pull`}
+        plain={`Fetch, switch this repo to ${commonBranch}, and pull the latest commits.`}
       >
-        {busy ? 'Syncing…' : `Sync to ${commonBranch}`}
-      </button>
+        <button
+          disabled={busy}
+          onClick={async () => {
+            setBusy(true);
+            setOutcome(null);
+            try {
+              const res = await window.overgit.invoke('workspace:syncMemberToBranch', {
+                repoId,
+                branch: commonBranch,
+              });
+              if ('repoId' in res) setOutcome(res);
+              await refresh(workspaceId);
+            } finally {
+              setBusy(false);
+            }
+          }}
+          title={`Fetch, sync default, pull, then check out ${commonBranch} in this repo`}
+          className="text-[10px] px-2 py-1 rounded border border-card hover:bg-card disabled:opacity-50 inline-flex items-center gap-1.5"
+        >
+          {busy && (
+            <svg width="10" height="10" viewBox="0 0 24 24" className="animate-spin" aria-hidden>
+              <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" opacity="0.25" fill="none" />
+              <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" strokeWidth="3" fill="none" strokeLinecap="round" />
+            </svg>
+          )}
+          <span>{busy ? 'Syncing…' : `Sync to ${commonBranch}`}</span>
+        </button>
+      </Explain>
       {outcome && outcome.result !== 'created' && (
         <span
           className="text-[10px] text-amber-400 max-w-[200px] truncate"
