@@ -45,7 +45,8 @@ export type Sheet =
   | { kind: 'fileHistory'; repoId: UUID; path: string; tab: 'history' | 'blame' }
   | { kind: 'manageRepo'; repoId: UUID; tab: 'tags' | 'remotes' | 'submodules' | 'identity' }
   | { kind: 'pullConflict'; repoId: UUID; conflicts: string[]; rawError: string }
-  | { kind: 'initRepo'; path: string; reason: string };
+  | { kind: 'initRepo'; path: string; reason: string }
+  | { kind: 'resolveConflict'; repoId: UUID; path: string };
 
 interface OpenFile {
   repoId: UUID;
@@ -105,7 +106,7 @@ interface UiState {
   repoBranches: Record<UUID, { local: string[]; remote: string[] }>;
   repoBranchSummaries: Record<UUID, BranchSummary[]>;
   repoGraph: Record<UUID, GraphCommit[]>;
-  repoFileList: Record<UUID, string[]>;
+  repoFileList: Record<UUID, Array<{ path: string; ignored: boolean }>>;
   repoStashes: Record<UUID, Stash[]>;
   cliPresence: CliPresence | null;
 
@@ -136,6 +137,10 @@ interface UiState {
   /// can show per-repo outcomes and offer Stash/Commit affordances on
   /// repos that came back dirty.
   lastCheckout: { workspaceId: UUID; branch: string; outcomes: CheckoutOutcome[] } | null;
+  /// Current contents of the bottom learning bar. Set by `<Explain>` on
+  /// hover. `null` puts the bar in its idle prompt. Single slot — only
+  /// the most recently hovered element is shown.
+  learningHint: { command: string; plain: string } | null;
 
   hydrate: () => Promise<void>;
   pickAndAddRepo: () => Promise<void>;
@@ -146,7 +151,7 @@ interface UiState {
     path: string,
     initialBranch: string,
   ) => Promise<{ ok: boolean; error?: string }>;
-  createWorkspace: (name: string, repoIds: UUID[]) => Promise<void>;
+  createWorkspace: (name: string, repoIds: UUID[], preferredBranch?: string) => Promise<void>;
   selectWorkspace: (id: UUID | null) => void;
   selectRepo: (id: UUID | null) => void;
   refreshWorkspaceStatus: (id: UUID) => Promise<void>;
@@ -195,6 +200,12 @@ interface UiState {
   /// each one. Failures on individual repos are swallowed — a single
   /// broken repo shouldn't blank out the markers for the rest.
   refreshAllRepoStatuses: () => Promise<void>;
+  /// Fan out `git fetch` for every known repo so the sidebar's
+  /// ahead/behind dots reflect the remote, not just the stale local
+  /// tracking refs. Errors are swallowed — a flaky remote or auth
+  /// prompt shouldn't surface as a toast for a background sync. Calls
+  /// `refreshAllRepoStatuses` when done so the dots actually move.
+  fetchAllReposQuiet: () => Promise<void>;
   refreshRepoBranches: (id: UUID) => Promise<void>;
   refreshRepoBranchSummaries: (id: UUID) => Promise<void>;
   refreshRepoGraph: (id: UUID) => Promise<void>;
@@ -222,8 +233,15 @@ interface UiState {
     id: UUID,
     branch: string,
     mode: 'merge' | 'ff-only' | 'squash',
-  ) => Promise<{ ok: boolean; error?: string }>;
+  ) => Promise<{ ok: boolean; error?: string; output?: string; alreadyUpToDate?: boolean }>;
   abortMerge: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
+  resolveConflictSide: (
+    id: UUID,
+    path: string,
+    side: 'ours' | 'theirs',
+  ) => Promise<{ ok: boolean; error?: string }>;
+  readMergeMsg: (id: UUID) => Promise<{ ok: boolean; message: string | null; error?: string }>;
+  commitMerge: (id: UUID, message: string | null) => Promise<{ ok: boolean; error?: string }>;
   rebaseOnto: (id: UUID, onto: string) => Promise<{ ok: boolean; error?: string }>;
   abortRebase: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
   continueRebase: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
@@ -254,6 +272,12 @@ interface UiState {
     from?: string,
   ) => Promise<{ ok: boolean; error?: string }>;
   deleteRepoBranch: (id: UUID, name: string, force: boolean) => Promise<{ ok: boolean; error?: string }>;
+  renameRepoBranch: (
+    id: UUID,
+    from: string | null,
+    to: string,
+    force: boolean,
+  ) => Promise<{ ok: boolean; error?: string }>;
   loadRepoFileDiff: (id: UUID, path: string, side: 'staged' | 'unstaged' | 'combined') => Promise<void>;
 
   openRepoFile: (repoId: UUID, path: string) => Promise<void>;
@@ -269,7 +293,16 @@ interface UiState {
 
   removeRepo: (id: UUID) => Promise<void>;
   removeWorkspace: (id: UUID) => Promise<void>;
-  updateWorkspace: (id: UUID, patch: Partial<Pick<Workspace, 'name' | 'repoIds'>>) => Promise<void>;
+  updateWorkspace: (id: UUID, patch: Partial<Pick<Workspace, 'name' | 'repoIds' | 'preferredBranch'>>) => Promise<void>;
+  /// Hide the workspace from the active sidebar list. Member repos are
+  /// untouched on disk; the working set just disappears from view until
+  /// reactivated. Deselects if it was the current workspace.
+  archiveWorkspace: (id: UUID) => Promise<void>;
+  /// Restore an archived workspace and select it (the "reopen" half of
+  /// the lifecycle).
+  unarchiveWorkspace: (id: UUID) => Promise<void>;
+
+  setLearningHint: (hint: { command: string; plain: string } | null) => void;
 
   pushToast: (toast: Omit<Toast, 'id'>) => string;
   dismissToast: (id: string) => void;
@@ -304,6 +337,7 @@ export const useStore = create<UiState>((set, get) => ({
     sidebarWidth: 288,
     historyAsideWidth: 480,
     stagingMode: 'simple',
+    explainMode: true,
   },
   selectedWorkspaceId: null,
   selectedRepoId: null,
@@ -322,6 +356,7 @@ export const useStore = create<UiState>((set, get) => ({
   repoStashes: {},
   cliPresence: null,
   lastCheckout: null,
+  learningHint: null,
   openFile: null,
   openFileContent: '',
   openFileDirty: false,
@@ -353,8 +388,9 @@ export const useStore = create<UiState>((set, get) => ({
     if (!haveSelection) {
       if (snap.repos.length > 0) {
         get().selectRepo(snap.repos[0].id);
-      } else if (snap.workspaces.length > 0) {
-        get().selectWorkspace(snap.workspaces[0].id);
+      } else {
+        const firstActive = snap.workspaces.find((w) => !w.archived);
+        if (firstActive) get().selectWorkspace(firstActive.id);
       }
     }
     // Background-refresh statuses for every repo so the sidebar can
@@ -437,8 +473,11 @@ export const useStore = create<UiState>((set, get) => ({
     return { ok: true };
   },
 
-  createWorkspace: async (name, repoIds) => {
+  createWorkspace: async (name, repoIds, preferredBranch) => {
     const ws: Workspace = { id: uuid(), name, repoIds };
+    if (preferredBranch && preferredBranch.trim()) {
+      ws.preferredBranch = preferredBranch.trim();
+    }
     const workspaces = [...get().workspaces, ws];
     set({ workspaces, selectedWorkspaceId: ws.id, selectedRepoId: null });
     await window.overgit.invoke('store:saveWorkspaces', workspaces);
@@ -671,6 +710,21 @@ export const useStore = create<UiState>((set, get) => ({
     set({ repoStatus: next });
   },
 
+  fetchAllReposQuiet: async () => {
+    const ids = get().repos.map((r) => r.id);
+    if (ids.length === 0) return;
+    // No status refresh per repo — we batch one `refreshAllRepoStatuses`
+    // at the end so we don't fire N status calls during the fan-out.
+    // `repo:fetch` already passes a network timeout so a stalled remote
+    // can't pin this forever.
+    await Promise.all(
+      ids.map((id) =>
+        window.overgit.invoke('repo:fetch', id).catch(() => undefined),
+      ),
+    );
+    await get().refreshAllRepoStatuses();
+  },
+
   refreshRepoBranches: async (id) => {
     const br = await window.overgit.invoke('repo:listBranches', id);
     set({ repoBranches: { ...get().repoBranches, [id]: br } });
@@ -830,6 +884,24 @@ export const useStore = create<UiState>((set, get) => ({
     return res;
   },
 
+  renameRepoBranch: async (id, from, to, force) => {
+    const res = await window.overgit.invoke('repo:renameBranch', {
+      repoId: id,
+      from,
+      to,
+      force,
+    });
+    if (res.ok) {
+      await Promise.all([
+        get().refreshRepoBranches(id),
+        get().refreshRepoStatus(id),
+        get().refreshRepoBranchSummaries(id),
+        get().refreshRepoGraph(id),
+      ]);
+    }
+    return res;
+  },
+
   loadRepoFileDiff: async (id, p, side) => {
     const files = await window.overgit.invoke('repo:diffFile', {
       repoId: id,
@@ -845,7 +917,7 @@ export const useStore = create<UiState>((set, get) => ({
   },
 
   refreshRepoFileList: async (id) => {
-    const files = await window.overgit.invoke('fs:listFiles', id);
+    const files = await window.overgit.invoke('fs:listRepoFiles', id);
     set({ repoFileList: { ...get().repoFileList, [id]: files } });
   },
 
@@ -928,6 +1000,41 @@ export const useStore = create<UiState>((set, get) => ({
       get().refreshRepoStatus(id),
       get().refreshRepoChanges(id),
     ]);
+    return res;
+  },
+
+  resolveConflictSide: async (id, path, side) => {
+    const res = await window.overgit.invoke('repo:resolveConflictSide', {
+      repoId: id,
+      path,
+      side,
+    });
+    if (res.ok) {
+      await Promise.all([
+        get().refreshRepoStatus(id),
+        get().refreshRepoChanges(id),
+      ]);
+    }
+    return res;
+  },
+
+  readMergeMsg: async (id) => {
+    return window.overgit.invoke('repo:readMergeMsg', id);
+  },
+
+  commitMerge: async (id, message) => {
+    const res = await window.overgit.invoke('repo:commitMerge', {
+      repoId: id,
+      message,
+    });
+    if (res.ok) {
+      await Promise.all([
+        get().refreshRepoStatus(id),
+        get().refreshRepoChanges(id),
+        get().refreshRepoLog(id),
+        get().refreshRepoGraph(id),
+      ]);
+    }
     return res;
   },
 
@@ -1160,6 +1267,27 @@ export const useStore = create<UiState>((set, get) => ({
     set({ workspaces });
     await window.overgit.invoke('store:saveWorkspaces', workspaces);
   },
+
+  archiveWorkspace: async (id) => {
+    const workspaces = get().workspaces.map((w) =>
+      w.id === id ? { ...w, archived: true } : w,
+    );
+    const patch: Partial<UiState> = { workspaces };
+    if (get().selectedWorkspaceId === id) patch.selectedWorkspaceId = null;
+    set(patch);
+    await window.overgit.invoke('store:saveWorkspaces', workspaces);
+  },
+
+  unarchiveWorkspace: async (id) => {
+    const workspaces = get().workspaces.map((w) =>
+      w.id === id ? { ...w, archived: false } : w,
+    );
+    set({ workspaces });
+    await window.overgit.invoke('store:saveWorkspaces', workspaces);
+    get().selectWorkspace(id);
+  },
+
+  setLearningHint: (hint) => set({ learningHint: hint }),
 
   pushToast: (t) => {
     const id = uuid();

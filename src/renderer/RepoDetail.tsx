@@ -2,6 +2,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useStore } from './store';
 import { FileEditor } from './FileEditor';
 import { BranchPicker } from './BranchPicker';
+import { Explain } from './Explain';
+import { sanitizeBranchName } from '@shared/branch-name';
 import type {
   ChangedFile,
   Commit,
@@ -32,6 +34,37 @@ function joinRepoPath(repoRoot: string, relPath: string): string {
 }
 
 type Tab = 'changes' | 'history' | 'files' | 'stash' | 'branches';
+
+/// Plain-English mapping for the per-file row action buttons in
+/// FileGroup. Centralized here because the FileGroup is generic over
+/// the action label — Stage / Unstage / Discard all flow through the
+/// same prop. The path goes into the command so the Learning bar
+/// echoes exactly what would be run.
+function explainForRowAction(
+  label: string,
+  path: string,
+): { command: string; plain: string } {
+  switch (label) {
+    case 'Stage':
+      return {
+        command: `git add ${path}`,
+        plain: 'Mark this file to be included in the next commit.',
+      };
+    case 'Unstage':
+      return {
+        command: `git reset HEAD ${path}`,
+        plain: 'Pull this file out of the staging area — your edits stay.',
+      };
+    case 'Discard':
+      return {
+        command: `git restore ${path}`,
+        plain: 'Throw away your unsaved edits to this file. Cannot be undone.',
+      };
+    default:
+      return { command: '', plain: label };
+  }
+}
+
 
 /// Detail view for a single repo. Two tabs:
 /// - Changes: stage / unstage / discard / commit (the standard daily flow)
@@ -99,7 +132,11 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
   const pushRepo = useStore((s) => s.pushRepo);
   const pushToast = useStore((s) => s.pushToast);
 
-  const [busy, setBusy] = useState(false);
+  // Track *which* network op is in flight so we can label the active
+  // button ("Pulling…") and disable just-the-others. `null` = idle.
+  type Pending = 'fetch' | 'pull' | 'push' | null;
+  const [pending, setPending] = useState<Pending>(null);
+  const busy = pending !== null;
   const [pickerOpen, setPickerOpen] = useState(false);
   /// When set, the picker mounts directly into "create branch" mode.
   /// Reset when the picker closes so the next Cmd+B opens to the list.
@@ -137,11 +174,11 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
   useEffect(() => {
     const onFetch = () => {
       if (busy) return;
-      void onAction(() => fetchRepo(repoId))();
+      void onAction('fetch', () => fetchRepo(repoId))();
     };
     const onPush = () => {
       if (busy || !status?.branch) return;
-      void onAction(() => pushRepo(repoId))();
+      void onAction('push', () => pushRepo(repoId))();
     };
     window.addEventListener('overgit:repoFetch', onFetch);
     window.addEventListener('overgit:repoPush', onPush);
@@ -157,13 +194,16 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
 
   const setSheet = useStore((s) => s.setSheet);
 
-  const onAction = (fn: () => Promise<{ ok: boolean; error?: string }>) => async () => {
-    setBusy(true);
+  const onAction = (
+    name: Exclude<Pending, null>,
+    fn: () => Promise<{ ok: boolean; error?: string }>,
+  ) => async () => {
+    setPending(name);
     try {
       const res = await fn();
       if (!res.ok) pushToast({ kind: 'error', message: res.error ?? 'Action failed' });
     } finally {
-      setBusy(false);
+      setPending(null);
     }
   };
 
@@ -172,7 +212,7 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
   /// conflicts. Route those into the PullConflictSheet so the user has
   /// real recovery options instead of just an alert.
   const onPull = async () => {
-    setBusy(true);
+    setPending('pull');
     try {
       const res = await pullRepo(repoId);
       if (res.ok) return;
@@ -187,64 +227,128 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
       }
       pushToast({ kind: 'error', message: res.error ?? 'Pull failed' });
     } finally {
-      setBusy(false);
+      setPending(null);
     }
   };
 
   const branchLabel = status?.branch ?? '(detached)';
 
   return (
-    <header className="px-6 py-3 border-b border-card flex items-center gap-4">
+    <header className="px-6 py-3 border-b border-card flex items-center gap-4 relative">
+      {/* Indeterminate progress bar — sits at the very top of the header
+          while a network op is in flight. Network ops can take 5–15s
+          and the disabled-button alone wasn't strong enough feedback. */}
+      {busy && (
+        <div
+          className="absolute left-0 right-0 top-0 h-0.5 overflow-hidden bg-accent/15"
+          aria-hidden
+        >
+          <div className="h-full w-1/3 bg-accent animate-progress-slide" />
+        </div>
+      )}
       <div className="min-w-0">
         <div className="text-sm font-semibold truncate">{repo.name}</div>
         <div className="text-[11px] text-ink-faint truncate font-mono">{repo.path}</div>
       </div>
 
       <div className="flex items-center gap-2 ml-auto">
-        <button
-          ref={triggerRef}
-          disabled={busy}
-          onClick={() => setPickerOpen((v) => !v)}
-          className={`text-xs px-2.5 py-1 rounded border flex items-center gap-1.5 disabled:opacity-50 ${
-            pickerOpen ? 'border-accent bg-accent/10' : 'border-card hover:bg-card'
-          }`}
-          title="Switch branch, create one, or cherry-pick"
+        <Explain
+          command={`git checkout ${status?.branch ?? '<branch>'}`}
+          plain="Open the branch menu — switch HEAD, create a new branch, or cherry-pick."
         >
-          <BranchGlyph />
-          <span className="font-mono truncate max-w-[180px]">{branchLabel}</span>
-          <span className="text-[9px] text-ink-faint">▾</span>
-        </button>
+          <button
+            ref={triggerRef}
+            disabled={busy}
+            onClick={() => setPickerOpen((v) => !v)}
+            className={`text-xs px-2.5 py-1 rounded border flex items-center gap-1.5 disabled:opacity-50 ${
+              pickerOpen ? 'border-accent bg-accent/10' : 'border-card hover:bg-card'
+            }`}
+            title="Switch branch, create one, or cherry-pick"
+          >
+            <BranchGlyph />
+            <span className="font-mono">{branchLabel}</span>
+            <span className="text-[9px] text-ink-faint">▾</span>
+          </button>
+        </Explain>
 
         {status && <WorktreeDeltaPill status={status} />}
         {status && <TrunkDistancePill status={status} />}
 
         <div className="w-px h-5 bg-card mx-1" />
 
-        <button
-          disabled={busy}
-          onClick={onAction(() => fetchRepo(repoId))}
-          title="Fetch (⌘F)"
-          className="text-xs px-2.5 py-1 rounded border border-card hover:bg-card disabled:opacity-50 flex items-center gap-1.5"
+        <Explain
+          command="git fetch"
+          plain="Ask the remote what's new — doesn't change your branch."
         >
-          <span>Fetch</span>
-          <kbd className="text-[11px] text-ink-faint font-mono">⌘F</kbd>
-        </button>
-        <button
-          disabled={busy || !status?.branch}
-          onClick={onPull}
-          className="text-xs px-2.5 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
+          <button
+            disabled={busy}
+            onClick={onAction('fetch', () => fetchRepo(repoId))}
+            title="Fetch (⌘F)"
+            className="text-xs px-2.5 py-1 rounded border border-card hover:bg-card disabled:opacity-50 flex items-center gap-1.5"
+          >
+            {pending === 'fetch' ? (
+              <>
+                <Spinner />
+                <span>Fetching…</span>
+              </>
+            ) : (
+              <>
+                <span>Fetch</span>
+                <kbd className="text-[11px] text-ink-faint font-mono">⌘F</kbd>
+              </>
+            )}
+          </button>
+        </Explain>
+        <Explain
+          command="git pull"
+          plain="Bring remote commits down into your current branch."
         >
-          Pull{status?.behind ? ` ↓${status.behind}` : ''}
-        </button>
-        <button
-          disabled={busy || !status?.branch}
-          onClick={onAction(() => pushRepo(repoId))}
-          title="Push (⌘P)"
-          className="text-xs px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50 flex items-center gap-1.5"
+          <button
+            disabled={busy || !status?.branch}
+            onClick={onPull}
+            title={status?.behind ? `${status.behind} commit${status.behind === 1 ? '' : 's'} to pull` : 'Pull'}
+            // Solid amber when there's something to pull, otherwise the
+            // muted ghost style. Mirrors how Push stands out when you have
+            // outgoing commits — but distinct color so the two don't blur.
+            className={
+              status?.behind
+                ? 'text-xs px-2.5 py-1 rounded bg-amber-500 text-white hover:bg-amber-600 disabled:opacity-50 flex items-center gap-1.5 shadow-[0_0_0_1px_rgba(245,158,11,0.4)]'
+                : 'text-xs px-2.5 py-1 rounded border border-card hover:bg-card disabled:opacity-50 flex items-center gap-1.5'
+            }
+          >
+            {pending === 'pull' ? (
+              <>
+                <Spinner />
+                <span>Pulling…</span>
+              </>
+            ) : (
+              <span>Pull{status?.behind ? ` ↓${status.behind}` : ''}</span>
+            )}
+          </button>
+        </Explain>
+        <Explain
+          command={`git push${status?.branch ? ` origin ${status.branch}` : ''}`}
+          plain="Send your local commits up to the remote."
         >
-          <span>Push{status?.ahead ? ` ↑${status.ahead}` : ''}</span>
-          <kbd className="text-[11px] text-white/85 font-mono">⌘P</kbd>
-        </button>
+          <button
+            disabled={busy || !status?.branch}
+            onClick={onAction('push', () => pushRepo(repoId))}
+            title="Push (⌘P)"
+            className="text-xs px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50 flex items-center gap-1.5"
+          >
+            {pending === 'push' ? (
+              <>
+                <Spinner />
+                <span>Pushing…</span>
+              </>
+            ) : (
+              <>
+                <span>Push{status?.ahead ? ` ↑${status.ahead}` : ''}</span>
+                <kbd className="text-[11px] text-white/85 font-mono">⌘P</kbd>
+              </>
+            )}
+          </button>
+        </Explain>
         <RepoExtrasBadges repoId={repoId} />
         <button
           onClick={() => setSheet({ kind: 'manageRepo', repoId, tab: 'tags' })}
@@ -448,20 +552,43 @@ function Tabs({ tab, onChange }: { tab: Tab; onChange: (t: Tab) => void }): JSX.
     stash: 'Stash',
     branches: 'Branches',
   };
+  const tabExplain: Record<Tab, { command: string; plain: string }> = {
+    changes: {
+      command: 'git status',
+      plain: 'See files you have edited or added that are not yet committed.',
+    },
+    history: {
+      command: 'git log --graph',
+      plain: 'Walk the commits on this branch and what each one changed.',
+    },
+    files: {
+      command: 'git ls-files',
+      plain: 'Browse every tracked file in the working tree.',
+    },
+    stash: {
+      command: 'git stash list',
+      plain: 'See snapshots of work you set aside without committing.',
+    },
+    branches: {
+      command: 'git branch -a',
+      plain: 'List every branch — local and remote — in this repo.',
+    },
+  };
   return (
     <nav className="px-6 border-b border-card flex gap-2">
       {(['changes', 'history', 'files', 'stash', 'branches'] as const).map((t) => (
-        <button
-          key={t}
-          onClick={() => onChange(t)}
-          className={`px-3 py-2 text-xs border-b-2 -mb-px ${
-            tab === t
-              ? 'border-accent text-ink'
-              : 'border-transparent text-ink-muted hover:text-ink'
-          }`}
-        >
-          {labels[t]}
-        </button>
+        <Explain key={t} command={tabExplain[t].command} plain={tabExplain[t].plain}>
+          <button
+            onClick={() => onChange(t)}
+            className={`px-3 py-2 text-xs border-b-2 -mb-px ${
+              tab === t
+                ? 'border-accent text-ink'
+                : 'border-transparent text-ink-muted hover:text-ink'
+            }`}
+          >
+            {labels[t]}
+          </button>
+        </Explain>
       ))}
     </nav>
   );
@@ -663,6 +790,31 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [amendMode]);
 
+  // When a merge is in progress and the user hasn't started typing,
+  // prefill the message box with `.git/MERGE_MSG` — git's auto-generated
+  // "Merge branch 'X' into Y" plus any conflict summary. Strip comment
+  // lines (the "# Conflicts:" footer) so the user sees a clean default
+  // they can ship as-is.
+  const readMergeMsgAction = useStore((s) => s.readMergeMsg);
+  useEffect(() => {
+    if (repoStatus?.inProgress !== 'merge') return;
+    if (message.trim()) return;
+    let cancelled = false;
+    void readMergeMsgAction(repoId).then((res) => {
+      if (cancelled || !res.ok || !res.message) return;
+      const cleaned = res.message
+        .split('\n')
+        .filter((l) => !l.startsWith('#'))
+        .join('\n')
+        .trim();
+      if (cleaned) setMessage(cleaned);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repoStatus?.inProgress, repoId]);
+
   const staged = ch?.staged ?? [];
   const unstaged = ch?.unstaged ?? [];
   const anyLlm = !!(cli?.claude || cli?.codex || cli?.gemini);
@@ -813,22 +965,32 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
         <div className="flex items-center gap-1 px-3 py-2 border-b border-card flex-wrap">
           {stagingMode === 'advanced' ? (
             <>
-              <button
-                disabled={unstaged.length === 0}
-                onClick={() => stage(repoId, unstaged.map((f) => f.path))}
-                className="text-xs px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
-                title="Stage every changed file"
+              <Explain
+                command="git add -A"
+                plain="Move every change into the staging area, ready to be committed."
               >
-                Stage all{unstaged.length ? ` (${unstaged.length})` : ''}
-              </button>
-              <button
-                disabled={staged.length === 0}
-                onClick={() => unstage(repoId, staged.map((f) => f.path))}
-                className="text-xs px-2.5 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
-                title="Unstage every staged file"
+                <button
+                  disabled={unstaged.length === 0}
+                  onClick={() => stage(repoId, unstaged.map((f) => f.path))}
+                  className="text-xs px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+                  title="Stage every changed file"
+                >
+                  Stage all{unstaged.length ? ` (${unstaged.length})` : ''}
+                </button>
+              </Explain>
+              <Explain
+                command="git reset HEAD"
+                plain="Pull every staged change back out of the staging area — your edits stay."
               >
-                Unstage all{staged.length ? ` (${staged.length})` : ''}
-              </button>
+                <button
+                  disabled={staged.length === 0}
+                  onClick={() => unstage(repoId, staged.map((f) => f.path))}
+                  className="text-xs px-2.5 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
+                  title="Unstage every staged file"
+                >
+                  Unstage all{staged.length ? ` (${staged.length})` : ''}
+                </button>
+              </Explain>
             </>
           ) : null}
           <div className="flex-1" />
@@ -1046,6 +1208,14 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
             </label>
           )}
 
+          <Explain
+            command={amendMode ? 'git commit --amend' : 'git commit -m "…"'}
+            plain={
+              amendMode
+                ? 'Rewrite the previous commit. Only safe before you have pushed it.'
+                : 'Save the staged changes as a new commit on this branch.'
+            }
+          >
           <button
             disabled={
               busy ||
@@ -1091,6 +1261,7 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
             </span>
             <kbd className="text-[13px] text-white/85 font-mono">⌘↩</kbd>
           </button>
+          </Explain>
         </div>
       </aside>
 
@@ -1399,7 +1570,12 @@ function ConflictBanner({
   const abortCherryPick = useStore((s) => s.abortCherryPick);
   const continueCherryPick = useStore((s) => s.continueCherryPick);
   const markResolved = useStore((s) => s.markResolved);
+  const resolveSide = useStore((s) => s.resolveConflictSide);
+  const commitMerge = useStore((s) => s.commitMerge);
+  const readMergeMsg = useStore((s) => s.readMergeMsg);
   const openRepoFile = useStore((s) => s.openRepoFile);
+  const setSheet = useStore((s) => s.setSheet);
+  const pushToast = useStore((s) => s.pushToast);
   const requestConfirm = useStore((s) => s.requestConfirm);
   const refreshStatus = useStore((s) => s.refreshRepoStatus);
   const refreshChanges = useStore((s) => s.refreshRepoChanges);
@@ -1439,18 +1615,33 @@ function ConflictBanner({
     setBusy(true);
     setError(null);
     try {
-      // Merge has no `--continue`: once conflicts are resolved, the
-      // user makes a regular commit which finalizes the merge. We
-      // surface that by linking to the commit form.
+      // Merge: there's no `git merge --continue` per se, but once every
+      // conflicted file is staged we can finalize via `git commit`. The
+      // commitMerge action uses MERGE_MSG (git's auto-generated "Merge
+      // branch 'X'…") so the user doesn't have to retype anything.
       if (op === 'merge') {
-        setError(
-          'Merge: stage the resolved files (or use "Mark all resolved"), then commit from the message box below to finalize.',
-        );
+        const res = await commitMerge(repoId, null);
+        if (!res.ok) {
+          setError(res.error ?? 'Commit merge failed');
+        } else {
+          pushToast({ kind: 'success', message: 'Merge committed.' });
+        }
         return;
       }
       const fn = op === 'rebase' ? continueRebase : continueCherryPick;
       const res = await fn(repoId);
       if (!res.ok) setError(res.error ?? 'Continue failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onTakeSide = async (path: string, side: 'ours' | 'theirs') => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await resolveSide(repoId, path, side);
+      if (!res.ok) setError(res.error ?? `Take ${side} failed`);
     } finally {
       setBusy(false);
     }
@@ -1508,7 +1699,15 @@ function ConflictBanner({
           </div>
           {!allResolved && (
             <div className="text-[11px] text-ink-muted mt-0.5">
-              Open each file in your editor, fix the {'<<<<<<<'} / {'>>>>>>>'} markers, then mark resolved.
+              Click <span className="text-ink">Resolve</span> to pick hunks side-by-side, or use{' '}
+              <span className="text-ink">Ours</span> / <span className="text-ink">Theirs</span> to
+              take one side wholesale.
+            </div>
+          )}
+          {allResolved && op === 'merge' && (
+            <div className="text-[11px] text-ink-muted mt-0.5">
+              Click <span className="text-ink">Commit merge</span> to finalize — git's default
+              message is used (you can edit it after if you want).
             </div>
           )}
         </div>
@@ -1530,6 +1729,16 @@ function ConflictBanner({
               className="text-[11px] h-7 px-2.5 rounded bg-accent text-white hover:bg-accent-strong border border-accent disabled:opacity-50"
             >
               Continue
+            </button>
+          )}
+          {allResolved && op === 'merge' && (
+            <button
+              disabled={busy}
+              onClick={onContinue}
+              className="text-[11px] h-7 px-2.5 rounded bg-accent text-white hover:bg-accent-strong border border-accent disabled:opacity-50"
+              title="Run `git commit --no-edit` to finalize the merge with git's auto-generated message"
+            >
+              Commit merge
             </button>
           )}
           <button
@@ -1563,19 +1772,43 @@ function ConflictBanner({
                 {p}
               </span>
               <button
+                disabled={busy}
+                onClick={() => setSheet({ kind: 'resolveConflict', repoId, path: p })}
+                className="text-[10px] uppercase tracking-wide text-accent hover:text-ink px-1.5 disabled:opacity-50"
+                title="Open the 3-way picker — choose theirs/ours/both per hunk, or edit inline"
+              >
+                Resolve
+              </button>
+              <button
+                disabled={busy}
+                onClick={() => onTakeSide(p, 'ours')}
+                className="text-[10px] uppercase tracking-wide text-emerald-300 hover:text-ink px-1.5 disabled:opacity-50"
+                title="git checkout --ours — keep this branch's version"
+              >
+                Ours
+              </button>
+              <button
+                disabled={busy}
+                onClick={() => onTakeSide(p, 'theirs')}
+                className="text-[10px] uppercase tracking-wide text-sky-300 hover:text-ink px-1.5 disabled:opacity-50"
+                title="git checkout --theirs — take the merging branch's version"
+              >
+                Theirs
+              </button>
+              <button
                 onClick={() => onOpen(p)}
                 className="text-[10px] uppercase tracking-wide text-ink-faint hover:text-ink px-1.5"
-                title="Open in editor — fix the <<<<<<< / >>>>>>> markers"
+                title="Open in editor — fix the <<<<<<< / >>>>>>> markers manually"
               >
-                Open
+                Edit
               </button>
               <button
                 disabled={busy}
                 onClick={() => onMarkOne(p)}
-                className="text-[10px] uppercase tracking-wide text-amber-300 hover:text-emerald-300 px-1.5"
-                title="git add this path"
+                className="text-[10px] uppercase tracking-wide text-amber-300 hover:text-emerald-300 px-1.5 disabled:opacity-50"
+                title="git add this path — use after editing the file manually"
               >
-                Resolve
+                Mark
               </button>
             </li>
           ))}
@@ -1808,28 +2041,32 @@ function FileGroup({
                       View
                     </button>
                   )}
-                  <button
-                    onClick={() => onAction(f)}
-                    className={`text-[11px] px-1.5 py-0.5 rounded ${
-                      active
-                        ? 'hover:bg-accent-strong text-white'
-                        : 'text-ink-muted hover:bg-surface-elevated hover:text-ink'
-                    }`}
-                  >
-                    {actionLabel}
-                  </button>
-                  {extraAction && (
+                  <Explain {...explainForRowAction(actionLabel, f.path)}>
                     <button
-                      onClick={() => extraAction.onAction(f)}
+                      onClick={() => onAction(f)}
                       className={`text-[11px] px-1.5 py-0.5 rounded ${
                         active
                           ? 'hover:bg-accent-strong text-white'
-                          : 'text-ink-muted hover:bg-surface-elevated hover:text-red-300'
+                          : 'text-ink-muted hover:bg-surface-elevated hover:text-ink'
                       }`}
-                      title={extraAction.label}
                     >
-                      {extraAction.label}
+                      {actionLabel}
                     </button>
+                  </Explain>
+                  {extraAction && (
+                    <Explain {...explainForRowAction(extraAction.label, f.path)}>
+                      <button
+                        onClick={() => extraAction.onAction(f)}
+                        className={`text-[11px] px-1.5 py-0.5 rounded ${
+                          active
+                            ? 'hover:bg-accent-strong text-white'
+                            : 'text-ink-muted hover:bg-surface-elevated hover:text-red-300'
+                        }`}
+                        title={extraAction.label}
+                      >
+                        {extraAction.label}
+                      </button>
+                    </Explain>
                   )}
                 </div>
               </li>
@@ -2100,7 +2337,7 @@ function StashTab({ repoId }: { repoId: UUID }): JSX.Element {
             {stashes == null
               ? 'Loading…'
               : stashes.length === 0
-                ? 'No stashes — `git stash push` from your terminal or use Stash & retry on a workspace checkout.'
+                ? 'No stashes — `git stash push` from your terminal or use Stash & retry on a workset checkout.'
                 : `${stashes.length} ${stashes.length === 1 ? 'entry' : 'entries'}`}
           </p>
         </div>
@@ -2312,15 +2549,21 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
   const wts = useStore((s) => s.workspaceWorktrees[repoId]);
   const repoPath = useStore((s) => s.repos.find((r) => r.id === repoId)?.path);
   const branches = useStore((s) => s.repoBranchSummaries[repoId]);
+  const status = useStore((s) => s.repoStatus[repoId]);
   const refreshWorktrees = useStore((s) => s.refreshRepoWorktrees);
   const refreshBranches = useStore((s) => s.refreshRepoBranchSummaries);
   const checkoutRepo = useStore((s) => s.checkoutRepo);
+  const mergeBranchAction = useStore((s) => s.mergeBranch);
+  const rebaseOntoAction = useStore((s) => s.rebaseOnto);
+  const renameBranchAction = useStore((s) => s.renameRepoBranch);
   const pruneWorktrees = useStore((s) => s.pruneWorktrees);
   const pushToast = useStore((s) => s.pushToast);
   const requestConfirm = useStore((s) => s.requestConfirm);
   const [busy, setBusy] = useState(false);
   const [pruning, setPruning] = useState(false);
   const [switching, setSwitching] = useState<string | null>(null);
+  const [acting, setActing] = useState<string | null>(null);
+  const [renaming, setRenaming] = useState<string | null>(null);
   const [filter, setFilter] = useState('');
 
   useEffect(() => {
@@ -2387,6 +2630,95 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
       }
     } finally {
       setSwitching(null);
+    }
+  };
+
+  const dismissToast = useStore((s) => s.dismissToast);
+  const onMergeIntoCurrent = async (b: { shortName: string; upstream: string | null }) => {
+    if (!status?.branch) {
+      pushToast({ kind: 'error', message: 'No current branch — detached HEAD.' });
+      return;
+    }
+    // Prefer the upstream tracking ref when present so merging "master"
+    // actually pulls in `origin/master` (what the trunk-distance pill is
+    // comparing against) rather than the user's stale local master.
+    const target = b.upstream ?? b.shortName;
+    const targetLabel =
+      b.upstream && b.upstream !== b.shortName
+        ? `${b.shortName} (via ${b.upstream})`
+        : target;
+    const ok = await requestConfirm({
+      title: `Merge ${b.shortName}?`,
+      body: `Merge ${targetLabel} into ${status.branch}?\n\nIf there are conflicts you'll see a banner in the Changes tab with Resolve / Abort options.`,
+      confirmLabel: 'Merge',
+    });
+    if (!ok) return;
+    setActing(b.shortName);
+    const pendingId = pushToast({
+      kind: 'info',
+      message: `Merging ${target} into ${status.branch}…`,
+      sticky: true,
+    });
+    try {
+      const res = await mergeBranchAction(repoId, target, 'merge');
+      dismissToast(pendingId);
+      if (!res.ok) {
+        pushToast({ kind: 'error', message: res.error ?? 'Merge failed' });
+      } else if (res.alreadyUpToDate) {
+        pushToast({
+          kind: 'info',
+          message: `Already up to date — ${status.branch} already contains every commit on ${target}.`,
+        });
+      } else {
+        pushToast({
+          kind: 'success',
+          message: `Merged ${target} into ${status.branch}.`,
+        });
+      }
+    } finally {
+      setActing(null);
+    }
+  };
+
+  const onRebaseOnto = async (name: string) => {
+    if (!status?.branch) {
+      pushToast({ kind: 'error', message: 'No current branch — detached HEAD.' });
+      return;
+    }
+    const ok = await requestConfirm({
+      title: `Rebase onto ${name}?`,
+      body: `Rebase ${status.branch} onto ${name}? Your commits will be replayed on top of ${name}.`,
+      confirmLabel: 'Rebase',
+    });
+    if (!ok) return;
+    setActing(name);
+    try {
+      const res = await rebaseOntoAction(repoId, name);
+      if (!res.ok) {
+        pushToast({
+          kind: 'error',
+          message:
+            (res.error ?? 'Rebase failed') +
+            '\n\nIf there are conflicts, resolve them in the Changes tab — the conflict banner will guide you through Continue / Abort.',
+          sticky: true,
+        });
+      }
+    } finally {
+      setActing(null);
+    }
+  };
+
+  const onRename = async (oldName: string, newName: string) => {
+    setActing(oldName);
+    try {
+      const res = await renameBranchAction(repoId, oldName, newName, false);
+      if (!res.ok) {
+        pushToast({ kind: 'error', message: res.error ?? 'Rename failed' });
+        return false;
+      }
+      return true;
+    } finally {
+      setActing(null);
     }
   };
 
@@ -2483,9 +2815,20 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
                 isMainCheckout={
                   ownership.get(b.shortName)?.isMain ?? false
                 }
-                disabled={switching !== null}
+                disabled={switching !== null || acting !== null}
                 pending={switching === b.shortName}
+                acting={acting === b.shortName}
+                renaming={renaming === b.shortName}
+                hasCurrentBranch={!!status?.branch}
                 onSwitch={() => onSwitchBranch(b.shortName)}
+                onMerge={() => onMergeIntoCurrent({ shortName: b.shortName, upstream: b.upstream })}
+                onRebase={() => onRebaseOnto(b.shortName)}
+                onStartRename={() => setRenaming(b.shortName)}
+                onCancelRename={() => setRenaming(null)}
+                onSubmitRename={async (next) => {
+                  const ok = await onRename(b.shortName, next);
+                  if (ok) setRenaming(null);
+                }}
               />
             ))}
           </ul>
@@ -2547,7 +2890,15 @@ function BranchSwitchRow({
   isMainCheckout,
   disabled,
   pending,
+  acting,
+  renaming,
+  hasCurrentBranch,
   onSwitch,
+  onMerge,
+  onRebase,
+  onStartRename,
+  onCancelRename,
+  onSubmitRename,
 }: {
   name: string;
   isCurrent: boolean;
@@ -2557,7 +2908,15 @@ function BranchSwitchRow({
   isMainCheckout: boolean;
   disabled: boolean;
   pending: boolean;
+  acting: boolean;
+  renaming: boolean;
+  hasCurrentBranch: boolean;
   onSwitch: () => void;
+  onMerge: () => void;
+  onRebase: () => void;
+  onStartRename: () => void;
+  onCancelRename: () => void;
+  onSubmitRename: (next: string) => void;
 }): JSX.Element {
   // A branch is switchable from this row only if no *linked* worktree
   // owns it. If the main repo owns it, that's the current branch (or a
@@ -2566,6 +2925,24 @@ function BranchSwitchRow({
   // worktree row's "Switch main repo here" affordance instead, since
   // git refuses to check out a branch that's already in use.
   const ownedByLinked = ownedBy !== undefined && !isMainCheckout;
+  // Merge/Rebase only make sense when this row is NOT the current branch
+  // and we actually have a current branch to merge into.
+  const showMergeRebase = !isCurrent && hasCurrentBranch;
+  const [draft, setDraft] = useState(name);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  useEffect(() => {
+    if (renaming) {
+      setDraft(name);
+      // Focus + select the basename so the user can re-type quickly.
+      requestAnimationFrame(() => {
+        inputRef.current?.focus();
+        inputRef.current?.select();
+      });
+    }
+  }, [renaming, name]);
+  const sanitized = useMemo(() => sanitizeBranchName(draft), [draft]);
+  const canSubmit =
+    renaming && sanitized.value && !sanitized.error && sanitized.value !== name;
   return (
     <li
       className={`flex items-center gap-3 px-3 py-1.5 rounded border ${
@@ -2578,30 +2955,141 @@ function BranchSwitchRow({
       >
         {isCurrent ? '⎇' : ''}
       </span>
-      <span className="font-mono text-sm truncate flex-1" title={name}>
-        {name}
-      </span>
-      <span className="text-[11px] text-ink-faint truncate max-w-[40%]" title={subject}>
-        {subject}
-      </span>
-      <span className="text-[11px] text-ink-faint font-mono">{shortSha}</span>
-      {ownedByLinked ? (
-        <span
-          className="text-[11px] text-amber-400 font-mono truncate max-w-[40%]"
-          title={`This branch is checked out at ${ownedBy!.path}. Use that row's "Switch main repo here" to bring it back.`}
-        >
-          owned by {ownedBy!.path}
-        </span>
-      ) : isCurrent ? (
-        <span className="text-[11px] text-ink-faint">on this checkout</span>
+      {renaming ? (
+        <input
+          ref={inputRef}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && canSubmit) onSubmitRename(sanitized.value);
+            else if (e.key === 'Escape') onCancelRename();
+          }}
+          disabled={acting}
+          className="field font-mono text-sm flex-1 px-2 py-0.5"
+          placeholder="new branch name"
+        />
       ) : (
-        <button
-          onClick={onSwitch}
-          disabled={disabled}
-          className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-surface-elevated disabled:opacity-50"
-        >
-          {pending ? 'Switching…' : 'Switch'}
-        </button>
+        <span className="font-mono text-sm truncate flex-1" title={name}>
+          {name}
+        </span>
+      )}
+      {!renaming && (
+        <>
+          <span className="text-[11px] text-ink-faint truncate max-w-[40%]" title={subject}>
+            {subject}
+          </span>
+          <span className="text-[11px] text-ink-faint font-mono">{shortSha}</span>
+        </>
+      )}
+      {renaming ? (
+        <div className="flex items-center gap-1">
+          {sanitized.error && (
+            <span className="text-[11px] text-red-400" title={sanitized.error}>
+              invalid
+            </span>
+          )}
+          {sanitized.changed && !sanitized.error && (
+            <span
+              className="text-[11px] text-amber-300 font-mono truncate max-w-[16ch]"
+              title={`Will rename to ${sanitized.value}`}
+            >
+              → {sanitized.value}
+            </span>
+          )}
+          <button
+            onClick={() => sanitized.value && onSubmitRename(sanitized.value)}
+            disabled={!canSubmit || acting}
+            className="text-[11px] px-2 py-0.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+          >
+            {acting ? 'Renaming…' : 'Rename'}
+          </button>
+          <button
+            onClick={onCancelRename}
+            disabled={acting}
+            className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-surface-elevated disabled:opacity-50"
+          >
+            Cancel
+          </button>
+        </div>
+      ) : ownedByLinked ? (
+        <>
+          <span
+            className="text-[11px] text-amber-400 font-mono truncate max-w-[40%]"
+            title={`This branch is checked out at ${ownedBy!.path}. Use that row's "Switch main repo here" to bring it back.`}
+          >
+            owned by {ownedBy!.path}
+          </span>
+          <Explain
+            command={`git branch -m ${name} <new-name>`}
+            plain={`Rename ${name} in place. The branch keeps its history.`}
+          >
+            <button
+              onClick={onStartRename}
+              disabled={disabled}
+              className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-surface-elevated disabled:opacity-50"
+              title={`Rename ${name}`}
+            >
+              Rename
+            </button>
+          </Explain>
+        </>
+      ) : (
+        <div className="flex items-center gap-1">
+          {showMergeRebase && (
+            <>
+              <Explain
+                command={`git merge ${name}`}
+                plain={`Bring commits from ${name} into the current branch as a merge commit.`}
+              >
+                <button
+                  onClick={onMerge}
+                  disabled={disabled}
+                  className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-surface-elevated disabled:opacity-50"
+                  title={`Merge ${name} into current branch`}
+                >
+                  {acting ? 'Working…' : 'Merge'}
+                </button>
+              </Explain>
+              <Explain
+                command={`git rebase ${name}`}
+                plain={`Replay the current branch's commits on top of ${name}. Rewrites history.`}
+              >
+                <button
+                  onClick={onRebase}
+                  disabled={disabled}
+                  className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-surface-elevated disabled:opacity-50"
+                  title={`Rebase current branch onto ${name}`}
+                >
+                  Rebase
+                </button>
+              </Explain>
+            </>
+          )}
+          <Explain
+            command={`git branch -m ${name} <new-name>`}
+            plain={`Rename ${name} in place. The branch keeps its history.`}
+          >
+            <button
+              onClick={onStartRename}
+              disabled={disabled}
+              className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-surface-elevated disabled:opacity-50"
+              title={`Rename ${name}`}
+            >
+              Rename
+            </button>
+          </Explain>
+          {isCurrent ? (
+            <span className="text-[11px] text-ink-faint">on this checkout</span>
+          ) : (
+            <button
+              onClick={onSwitch}
+              disabled={disabled}
+              className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-surface-elevated disabled:opacity-50"
+            >
+              {pending ? 'Switching…' : 'Switch'}
+            </button>
+          )}
+        </div>
       )}
     </li>
   );
@@ -3137,42 +3625,52 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
             {/* Rows render full-width with their own bg. The SVG
                 overlay paints lines + circles on top of the rail
                 strip; pointer-events none so clicks fall through. */}
-            <button
-              onClick={onPickWorking}
-              className={`w-full text-left flex items-center gap-2 text-xs border-b border-card relative z-10 ${
-                selected === 'working' ? 'bg-accent text-white' : 'hover:bg-card'
-              }`}
-              style={{ height: ROW_HEIGHT, paddingLeft: railWidth, paddingRight: 12 }}
+            <Explain
+              command="git diff HEAD"
+              plain="See every change in your working tree compared to the latest commit."
             >
-              <span className="font-medium truncate">Working tree</span>
-              <span
-                className={`text-[10px] truncate ${
-                  selected === 'working' ? 'text-white/70' : 'text-ink-faint'
+              <button
+                onClick={onPickWorking}
+                className={`w-full text-left flex items-center gap-2 text-xs border-b border-card relative z-10 ${
+                  selected === 'working' ? 'bg-accent text-white' : 'hover:bg-card'
                 }`}
+                style={{ height: ROW_HEIGHT, paddingLeft: railWidth, paddingRight: 12 }}
               >
-                staged + unstaged vs HEAD
-              </span>
-            </button>
+                <span className="font-medium truncate">Working tree</span>
+                <span
+                  className={`text-[10px] truncate ${
+                    selected === 'working' ? 'text-white/70' : 'text-ink-faint'
+                  }`}
+                >
+                  staged + unstaged vs HEAD
+                </span>
+              </button>
+            </Explain>
 
             {filteredCommits.map((c) => {
               const active = selected === c.sha;
               const isHead = c.sha === headSha;
               return (
-                <button
+                <Explain
                   key={c.sha}
-                  onClick={() => onPickCommit(c.sha)}
-                  onContextMenu={(e) => openContextMenu(e, c.sha)}
-                  style={{
-                    height: ROW_HEIGHT,
-                    paddingLeft: railWidth,
-                    paddingRight: 12,
-                  }}
-                  className={`w-full text-left flex items-center gap-2 text-xs border-b border-card relative z-10 ${
-                    active ? 'bg-accent text-white' : 'hover:bg-card'
-                  }`}
+                  command={`git show ${c.shortSha}`}
+                  plain={`Inspect this commit: ${c.subject || '(no subject)'}`}
                 >
-                  <CommitGraphRow commit={c} active={active} isHead={isHead} />
-                </button>
+                  <button
+                    onClick={() => onPickCommit(c.sha)}
+                    onContextMenu={(e) => openContextMenu(e, c.sha)}
+                    style={{
+                      height: ROW_HEIGHT,
+                      paddingLeft: railWidth,
+                      paddingRight: 12,
+                    }}
+                    className={`w-full text-left flex items-center gap-2 text-xs border-b border-card relative z-10 ${
+                      active ? 'bg-accent text-white' : 'hover:bg-card'
+                    }`}
+                  >
+                    <CommitGraphRow commit={c} active={active} isHead={isHead} />
+                  </button>
+                </Explain>
               );
             })}
             {filteredCommits.length === 0 && commits.length > 0 && (

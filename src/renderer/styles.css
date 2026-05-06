@@ -103,3 +103,18 @@ body {
   background-color: var(--c-surface);
   color: var(--c-ink);
 }
+
+/* Indeterminate progress sweep used by the repo header during fetch /
+ * pull / push. Runs from -100% to 200% so the bar enters from the left,
+ * sweeps fully across, and disappears off the right before looping. */
+@keyframes progress-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(400%);
+  }
+}
+.animate-progress-slide {
+  animation: progress-slide 1.4s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}

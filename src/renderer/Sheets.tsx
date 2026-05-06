@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useStore } from './store';
 import type {
   AppSettings,
@@ -60,9 +60,11 @@ export function SheetHost(): JSX.Element | null {
             : sheet.kind === 'about'
               ? 'w-[720px] max-w-[92vw] max-h-[85vh]'
               : sheet.kind === 'settings'
-                ? 'w-[760px] max-w-[92vw] h-[80vh]'
+                ? 'w-[1080px] max-w-[95vw] h-[80vh]'
                 : sheet.kind === 'pullConflict'
                   ? 'w-[680px] max-w-[92vw] max-h-[80vh]'
+                  : sheet.kind === 'resolveConflict'
+                    ? 'w-[1100px] max-w-[96vw] h-[85vh]'
                   : sheet.kind === 'fileHistory'
                     ? 'w-[860px] max-w-[94vw] h-[82vh]'
                     : sheet.kind === 'manageRepo'
@@ -110,6 +112,9 @@ export function SheetHost(): JSX.Element | null {
         )}
         {sheet.kind === 'initRepo' && (
           <InitRepoSheet path={sheet.path} reason={sheet.reason} />
+        )}
+        {sheet.kind === 'resolveConflict' && (
+          <ResolveConflictSheet repoId={sheet.repoId} path={sheet.path} />
         )}
       </div>
     </div>
@@ -317,6 +322,12 @@ function SettingsGeneralPanel(): JSX.Element {
     await window.overgit.invoke('store:saveSettings', next);
   };
 
+  const updateExplainMode = async (explainMode: boolean) => {
+    const next = { ...settings, explainMode };
+    useStore.setState({ settings: next });
+    await window.overgit.invoke('store:saveSettings', next);
+  };
+
   return (
     <div className="flex flex-col gap-6 text-sm">
       <ProcessExplainer />
@@ -338,6 +349,28 @@ function SettingsGeneralPanel(): JSX.Element {
               }`}
             >
               {t[0].toUpperCase() + t.slice(1)}
+            </button>
+          ))}
+        </div>
+      </SettingsGroup>
+
+      <SettingsGroup
+        eyebrow="Learning"
+        title="Explain mode"
+        subtitle="Show the underlying git command and a plain-English caption next to action buttons. Useful for learning what overgit is doing under the hood."
+      >
+        <div className="flex gap-2">
+          {([['off', false], ['on', true]] as const).map(([label, value]) => (
+            <button
+              key={label}
+              onClick={() => updateExplainMode(value)}
+              className={`px-3 py-1.5 rounded-md border text-xs ${
+                Boolean(settings.explainMode) === value
+                  ? 'bg-accent text-white border-accent'
+                  : 'border-card hover:bg-card'
+              }`}
+            >
+              {label[0].toUpperCase() + label.slice(1)}
             </button>
           ))}
         </div>
@@ -372,7 +405,7 @@ function SettingsGeneralPanel(): JSX.Element {
       >
         <div className="grid grid-cols-2 gap-2">
           <Stat label="Repos" value={repos.length.toString()} />
-          <Stat label="Workspaces" value={workspaces.length.toString()} />
+          <Stat label="Worksets" value={workspaces.length.toString()} />
         </div>
       </SettingsGroup>
     </div>
@@ -417,7 +450,7 @@ function SettingsReposPanel(): JSX.Element {
       <SettingsGroup
         eyebrow="Repos"
         title="Default branches"
-        subtitle="Each repo's trunk — the branch overgit treats as the base for compare/PR-base and as the recovery target during a workspace sync-and-branch. Auto-detected from origin/HEAD on add."
+        subtitle="Each repo's trunk — the branch overgit treats as the base for compare/PR-base and as the recovery target during a workset sync-and-branch. Auto-detected from origin/HEAD on add."
       >
         {repos.length === 0 ? (
           <div className="text-[11px] text-ink-faint p-3 rounded border border-card bg-card">
@@ -885,7 +918,7 @@ function IdentityBulkTable(): JSX.Element {
       </div>
 
       {/* Header */}
-      <div className="grid grid-cols-[24px_minmax(0,1.4fr)_minmax(0,1.2fr)_minmax(0,1.5fr)_minmax(0,1fr)_auto] gap-2 px-2 text-[10px] uppercase tracking-wide text-ink-faint">
+      <div className="grid grid-cols-[24px_minmax(0,1.3fr)_minmax(0,1fr)_minmax(0,1.3fr)_minmax(0,1.6fr)_auto] gap-2 px-2 text-[10px] uppercase tracking-wide text-ink-faint">
         <input
           type="checkbox"
           checked={allChecked}
@@ -914,7 +947,7 @@ function IdentityBulkTable(): JSX.Element {
           return (
             <li
               key={r.id}
-              className="grid grid-cols-[24px_minmax(0,1.4fr)_minmax(0,1.2fr)_minmax(0,1.5fr)_minmax(0,1fr)_auto] gap-2 items-center px-2 py-1.5 border-b border-card last:border-b-0"
+              className="grid grid-cols-[24px_minmax(0,1.3fr)_minmax(0,1fr)_minmax(0,1.3fr)_minmax(0,1.6fr)_auto] gap-2 items-center px-2 py-1.5 border-b border-card last:border-b-0"
             >
               <input
                 type="checkbox"
@@ -1001,7 +1034,7 @@ function SettingsShortcutsPanel(): JSX.Element {
           <ShortcutRow keys="⌘ \\" what="Toggle sidebar" />
           <ShortcutRow keys="⌘ R" what="Refresh current pane" />
           <ShortcutRow keys="⌘ B" what="Branch picker (in a repo)" />
-          <ShortcutRow keys="⌘ N" what="New branch (in a workspace)" />
+          <ShortcutRow keys="⌘ N" what="New branch (in a workset)" />
           <ShortcutRow keys="⌘ 1 – 4" what="Changes / History / Files / Graph" />
           <ShortcutRow keys="⌘ S" what="Save open file" />
           <ShortcutRow keys="↑ ↓ ⏎" what="Navigate picker / palette" />
@@ -1125,9 +1158,9 @@ function ProcessExplainer(): JSX.Element {
         'Overgit records the path in its own store. Your repo on disk is untouched — we never write inside .git.',
     },
     {
-      title: 'Group into a workspace',
+      title: 'Group into a workset',
       body:
-        'A workspace is a named list of repo IDs. No symlinks, no synthetic root — just a coordinator that fans operations out.',
+        'A workset is the unit of in-flight work — a named list of repos you branch, commit, push, and archive together. No symlinks, no synthetic root.',
     },
     {
       title: 'Run plain git',
@@ -1251,9 +1284,9 @@ const ABOUT_PILLARS = [
   {
     color: '#8a78ff',
     kicker: 'Coordinate',
-    title: 'Workspaces, not single repos.',
+    title: 'Worksets, not single repos.',
     body:
-      'Group polyrepo services into one workspace and switch them onto the same branch in one go. Status, PRs, and pull/push fan out across every member.',
+      'Group repos for a single piece of work into a workset. Branch, commit, and push together across every member. Archive when the work ships — reactivate if it comes back.',
   },
   {
     color: '#5eead4',
@@ -1272,12 +1305,12 @@ const ABOUT_PILLARS = [
 ] as const;
 
 const ABOUT_FEATURES = [
-  { title: 'Workspace-wide branching', body: 'Sync to default → pull → branch, across N repos at once.' },
+  { title: 'Workset-wide branching', body: 'Sync to default → pull → branch, across N repos at once.' },
   { title: 'Branch picker + cherry-pick', body: 'Searchable popover, ↑↓/Enter, per-branch commit picker.' },
   { title: 'AI review & suggest', body: 'claude / codex / gemini on the staged or working diff.' },
   { title: 'File editor', body: 'Syntax-highlighted, sandboxed to registered repos.' },
   { title: 'Branch graph', body: 'Per-lane colored visualization with ref labels.' },
-  { title: 'Cmd+K palette', body: 'Branches, files, repos, workspaces, actions — one keystroke.' },
+  { title: 'Cmd+K palette', body: 'Branches, files, repos, worksets, actions — one keystroke.' },
 ] as const;
 
 function AboutSheet(): JSX.Element {
@@ -1302,8 +1335,8 @@ function AboutSheet(): JSX.Element {
               </div>
             </div>
             <div className="mt-2.5 text-sm leading-snug text-ink-muted">
-              A workspace-overlay git client. Coordinate many repos at once
-              without owning their state.
+              An overlay git client. Coordinate many repos at once without
+              owning their state.
             </div>
           </div>
         </div>
@@ -1453,6 +1486,8 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
   const setSheet = useStore((s) => s.setSheet);
   const createWorkspace = useStore((s) => s.createWorkspace);
   const updateWorkspace = useStore((s) => s.updateWorkspace);
+  const checkoutWorkspaceBranch = useStore((s) => s.checkoutWorkspaceBranch);
+  const pushToast = useStore((s) => s.pushToast);
   const editingId = workspaceId ?? null;
   const existingStatuses = useStore((s) =>
     editingId ? s.workspaceStatuses[editingId] ?? EMPTY_STATUSES : EMPTY_STATUSES,
@@ -1467,13 +1502,48 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
   const [picked, setPicked] = useState<Set<UUID>>(
     new Set(editing?.repoIds ?? []),
   );
+  const [branch, setBranch] = useState(editing?.preferredBranch ?? '');
   const [busy, setBusy] = useState(false);
 
-  // Common branch of the workspace as it stands today: explicit
-  // preferredBranch wins; otherwise the dominant branch among loaded
-  // members iff it's held by 2+ repos and a majority. Used to offer a
-  // post-save sync for any newly-added project.
+  // Where the bound branch should come from for the auto-checkout step
+  // on Create. Default to "from origin/<default>" — the safest base for
+  // fresh work, matching the "+ New branch" sheet's default. Edit doesn't
+  // expose this; Edit just saves the metadata patch and lets the user run
+  // the explicit branch flows when they want to move repos.
+  type BaseMode = 'origin' | 'current' | 'existing';
+  const [baseMode, setBaseMode] = useState<BaseMode>('origin');
+
+  // Progress phase for the create flow. The sheet swaps its form for a
+  // spinner-and-message UI while the workset is being created and the
+  // bound branch is being checked out / created across N repos. After
+  // the operation finishes, partial failures are shown as a per-repo
+  // outcome list so the user can act before closing the sheet.
+  type Phase =
+    | { kind: 'form' }
+    | { kind: 'busy'; message: string }
+    | { kind: 'outcomes'; rows: { repoId: UUID; ok: boolean; label: string; message?: string }[] };
+  const [phase, setPhase] = useState<Phase>({ kind: 'form' });
+
+  // Slug suggestion derived from the workset name. Shown as the Branch
+  // input's placeholder when the user hasn't typed one yet — accepting
+  // the placeholder is one click. Pure formatting, no state writes.
+  const suggestedBranch = useMemo(() => {
+    const slug = name
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '');
+    return slug ? `feature/${slug}` : '';
+  }, [name]);
+
+  // Bound branch for the workset. The Branch input wins (it's what the
+  // user is about to save); falls back to `editing.preferredBranch` for
+  // existing worksets without a typed override; falls back to majority-
+  // inference for legacy worksets that haven't bound a branch yet. Used
+  // to offer a post-save sync for any newly-added project.
   const commonBranch: string | null = useMemo(() => {
+    const typed = branch.trim();
+    if (typed) return typed;
     if (!editing) return null;
     if (editing.preferredBranch) return editing.preferredBranch;
     const tally = new Map<string, number>();
@@ -1488,7 +1558,7 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
     if (topCount < 2) return null;
     if (topCount * 2 < existingStatuses.length) return null;
     return topBranch;
-  }, [editing, existingStatuses]);
+  }, [branch, editing, existingStatuses]);
 
   // Newly-added repos: in `picked` but not previously a member. These
   // are the rows we'll offer to sync to commonBranch after save.
@@ -1518,21 +1588,100 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
 
   const onSave = async () => {
     if (!name.trim() || picked.size === 0) return;
+    const trimmedBranch = branch.trim() || suggestedBranch;
     setBusy(true);
     try {
+      // Edit path: just save metadata, no branch operations. Branch
+      // changes on edit happen explicitly via "+ New branch" / per-row
+      // Sync, so we don't move N repos as a side effect of "Save".
       if (editing) {
-        await updateWorkspace(editing.id, { name: name.trim(), repoIds: [...picked] });
-      } else {
-        await createWorkspace(name.trim(), [...picked]);
+        await updateWorkspace(editing.id, {
+          name: name.trim(),
+          repoIds: [...picked],
+          preferredBranch: trimmedBranch || undefined,
+        });
+        if (newlyAdded.length > 0 && commonBranch) {
+          setShowSync(true);
+        } else {
+          setSheet(null);
+        }
+        return;
       }
-      // Editing flow with new members + a common branch: stay in the
-      // sheet and reveal the sync panel so the user can bring each
-      // new repo up to the workspace's branch in one click. Otherwise
-      // close as before.
-      if (editing && newlyAdded.length > 0 && commonBranch) {
-        setShowSync(true);
-      } else {
+
+      // Create path: workset row + (if a branch is bound) the chosen
+      // branch flow across every member. Spinner and per-repo outcomes
+      // surface in the sheet body via `phase`.
+      setPhase({ kind: 'busy', message: 'Creating workset…' });
+      await createWorkspace(name.trim(), [...picked], trimmedBranch || undefined);
+      const createdId = useStore.getState().selectedWorkspaceId;
+      if (!createdId || !trimmedBranch) {
         setSheet(null);
+        return;
+      }
+
+      const repoCount = picked.size;
+      const repoWord = repoCount === 1 ? 'repo' : 'repos';
+      const rows: { repoId: UUID; ok: boolean; label: string; message?: string }[] = [];
+
+      if (baseMode === 'origin' || baseMode === 'current') {
+        const syncDefault = baseMode === 'origin';
+        setPhase({
+          kind: 'busy',
+          message:
+            baseMode === 'origin'
+              ? `Fetching, syncing default, and creating ${trimmedBranch} across ${repoCount} ${repoWord}…`
+              : `Creating ${trimmedBranch} from current branch in ${repoCount} ${repoWord}…`,
+        });
+        const outcomes = await window.overgit.invoke('workspace:syncAndBranch', {
+          workspaceId: createdId,
+          branch: trimmedBranch,
+          syncDefault,
+          pullBeforeBranch: syncDefault,
+        });
+        for (const o of outcomes) {
+          rows.push({
+            repoId: o.repoId,
+            ok: o.result === 'created',
+            label: o.result,
+            message: o.message,
+          });
+        }
+      } else {
+        // Existing branch — checkout without creating. Repos that don't
+        // have the branch come back as 'missing-branch' and surface in
+        // the outcomes list so the user can decide what to do.
+        setPhase({
+          kind: 'busy',
+          message: `Checking out ${trimmedBranch} across ${repoCount} ${repoWord}…`,
+        });
+        const outcomes = await window.overgit.invoke('workspace:checkoutBranch', {
+          workspaceId: createdId,
+          branch: trimmedBranch,
+          createIfMissing: false,
+        });
+        for (const o of outcomes) {
+          const ok = o.result === 'switched' || o.result === 'already-on-branch';
+          rows.push({
+            repoId: o.repoId,
+            ok,
+            label: o.result,
+            message: o.message,
+          });
+        }
+      }
+
+      await refreshWorkspaceStatus(createdId);
+      const failures = rows.filter((r) => !r.ok);
+      if (failures.length === 0) {
+        pushToast({
+          kind: 'success',
+          message: `Workset created · ${trimmedBranch} on ${repoCount} ${repoWord}.`,
+        });
+        setSheet(null);
+      } else {
+        // Stay in the sheet and show per-repo outcomes so the user can
+        // see what failed (dirty / pull-failed / missing-branch / etc).
+        setPhase({ kind: 'outcomes', rows });
       }
     } finally {
       setBusy(false);
@@ -1563,22 +1712,151 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
   return (
     <>
       <SheetHeader
-        title={editing ? `Edit workspace · ${editing.name}` : 'New workspace'}
+        title={editing ? `Edit workset · ${editing.name}` : 'New workset'}
         onClose={() => setSheet(null)}
       />
       <div className="flex-1 min-h-0 p-5 flex flex-col gap-4 text-sm overflow-y-auto">
-        {!showSync && (
+        {phase.kind === 'busy' && (
+          <div className="flex-1 flex flex-col items-center justify-center gap-4 py-12">
+            <svg
+              width="28"
+              height="28"
+              viewBox="0 0 24 24"
+              className="animate-spin text-accent"
+              aria-hidden
+            >
+              <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" opacity="0.25" fill="none" />
+              <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" strokeWidth="3" fill="none" strokeLinecap="round" />
+            </svg>
+            <div className="text-sm text-ink text-center max-w-md leading-snug">
+              {phase.message}
+            </div>
+            <div className="text-[11px] text-ink-faint">This can take a moment.</div>
+          </div>
+        )}
+        {phase.kind === 'outcomes' && (
+          <div className="flex flex-col gap-3">
+            <div className="text-sm text-ink">
+              Workset created. Some repos need attention:
+            </div>
+            <ul className="flex flex-col gap-1.5">
+              {phase.rows.map((row) => {
+                const r = reposById.get(row.repoId);
+                return (
+                  <li
+                    key={row.repoId}
+                    className={`flex items-center gap-3 px-3 py-2 rounded border ${
+                      row.ok ? 'border-card bg-card' : 'border-amber-500/30 bg-amber-500/5'
+                    }`}
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm font-medium truncate">
+                        {r?.name ?? row.repoId}
+                      </div>
+                      {r?.path && (
+                        <div className="text-[11px] text-ink-faint truncate font-mono">
+                          {r.path}
+                        </div>
+                      )}
+                    </div>
+                    <span
+                      className={`text-[11px] font-mono max-w-[260px] truncate ${
+                        row.ok ? 'text-emerald-400' : 'text-amber-400'
+                      }`}
+                      title={row.message ?? row.label}
+                    >
+                      {row.label}
+                      {row.message ? ` — ${row.message}` : ''}
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+            <div className="text-[11px] text-ink-faint leading-snug">
+              The workset is created and the branch is bound. Use the per-repo
+              "Sync to <span className="font-mono">{branch.trim() || suggestedBranch}</span>"
+              button on each row above (or "+ New branch" inside the workset)
+              to bring drifted repos onto the branch.
+            </div>
+          </div>
+        )}
+        {phase.kind === 'form' && !showSync && (
           <>
+            {!editing && (
+              <div className="rounded border border-accent/30 bg-accent/5 px-3 py-2.5 text-[12px] text-ink-muted leading-snug">
+                <div className="text-ink font-medium mb-0.5">What's a workset?</div>
+                A unit of work across repos, bound to a branch. Pick the repos
+                and name the branch — then branch, commit, and push them
+                together. Archive when shipped.
+              </div>
+            )}
             <label className="flex flex-col gap-1">
               <span className="text-xs uppercase tracking-wide text-ink-faint">Name</span>
               <input
                 autoFocus
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                placeholder="e.g. service-platform, marketing-site, polyrepo-stack"
+                placeholder="e.g. checkout-redesign, billing-migration, sso-rollout"
                 className="field px-2 py-1.5 text-sm"
               />
             </label>
+
+            <label className="flex flex-col gap-1">
+              <span className="text-xs uppercase tracking-wide text-ink-faint">Branch</span>
+              <input
+                value={branch}
+                onChange={(e) => setBranch(e.target.value)}
+                placeholder={suggestedBranch || 'e.g. feature/checkout-redesign'}
+                className="field px-2 py-1.5 text-sm font-mono"
+              />
+              <span className="text-[11px] text-ink-faint">
+                {editing
+                  ? 'The branch this workset is bound to. Changes apply on save; member repos are not switched automatically — use "+ New branch" or per-row Sync.'
+                  : 'On Create, every selected repo is moved to this branch using the option below.'}
+                {!editing && !branch.trim() && suggestedBranch && (
+                  <>
+                    {' '}Empty saves as{' '}
+                    <button
+                      type="button"
+                      onClick={() => setBranch(suggestedBranch)}
+                      className="font-mono text-accent hover:underline"
+                    >
+                      {suggestedBranch}
+                    </button>
+                    .
+                  </>
+                )}
+              </span>
+            </label>
+
+            {!editing && (
+              <fieldset className="flex flex-col gap-1.5">
+                <legend className="text-xs uppercase tracking-wide text-ink-faint mb-1">
+                  Branch from
+                </legend>
+                <BaseModeRadio
+                  value="origin"
+                  current={baseMode}
+                  onPick={setBaseMode}
+                  title="Latest origin/<default>"
+                  subtitle="Recommended for new work — fetch, switch each repo to its default, pull, then create the branch off it."
+                />
+                <BaseModeRadio
+                  value="current"
+                  current={baseMode}
+                  onPick={setBaseMode}
+                  title="Each repo's current branch"
+                  subtitle="Quick — create the branch from whatever each repo is on right now."
+                />
+                <BaseModeRadio
+                  value="existing"
+                  current={baseMode}
+                  onPick={setBaseMode}
+                  title="Existing branch (don't create)"
+                  subtitle="Just check out — fail per-repo if the branch isn't there."
+                />
+              </fieldset>
+            )}
 
             <div>
               <div className="flex items-center justify-between mb-2">
@@ -1589,7 +1867,7 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
               </div>
               {repos.length === 0 ? (
                 <div className="text-xs text-ink-faint p-3 rounded border border-card bg-card">
-                  Add a repo first — workspaces are built from repos already in
+                  Add a repo first — worksets are built from repos already in
                   overgit.
                 </div>
               ) : (
@@ -1621,7 +1899,7 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
                 After saving, you'll be offered to sync the {newlyAdded.length}{' '}
                 new {newlyAdded.length === 1 ? 'repo' : 'repos'} to{' '}
                 <span className="font-mono">{commonBranch}</span> (fetch → switch
-                default → pull → check out the workspace branch).
+                default → pull → check out the workset branch).
               </div>
             )}
           </>
@@ -1629,7 +1907,7 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
         {showSync && commonBranch && (
           <div className="flex flex-col gap-3">
             <div className="text-xs text-ink-muted">
-              Workspace common branch:{' '}
+              Workset common branch:{' '}
               <span className="font-mono text-ink">{commonBranch}</span>. Sync
               each new repo to bring it onto that branch off the latest default.
             </div>
@@ -1638,33 +1916,15 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
                 const r = reposById.get(id);
                 const st = syncState[id] ?? { kind: 'idle' };
                 return (
-                  <li
+                  <SyncRow
                     key={id}
-                    className="flex items-center gap-3 px-3 py-2 rounded border border-card bg-card"
-                  >
-                    <div className="min-w-0 flex-1">
-                      <div className="text-sm font-medium truncate">
-                        {r?.name ?? id}
-                      </div>
-                      <div className="text-[11px] text-ink-faint truncate font-mono">
-                        {r?.path}
-                      </div>
-                    </div>
-                    {st.kind === 'idle' && (
-                      <button
-                        onClick={() => runSyncFor(id)}
-                        className="text-[11px] px-2 py-1 rounded border border-card hover:bg-card"
-                      >
-                        Sync to {commonBranch}
-                      </button>
-                    )}
-                    {st.kind === 'syncing' && (
-                      <span className="text-[11px] text-ink-faint">syncing…</span>
-                    )}
-                    {st.kind === 'done' && (
-                      <SyncOutcomeBadge outcome={st.outcome} />
-                    )}
-                  </li>
+                    repoId={id}
+                    repoName={r?.name ?? id}
+                    repoPath={r?.path}
+                    branch={commonBranch}
+                    state={st}
+                    onSync={() => runSyncFor(id)}
+                  />
                 );
               })}
             </ul>
@@ -1672,7 +1932,23 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
         )}
       </div>
       <div className="px-5 py-3 border-t border-card flex justify-end gap-2">
-        {!showSync && (
+        {phase.kind === 'busy' && (
+          <button
+            disabled
+            className="text-xs px-3 py-1.5 rounded border border-card text-ink-faint cursor-not-allowed"
+          >
+            Working…
+          </button>
+        )}
+        {phase.kind === 'outcomes' && (
+          <button
+            onClick={() => setSheet(null)}
+            className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong"
+          >
+            Done
+          </button>
+        )}
+        {phase.kind === 'form' && !showSync && (
           <>
             <button
               onClick={() => setSheet(null)}
@@ -1685,7 +1961,13 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
               onClick={onSave}
               className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
             >
-              {editing ? 'Save changes' : `Create workspace`}
+              {editing
+                ? 'Save changes'
+                : (branch.trim() || suggestedBranch)
+                  ? baseMode === 'existing'
+                    ? `Create & checkout ${branch.trim() || suggestedBranch}`
+                    : `Create & branch ${branch.trim() || suggestedBranch}`
+                  : 'Create workset'}
             </button>
           </>
         )}
@@ -1710,6 +1992,191 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
         )}
       </div>
     </>
+  );
+}
+
+function BaseModeRadio<V extends string>({
+  value,
+  current,
+  onPick,
+  title,
+  subtitle,
+}: {
+  value: V;
+  current: V;
+  onPick: (v: V) => void;
+  title: string;
+  subtitle: string;
+}): JSX.Element {
+  const selected = current === value;
+  return (
+    <button
+      type="button"
+      onClick={() => onPick(value)}
+      className={`text-left rounded border px-3 py-2 transition-colors ${
+        selected
+          ? 'border-accent/60 bg-accent/10'
+          : 'border-card bg-card hover:border-accent/30'
+      }`}
+    >
+      <div className="flex items-center gap-2">
+        <span
+          className={`flex items-center justify-center w-4 h-4 rounded-full border-2 shrink-0 ${
+            selected ? 'border-accent' : 'border-ink-faint'
+          }`}
+        >
+          {selected && <span className="w-2 h-2 rounded-full bg-accent" />}
+        </span>
+        <span className={`text-xs font-medium ${selected ? 'text-ink' : 'text-ink-muted'}`}>
+          {title}
+        </span>
+      </div>
+      <div className="mt-0.5 ml-6 text-[11px] text-ink-faint leading-snug">
+        {subtitle}
+      </div>
+    </button>
+  );
+}
+
+/// One row of the post-edit sync panel. When the sync result is `dirty`,
+/// surfaces Stash & retry / Commit & retry inline so the user can resolve
+/// the offending working tree without leaving the sheet — same pattern
+/// as `CheckoutOutcomeRow` for the Resume flow. Owns its own commit
+/// composer / busy state so a slow stash on one repo doesn't lock up the
+/// rest of the panel.
+type SyncRowState =
+  | { kind: 'idle' }
+  | { kind: 'syncing' }
+  | { kind: 'done'; outcome: SyncAndBranchOutcome | { result: 'unknown-repo' } };
+
+function SyncRow({
+  repoId,
+  repoName,
+  repoPath,
+  branch,
+  state,
+  onSync,
+}: {
+  repoId: UUID;
+  repoName: string;
+  repoPath: string | undefined;
+  branch: string;
+  state: SyncRowState;
+  onSync: () => Promise<void> | void;
+}): JSX.Element {
+  const stash = useStore((s) => s.stashRepo);
+  const commitAll = useStore((s) => s.commitAllRepo);
+  const pushToast = useStore((s) => s.pushToast);
+
+  const [showCommit, setShowCommit] = useState(false);
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const isDirty =
+    state.kind === 'done' &&
+    'result' in state.outcome &&
+    state.outcome.result === 'dirty';
+
+  const onStash = async () => {
+    setBusy(true);
+    try {
+      const res = await stash(repoId);
+      if (!res.ok) {
+        pushToast({ kind: 'error', message: res.error ?? 'Stash failed' });
+        return;
+      }
+      await onSync();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onCommit = async () => {
+    if (!message.trim()) return;
+    setBusy(true);
+    try {
+      const res = await commitAll(repoId, message.trim());
+      if (!res.ok) {
+        pushToast({ kind: 'error', message: res.error ?? 'Commit failed' });
+        return;
+      }
+      setShowCommit(false);
+      setMessage('');
+      await onSync();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <li className="flex flex-col gap-1.5 px-3 py-2 rounded border border-card bg-card">
+      <div className="flex items-center gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-medium truncate">{repoName}</div>
+          {repoPath && (
+            <div className="text-[11px] text-ink-faint truncate font-mono">{repoPath}</div>
+          )}
+        </div>
+        {state.kind === 'idle' && (
+          <button
+            onClick={() => void onSync()}
+            className="text-[11px] px-2 py-1 rounded border border-card hover:bg-card"
+          >
+            Sync to {branch}
+          </button>
+        )}
+        {state.kind === 'syncing' && (
+          <span className="text-[11px] text-ink-faint">syncing…</span>
+        )}
+        {state.kind === 'done' && <SyncOutcomeBadge outcome={state.outcome} />}
+      </div>
+      {isDirty && !showCommit && (
+        <div className="flex gap-1 ml-1 text-[11px]">
+          <button
+            disabled={busy}
+            onClick={onStash}
+            className="px-2 py-0.5 rounded border border-card hover:bg-card disabled:opacity-50"
+          >
+            {busy ? 'Stashing…' : 'Stash & retry'}
+          </button>
+          <button
+            disabled={busy}
+            onClick={() => setShowCommit(true)}
+            className="px-2 py-0.5 rounded border border-card hover:bg-card disabled:opacity-50"
+          >
+            Commit & retry
+          </button>
+        </div>
+      )}
+      {isDirty && showCommit && (
+        <div className="flex gap-1 ml-1">
+          <input
+            autoFocus
+            value={message}
+            onChange={(e) => setMessage(e.target.value)}
+            placeholder="commit message"
+            className="field flex-1 px-2 py-1 text-[11px]"
+          />
+          <button
+            disabled={busy || !message.trim()}
+            onClick={onCommit}
+            className="px-2 py-1 rounded bg-accent text-white text-[11px] hover:bg-accent-strong disabled:opacity-50"
+          >
+            {busy ? 'Committing…' : 'Commit'}
+          </button>
+          <button
+            disabled={busy}
+            onClick={() => {
+              setShowCommit(false);
+              setMessage('');
+            }}
+            className="px-2 py-1 rounded border border-card text-[11px] hover:bg-card disabled:opacity-50"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
+    </li>
   );
 }
 
@@ -2731,7 +3198,7 @@ function WorkspaceCommitAllSheet({ workspaceId }: { workspaceId: UUID }): JSX.El
               onClick={onDraft}
               disabled={cliBusy || !tool || dirtyOnBranch.length === 0}
               className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-card disabled:opacity-50"
-              title="Draft a shared commit message from the aggregated workspace diff"
+              title="Draft a shared commit message from the aggregated workset diff"
             >
               ✨ Draft message
             </button>
@@ -2739,7 +3206,7 @@ function WorkspaceCommitAllSheet({ workspaceId }: { workspaceId: UUID }): JSX.El
               onClick={onReview}
               disabled={cliBusy || !tool || dirtyOnBranch.length === 0}
               className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-card disabled:opacity-50"
-              title="Pipe the aggregated workspace diff to the CLI for review"
+              title="Pipe the aggregated workset diff to the CLI for review"
             >
               Review changes
             </button>
@@ -2775,7 +3242,7 @@ function WorkspaceCommitAllSheet({ workspaceId }: { workspaceId: UUID }): JSX.El
           </div>
           {dirtyOnBranch.length === 0 ? (
             <div className="text-[11px] text-ink-faint">
-              Nothing to commit — every repo in this workspace is either clean or in
+              Nothing to commit — every repo in this workset is either clean or in
               detached HEAD.
             </div>
           ) : (
@@ -3156,7 +3623,7 @@ function WorkspaceOpenPRsSheet({ workspaceId }: { workspaceId: UUID }): JSX.Elem
           {candidates.length === 0 ? (
             <div className="text-[11px] text-ink-faint">
               Every repo is on its default branch (or detached). Switch to a feature
-              branch to open PRs across the workspace.
+              branch to open PRs across the workset.
             </div>
           ) : (
             <ul className="text-[11px] text-ink-faint flex flex-col gap-0.5">
@@ -4166,5 +4633,605 @@ function RepoPickRow({
         </span>
       )}
     </label>
+  );
+}
+
+/// Hunk-level 3-way conflict resolver.
+///
+/// Reads the conflicted file from disk, parses its `<<<<<<<` /
+/// `=======` / `>>>>>>>` regions into hunks, and lets the user pick
+/// "Ours", "Theirs", or "Both" for each region — or edit the result
+/// inline. The non-conflicted slices around each hunk render plainly so
+/// the user can see context. On Save we serialize the resolution back
+/// to the file and `git add` it so the conflict banner ticks down.
+///
+/// Diff3 markers (`|||||||` for the merge base) are preserved in the
+/// "ours" half so they don't leak into the saved output but still let
+/// us recover the base text if we want to render it later.
+interface ConflictHunk {
+  ours: string;
+  theirs: string;
+  base: string | null;
+  /// Header text after the conflict marker (e.g. branch name git wrote).
+  oursLabel: string;
+  theirsLabel: string;
+  /// User's choice. 'edit' means `editText` overrides everything.
+  choice: 'ours' | 'theirs' | 'both' | 'edit' | null;
+  /// When `choice === 'both'`, which side comes first in the merged
+  /// output. Default 'ours' so the "ours then theirs" reading order
+  /// matches how `<<<<<<<` and `>>>>>>>` typically frame the conflict.
+  bothOrder: 'ours' | 'theirs';
+  editText: string;
+}
+
+interface ParsedConflict {
+  /// Alternating literal-string + hunk slices. Index even = string,
+  /// odd = hunk. Lets us render in document order without an extra
+  /// position field.
+  segments: Array<string | ConflictHunk>;
+  /// Indexes into `segments` of every hunk for fast iteration.
+  hunkIndexes: number[];
+}
+
+function parseConflicts(text: string): ParsedConflict {
+  const segments: Array<string | ConflictHunk> = [];
+  const hunkIndexes: number[] = [];
+  const lines = text.split('\n');
+  let buf: string[] = [];
+  let i = 0;
+  const flushString = () => {
+    segments.push(buf.join('\n'));
+    buf = [];
+  };
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.startsWith('<<<<<<<')) {
+      flushString();
+      const oursLabel = line.slice(7).trim();
+      const oursLines: string[] = [];
+      const baseLines: string[] = [];
+      const theirsLines: string[] = [];
+      let theirsLabel = '';
+      let phase: 'ours' | 'base' | 'theirs' = 'ours';
+      i += 1;
+      while (i < lines.length && !lines[i].startsWith('>>>>>>>')) {
+        const l = lines[i];
+        if (l.startsWith('|||||||')) {
+          phase = 'base';
+        } else if (l.startsWith('=======')) {
+          phase = 'theirs';
+        } else if (phase === 'ours') {
+          oursLines.push(l);
+        } else if (phase === 'base') {
+          baseLines.push(l);
+        } else {
+          theirsLines.push(l);
+        }
+        i += 1;
+      }
+      if (i < lines.length) {
+        theirsLabel = lines[i].slice(7).trim();
+        i += 1;
+      }
+      const hunk: ConflictHunk = {
+        ours: oursLines.join('\n'),
+        theirs: theirsLines.join('\n'),
+        base: phase === 'base' || baseLines.length > 0 ? baseLines.join('\n') : null,
+        oursLabel,
+        theirsLabel,
+        choice: null,
+        bothOrder: 'ours',
+        editText: '',
+      };
+      hunkIndexes.push(segments.length);
+      segments.push(hunk);
+    } else {
+      buf.push(line);
+      i += 1;
+    }
+  }
+  flushString();
+  return { segments, hunkIndexes };
+}
+
+function serializeResolution(parsed: ParsedConflict): {
+  text: string;
+  unresolved: number;
+} {
+  const out: string[] = [];
+  let unresolved = 0;
+  for (const seg of parsed.segments) {
+    if (typeof seg === 'string') {
+      out.push(seg);
+      continue;
+    }
+    if (seg.choice === 'ours') out.push(seg.ours);
+    else if (seg.choice === 'theirs') out.push(seg.theirs);
+    else if (seg.choice === 'both') {
+      const first = seg.bothOrder === 'ours' ? seg.ours : seg.theirs;
+      const second = seg.bothOrder === 'ours' ? seg.theirs : seg.ours;
+      out.push(`${first}\n${second}`);
+    } else if (seg.choice === 'edit') out.push(seg.editText);
+    else {
+      unresolved += 1;
+      // Re-emit the conflict markers so the file remains a valid
+      // conflict file if the user saves with unresolved hunks (we
+      // disable Save in that case, but be safe).
+      out.push(`<<<<<<< ${seg.oursLabel}`);
+      out.push(seg.ours);
+      if (seg.base !== null) {
+        out.push(`||||||| base`);
+        out.push(seg.base);
+      }
+      out.push(`=======`);
+      out.push(seg.theirs);
+      out.push(`>>>>>>> ${seg.theirsLabel}`);
+    }
+  }
+  return { text: out.join('\n'), unresolved };
+}
+
+function ResolveConflictSheet({
+  repoId,
+  path,
+}: {
+  repoId: UUID;
+  path: string;
+}): JSX.Element {
+  const setSheet = useStore((s) => s.setSheet);
+  const repo = useStore((s) => s.repos.find((r) => r.id === repoId));
+  const markResolved = useStore((s) => s.markResolved);
+  const pushToast = useStore((s) => s.pushToast);
+  const refreshStatus = useStore((s) => s.refreshRepoStatus);
+  const refreshChanges = useStore((s) => s.refreshRepoChanges);
+
+  const [raw, setRaw] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [parsed, setParsed] = useState<ParsedConflict | null>(null);
+  const [saving, setSaving] = useState(false);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const firstHunkRef = useRef<HTMLDivElement | null>(null);
+
+  // First *unresolved* hunk index — drives the auto-scroll on mount and
+  // the "Jump to next" button in the toolbar. Recomputed when the user
+  // makes a choice so "next" walks forward through the file.
+  const firstUnresolvedIdx = useMemo(() => {
+    if (!parsed) return -1;
+    for (const idx of parsed.hunkIndexes) {
+      const seg = parsed.segments[idx];
+      if (typeof seg === 'string') continue;
+      if (seg.choice === null) return idx;
+    }
+    return -1;
+  }, [parsed]);
+
+  // Scroll the first unresolved hunk into view once the file finishes
+  // parsing. Without this, large files (like the user's Java enum with
+  // thousands of context lines) would show the literal preamble and
+  // the conflict region would be way below the fold.
+  useEffect(() => {
+    if (!parsed || firstUnresolvedIdx < 0) return;
+    requestAnimationFrame(() => {
+      firstHunkRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    });
+  }, [parsed, firstUnresolvedIdx]);
+
+  // Resolve the absolute path the same way the editor does — repo root
+  // joined with the repo-relative path. fs:readFile expects the rel path.
+  useEffect(() => {
+    let cancelled = false;
+    setError(null);
+    setRaw(null);
+    setParsed(null);
+    void window.overgit
+      .invoke('fs:readFile', { repoId, path })
+      .then((res) => {
+        if (cancelled) return;
+        if (!res.ok) {
+          setError(res.error);
+          return;
+        }
+        setRaw(res.content);
+        setParsed(parseConflicts(res.content));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [repoId, path]);
+
+  const setHunkChoice = (idx: number, choice: ConflictHunk['choice']) => {
+    setParsed((cur) => {
+      if (!cur) return cur;
+      const next = { ...cur, segments: cur.segments.slice() };
+      const seg = next.segments[idx];
+      if (typeof seg === 'string') return cur;
+      const updated: ConflictHunk = { ...seg, choice };
+      // Seed the edit buffer when entering edit mode so the user has
+      // something to start from rather than an empty textarea.
+      if (choice === 'edit' && !seg.editText) {
+        updated.editText = seg.ours;
+      }
+      next.segments[idx] = updated;
+      return next;
+    });
+  };
+
+  const setHunkEdit = (idx: number, text: string) => {
+    setParsed((cur) => {
+      if (!cur) return cur;
+      const next = { ...cur, segments: cur.segments.slice() };
+      const seg = next.segments[idx];
+      if (typeof seg === 'string') return cur;
+      next.segments[idx] = { ...seg, editText: text };
+      return next;
+    });
+  };
+
+  const swapBothOrder = (idx: number) => {
+    setParsed((cur) => {
+      if (!cur) return cur;
+      const next = { ...cur, segments: cur.segments.slice() };
+      const seg = next.segments[idx];
+      if (typeof seg === 'string') return cur;
+      next.segments[idx] = {
+        ...seg,
+        bothOrder: seg.bothOrder === 'ours' ? 'theirs' : 'ours',
+      };
+      return next;
+    });
+  };
+
+  const onResolveAll = (side: 'ours' | 'theirs') => {
+    setParsed((cur) => {
+      if (!cur) return cur;
+      const next = { ...cur, segments: cur.segments.slice() };
+      for (const idx of cur.hunkIndexes) {
+        const seg = next.segments[idx];
+        if (typeof seg === 'string') continue;
+        next.segments[idx] = { ...seg, choice: side };
+      }
+      return next;
+    });
+  };
+
+  const summary = useMemo(() => {
+    if (!parsed) return { total: 0, resolved: 0 };
+    let resolved = 0;
+    for (const idx of parsed.hunkIndexes) {
+      const seg = parsed.segments[idx];
+      if (typeof seg === 'string') continue;
+      if (seg.choice !== null) resolved += 1;
+    }
+    return { total: parsed.hunkIndexes.length, resolved };
+  }, [parsed]);
+
+  const allResolved = parsed !== null && summary.resolved === summary.total && summary.total > 0;
+  const noConflicts = parsed !== null && summary.total === 0;
+
+  const onSave = async () => {
+    if (!parsed) return;
+    const { text, unresolved } = serializeResolution(parsed);
+    if (unresolved > 0) return;
+    setSaving(true);
+    try {
+      const writeRes = await window.overgit.invoke('fs:writeFile', {
+        repoId,
+        path,
+        content: text,
+      });
+      if (!writeRes.ok) {
+        pushToast({ kind: 'error', message: writeRes.error ?? 'Write failed' });
+        return;
+      }
+      const addRes = await markResolved(repoId, [path]);
+      if (!addRes.ok) {
+        pushToast({ kind: 'error', message: addRes.error ?? 'git add failed' });
+        return;
+      }
+      await Promise.all([refreshStatus(repoId), refreshChanges(repoId)]);
+      pushToast({ kind: 'success', message: `Resolved ${path}.` });
+      setSheet(null);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <>
+      <SheetHeader title={`Resolve conflicts — ${path}`} onClose={() => setSheet(null)} />
+      <div className="px-5 py-2 border-b border-card flex items-center gap-2 text-[11px]">
+        <span className="text-ink-muted">
+          {summary.total === 0
+            ? 'No conflict markers found in this file.'
+            : `${summary.resolved}/${summary.total} hunks resolved`}
+        </span>
+        <div className="ml-auto flex items-center gap-1">
+          <button
+            disabled={firstUnresolvedIdx < 0}
+            onClick={() =>
+              firstHunkRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+            }
+            className="px-2 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
+            title="Scroll to the next unresolved hunk"
+          >
+            Jump to next
+          </button>
+          <button
+            disabled={summary.total === 0}
+            onClick={() => onResolveAll('ours')}
+            className="px-2 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
+            title="Take HEAD's version for every hunk"
+          >
+            Take all ours
+          </button>
+          <button
+            disabled={summary.total === 0}
+            onClick={() => onResolveAll('theirs')}
+            className="px-2 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
+            title="Take the merging branch's version for every hunk"
+          >
+            Take all theirs
+          </button>
+        </div>
+      </div>
+      <div
+        ref={scrollRef}
+        className="flex-1 min-h-0 overflow-y-auto px-5 py-3 flex flex-col gap-2 font-mono text-[11px] leading-snug"
+      >
+        {error && (
+          <div className="px-3 py-2 rounded border border-red-500/30 bg-red-500/10 text-red-300 text-xs">
+            {error}
+          </div>
+        )}
+        {parsed && noConflicts && (
+          <div className="px-3 py-2 rounded border border-card bg-card text-xs text-ink-faint">
+            This file has no conflict markers. It may have been resolved already — close this
+            and click "Mark resolved" in the conflict banner.
+          </div>
+        )}
+        {parsed?.segments.map((seg, idx) => {
+          if (typeof seg === 'string') {
+            if (!seg) return null;
+            // Truncate context segments to 3 lines top + 3 lines bottom
+            // by default — the conflict hunk is what the user came here
+            // for, so we don't bury it under thousands of unrelated lines.
+            const isFirst = idx === 0;
+            const isLast = idx === (parsed?.segments.length ?? 0) - 1;
+            return (
+              <ContextSegment
+                key={`s-${idx}`}
+                text={seg}
+                showLeading={!isFirst}
+                showTrailing={!isLast}
+              />
+            );
+          }
+          return (
+            <ConflictHunkBlock
+              key={`h-${idx}`}
+              hunk={seg}
+              hunkRef={idx === firstUnresolvedIdx ? firstHunkRef : undefined}
+              onChoice={(c) => setHunkChoice(idx, c)}
+              onEdit={(t) => setHunkEdit(idx, t)}
+              onSwapBoth={() => swapBothOrder(idx)}
+            />
+          );
+        })}
+        {raw === null && !error && (
+          <div className="text-xs text-ink-faint">Loading file…</div>
+        )}
+      </div>
+      <div className="px-5 py-3 border-t border-card flex items-center justify-end gap-2">
+        <span className="text-[11px] text-ink-faint mr-auto truncate font-mono">
+          {repo?.path ? `${repo.path}/${path}` : path}
+        </span>
+        <button
+          onClick={() => setSheet(null)}
+          className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
+        >
+          Cancel
+        </button>
+        <button
+          disabled={!allResolved || saving}
+          onClick={onSave}
+          className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+        >
+          {saving ? 'Saving…' : 'Save & mark resolved'}
+        </button>
+      </div>
+    </>
+  );
+}
+
+/// Collapsed-by-default literal context around a conflict hunk.
+/// We show 3 lines on the leading edge and 3 lines on the trailing edge
+/// — adjacent to a hunk those lines are the most informative — and hide
+/// the middle behind an "Expand N lines" toggle. The first segment in
+/// the file gets only a trailing tail (nothing before it is "context"),
+/// and the last segment gets only a leading head.
+function ContextSegment({
+  text,
+  showLeading,
+  showTrailing,
+}: {
+  text: string;
+  showLeading: boolean;
+  showTrailing: boolean;
+}): JSX.Element {
+  const [expanded, setExpanded] = useState(false);
+  const lines = text.split('\n');
+  const CONTEXT = 3;
+  const head = showLeading ? lines.slice(0, CONTEXT) : [];
+  const tail = showTrailing ? lines.slice(-CONTEXT) : [];
+  const overlap = head.length + tail.length >= lines.length;
+  if (expanded || overlap) {
+    return (
+      <pre className="whitespace-pre-wrap text-ink-muted bg-card/40 px-3 py-2 rounded border border-card">
+        {text}
+      </pre>
+    );
+  }
+  const hidden = lines.length - head.length - tail.length;
+  return (
+    <div className="flex flex-col">
+      {head.length > 0 && (
+        <pre className="whitespace-pre-wrap text-ink-muted bg-card/40 px-3 py-2 rounded-t border border-b-0 border-card">
+          {head.join('\n')}
+        </pre>
+      )}
+      {hidden > 0 && (
+        <button
+          onClick={() => setExpanded(true)}
+          className="text-[10px] uppercase tracking-wide text-ink-faint hover:text-ink bg-card/30 hover:bg-card border-x border-card px-3 py-1 text-left"
+        >
+          ⤢ Expand {hidden} more {hidden === 1 ? 'line' : 'lines'}
+        </button>
+      )}
+      {tail.length > 0 && (
+        <pre className="whitespace-pre-wrap text-ink-muted bg-card/40 px-3 py-2 rounded-b border border-t-0 border-card">
+          {tail.join('\n')}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+function ConflictHunkBlock({
+  hunk,
+  hunkRef,
+  onChoice,
+  onEdit,
+  onSwapBoth,
+}: {
+  hunk: ConflictHunk;
+  hunkRef?: React.Ref<HTMLDivElement>;
+  onChoice: (c: ConflictHunk['choice']) => void;
+  onEdit: (t: string) => void;
+  onSwapBoth: () => void;
+}): JSX.Element {
+  const oursActive = hunk.choice === 'ours';
+  const theirsActive = hunk.choice === 'theirs';
+  const bothActive = hunk.choice === 'both';
+  const editActive = hunk.choice === 'edit';
+  const cls = (active: boolean) =>
+    `text-[10px] px-2 py-1 rounded border ${
+      active
+        ? 'border-accent bg-accent/15 text-ink'
+        : 'border-card hover:bg-card text-ink-muted'
+    }`;
+  // When Both is active, render the panes in the saved order so the
+  // numbered "1" / "2" badges and the visual reading order both match
+  // what will end up in the file. Default to ours-first.
+  const oursFirst = hunk.bothOrder === 'ours';
+  return (
+    <div
+      ref={hunkRef}
+      style={{ scrollMarginTop: 60 }}
+      className="rounded border-2 border-amber-500/40 bg-amber-500/[0.04] overflow-hidden shadow-lg"
+    >
+      <div className="flex items-center gap-1 px-2 py-1 border-b border-amber-500/30 bg-amber-500/10">
+        <span className="text-[10px] uppercase tracking-wide text-amber-300 font-sans font-semibold">
+          Conflict
+        </span>
+        <div className="ml-auto flex items-center gap-1">
+          <button onClick={() => onChoice('ours')} className={cls(oursActive)}>
+            Take ours
+          </button>
+          <button onClick={() => onChoice('theirs')} className={cls(theirsActive)}>
+            Take theirs
+          </button>
+          <button
+            onClick={() => onChoice('both')}
+            className={cls(bothActive)}
+            title="Keep both sides — concatenated in the chosen order"
+          >
+            Keep both
+          </button>
+          <button onClick={() => onChoice('edit')} className={cls(editActive)}>
+            Edit
+          </button>
+        </div>
+      </div>
+      {editActive ? (
+        <textarea
+          value={hunk.editText}
+          onChange={(e) => onEdit(e.target.value)}
+          rows={Math.max(3, Math.min(20, (hunk.editText.match(/\n/g)?.length ?? 0) + 1))}
+          className="w-full bg-surface-elevated px-3 py-2 outline-none resize-y font-mono text-[11px]"
+          placeholder="Edit the resolved text…"
+        />
+      ) : (
+        <>
+          {/* Side-by-side ours vs theirs. When `bothActive` we re-order
+              the panes so the leftmost pane is what's saved first; that
+              way the visual order matches the file order. The numbered
+              badges hammer it home for users skimming. */}
+          <div className="grid grid-cols-2 divide-x divide-amber-500/20">
+            {(oursFirst || !bothActive
+              ? (['ours', 'theirs'] as const)
+              : (['theirs', 'ours'] as const)
+            ).map((side) => {
+              const isOurs = side === 'ours';
+              const active = isOurs ? oursActive : theirsActive;
+              const tint = isOurs ? 'bg-emerald-500/[0.06]' : 'bg-sky-500/[0.06]';
+              const label = isOurs ? 'Ours' : 'Theirs';
+              const subLabel = isOurs ? hunk.oursLabel : hunk.theirsLabel;
+              const text = isOurs ? hunk.ours : hunk.theirs;
+              const labelTone = isOurs ? 'text-emerald-300' : 'text-sky-300';
+              const order = bothActive
+                ? side === (oursFirst ? 'ours' : 'theirs')
+                  ? 1
+                  : 2
+                : null;
+              return (
+                <div
+                  key={side}
+                  className={`p-3 ${active || bothActive ? tint : ''}`}
+                >
+                  <div className={`flex items-center gap-2 mb-1 ${labelTone}`}>
+                    {order !== null && (
+                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-card text-ink font-bold">
+                        {order}
+                      </span>
+                    )}
+                    <span className="text-[10px] uppercase tracking-wide font-sans">
+                      {label}
+                      {subLabel ? ` · ${subLabel}` : ''}
+                    </span>
+                  </div>
+                  <pre className="whitespace-pre-wrap text-ink">{text || '(empty)'}</pre>
+                </div>
+              );
+            })}
+          </div>
+          {bothActive && (
+            <div className="border-t border-amber-500/30 bg-amber-500/[0.06]">
+              <div className="flex items-center gap-2 px-3 py-1.5 border-b border-amber-500/20">
+                <span className="text-[10px] uppercase tracking-wide text-ink font-sans font-semibold">
+                  Result preview
+                </span>
+                <span className="text-[10px] text-ink-faint">
+                  Saved as: {oursFirst ? 'ours, then theirs' : 'theirs, then ours'}
+                </span>
+                <button
+                  onClick={onSwapBoth}
+                  className="ml-auto text-[10px] px-2 py-0.5 rounded border border-card hover:bg-card text-ink-muted"
+                  title="Swap the order — put the other side first"
+                >
+                  ⇄ Swap order
+                </button>
+              </div>
+              <pre className="whitespace-pre-wrap text-ink px-3 py-2 bg-surface-elevated/40">
+                {(() => {
+                  const first = oursFirst ? hunk.ours : hunk.theirs;
+                  const second = oursFirst ? hunk.theirs : hunk.ours;
+                  return `${first}\n${second}`;
+                })()}
+              </pre>
+            </div>
+          )}
+        </>
+      )}
+    </div>
   );
 }

@@ -9,6 +9,10 @@ interface Node {
   /// a reindex of `files`.
   key: string;
   isDir: boolean;
+  /// True for files explicitly listed by `git ls-files --ignored`, and
+  /// for directories whose every descendant is ignored. Drives the
+  /// "ignored" greyed-out style and the show/hide toggle.
+  ignored: boolean;
   children: Node[];
 }
 
@@ -23,6 +27,7 @@ export function FileTree({ repoId }: { repoId: UUID }): JSX.Element {
   const openFile = useStore((s) => s.openRepoFile);
 
   const [filter, setFilter] = useState('');
+  const [showIgnored, setShowIgnored] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set(['']));
 
   useEffect(() => {
@@ -30,26 +35,52 @@ export function FileTree({ repoId }: { repoId: UUID }): JSX.Element {
   }, [files, refresh, repoId]);
 
   const tree = useMemo(
-    () => buildTree(files ?? [], repo?.path ?? '', filter.trim().toLowerCase()),
-    [files, repo?.path, filter],
+    () =>
+      buildTree(
+        files ?? [],
+        repo?.path ?? '',
+        filter.trim().toLowerCase(),
+        showIgnored,
+      ),
+    [files, repo?.path, filter, showIgnored],
+  );
+
+  const ignoredCount = useMemo(
+    () => (files ?? []).filter((f) => f.ignored).length,
+    [files],
   );
 
   return (
     <div className="flex flex-col h-full min-h-0">
-      <div className="flex items-center gap-2 px-3 py-2 border-b border-card">
-        <input
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-          placeholder="Filter files"
-          className="field flex-1 px-2 py-1 text-xs"
-        />
-        <button
-          onClick={() => refresh(repoId)}
-          className="text-xs px-2 py-1 rounded text-ink-muted hover:text-ink hover:bg-card"
-          title="Reindex"
-        >
-          ↻
-        </button>
+      <div className="flex flex-col gap-1 px-3 py-2 border-b border-card">
+        <div className="flex items-center gap-2">
+          <input
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            placeholder="Filter files"
+            className="field flex-1 px-2 py-1 text-xs"
+          />
+          <button
+            onClick={() => refresh(repoId)}
+            className="text-xs px-2 py-1 rounded text-ink-muted hover:text-ink hover:bg-card"
+            title="Reindex"
+          >
+            ↻
+          </button>
+        </div>
+        {ignoredCount > 0 && (
+          <label className="flex items-center gap-1.5 text-[10px] text-ink-faint cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={showIgnored}
+              onChange={(e) => setShowIgnored(e.target.checked)}
+              className="cursor-pointer"
+            />
+            <span>
+              Show {ignoredCount} ignored {ignoredCount === 1 ? 'file' : 'files'}
+            </span>
+          </label>
+        )}
       </div>
       <div className="flex-1 overflow-y-auto py-1">
         {files == null ? (
@@ -84,11 +115,25 @@ export function FileTree({ repoId }: { repoId: UUID }): JSX.Element {
   );
 }
 
-function buildTree(files: string[], root: string, filter: string): Node {
+function buildTree(
+  files: Array<{ path: string; ignored: boolean }>,
+  root: string,
+  filter: string,
+  showIgnored: boolean,
+): Node {
   const sep = root.includes('\\') ? '\\' : '/';
   const rootTrim = root.endsWith(sep) ? root.slice(0, -1) : root;
-  const rootNode: Node = { name: '', fullPath: rootTrim, key: '', isDir: true, children: [] };
-  for (const full of files) {
+  const rootNode: Node = {
+    name: '',
+    fullPath: rootTrim,
+    key: '',
+    isDir: true,
+    ignored: false,
+    children: [],
+  };
+  for (const f of files) {
+    if (!showIgnored && f.ignored) continue;
+    const full = f.path;
     const rel = full.startsWith(rootTrim + sep) ? full.slice(rootTrim.length + sep.length) : full;
     if (filter && !rel.toLowerCase().includes(filter)) continue;
     const parts = rel.split(sep);
@@ -103,20 +148,44 @@ function buildTree(files: string[], root: string, filter: string): Node {
           fullPath: [cursor.fullPath, part].join(sep),
           key: parts.slice(0, i + 1).join('/'),
           isDir: !isLeaf,
+          // Leaves carry their own ignored flag; parent dirs start
+          // optimistic and are flipped to ignored below if every
+          // descendant is ignored.
+          ignored: isLeaf ? f.ignored : false,
           children: [],
         };
         cursor.children.push(child);
+      } else if (isLeaf) {
+        child.ignored = f.ignored;
       }
       cursor = child;
     }
   }
+  markFullyIgnoredDirs(rootNode);
   sortInPlace(rootNode);
   return rootNode;
 }
 
+/// Recursively flag a directory as `ignored` when every descendant file
+/// is ignored. Lets the renderer grey the whole folder rather than
+/// every file individually, which reads better for `node_modules` etc.
+function markFullyIgnoredDirs(node: Node): boolean {
+  if (!node.isDir) return node.ignored;
+  if (node.children.length === 0) return node.ignored;
+  let allIgnored = true;
+  for (const c of node.children) {
+    if (!markFullyIgnoredDirs(c)) allIgnored = false;
+  }
+  node.ignored = allIgnored;
+  return allIgnored;
+}
+
 function sortInPlace(node: Node): void {
   node.children.sort((a, b) => {
+    // Push ignored entries below their non-ignored siblings within the
+    // same kind (dir/file), so the user's "real" code reads first.
     if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+    if (a.ignored !== b.ignored) return a.ignored ? 1 : -1;
     return a.name.localeCompare(b.name);
   });
   for (const c of node.children) sortInPlace(c);
@@ -141,6 +210,7 @@ function TreeRow({
 }): JSX.Element {
   const isOpen = forceOpen || expanded.has(node.key);
   const selected = selectedPath === node.fullPath;
+  const ignoredTone = node.ignored ? 'opacity-50 italic' : '';
   if (!node.isDir) {
     return (
       <button
@@ -148,11 +218,16 @@ function TreeRow({
         style={{ paddingLeft: 8 + depth * 12 }}
         className={`w-full text-left flex items-center gap-1.5 py-0.5 rounded text-xs truncate ${
           selected ? 'bg-accent/20 text-ink' : 'text-ink-muted hover:bg-card hover:text-ink'
-        }`}
-        title={node.fullPath}
+        } ${ignoredTone}`}
+        title={node.ignored ? `${node.fullPath} — ignored by .gitignore` : node.fullPath}
       >
         <FileGlyph />
         <span className="truncate">{node.name}</span>
+        {node.ignored && (
+          <span className="ml-auto text-[9px] uppercase tracking-wide text-ink-faint shrink-0">
+            ignored
+          </span>
+        )}
       </button>
     );
   }
@@ -161,7 +236,8 @@ function TreeRow({
       <button
         onClick={() => toggle(node.key)}
         style={{ paddingLeft: 8 + depth * 12 }}
-        className="w-full text-left flex items-center gap-1.5 py-0.5 rounded text-xs text-ink-muted hover:bg-card hover:text-ink"
+        className={`w-full text-left flex items-center gap-1.5 py-0.5 rounded text-xs text-ink-muted hover:bg-card hover:text-ink ${ignoredTone}`}
+        title={node.ignored ? `${node.name} — every entry is ignored by .gitignore` : node.name}
       >
         <span
           className={`text-[9px] text-ink-faint flex-shrink-0 transition-transform ${
@@ -172,6 +248,11 @@ function TreeRow({
         </span>
         <FolderGlyph />
         <span className="truncate">{node.name}</span>
+        {node.ignored && (
+          <span className="ml-auto text-[9px] uppercase tracking-wide text-ink-faint shrink-0">
+            ignored
+          </span>
+        )}
       </button>
       {isOpen &&
         node.children.map((c) => (

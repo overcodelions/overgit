@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useStore } from './store';
 import type { BranchSummary, Commit, UUID } from '@shared/types';
 import { sanitizeBranchName } from '@shared/branch-name';
+import { Explain } from './Explain';
 
 interface Props {
   repoId: UUID;
@@ -19,7 +20,8 @@ interface Props {
 type Mode =
   | { kind: 'list' }
   | { kind: 'create' }
-  | { kind: 'cherryPickFrom'; branch: BranchSummary };
+  | { kind: 'cherryPickFrom'; branch: BranchSummary }
+  | { kind: 'rename'; branch: BranchSummary };
 
 /// Searchable branch picker popover. GitHub-Desktop-style: type to
 /// filter, arrow keys to move, Enter to switch. Branches are grouped
@@ -131,26 +133,76 @@ export function BranchPicker({ repoId, anchorRef, initialMode, onClose }: Props)
   const pullRepo = useStore((s) => s.pullRepo);
   const mergeBranchAction = useStore((s) => s.mergeBranch);
   const rebaseOntoAction = useStore((s) => s.rebaseOnto);
+  const renameBranchAction = useStore((s) => s.renameRepoBranch);
 
+  const dismissToast = useStore((s) => s.dismissToast);
   const onMerge = async (b: BranchSummary) => {
-    const target = b.kind === 'remote' ? b.name : b.shortName;
+    // Prefer the upstream tracking ref when a local branch has one. The
+    // trunk-distance pill compares against `origin/<branch>`, so merging
+    // local `master` (which the user hasn't pulled) silently no-ops while
+    // the pill still says "14 behind master". Merging the upstream
+    // matches what the user is reading on screen.
+    const target =
+      b.kind === 'remote' ? b.name : b.upstream ?? b.shortName;
+    const targetLabel =
+      b.kind === 'local' && b.upstream && b.upstream !== b.shortName
+        ? `${b.shortName} (via ${b.upstream})`
+        : target;
+    const into = status?.branch ?? 'current branch';
     // Default to a regular merge (creates a merge commit). FF-only
     // and squash can be added as a sub-menu in a future pass — most
     // common case is just "merge X in", and conflicts get caught by
     // the in-progress banner in the Changes tab.
     const ok = await requestConfirm({
-      title: `Merge ${target}?`,
-      body: `Merge ${target} into the current branch?\n\nIf there are conflicts you'll see a banner in the Changes tab with Resolve / Abort options.`,
+      title: `Merge ${b.shortName}?`,
+      body: `Merge ${targetLabel} into ${into}?\n\nIf there are conflicts you'll see a banner in the Changes tab with Resolve / Abort options.`,
       confirmLabel: 'Merge',
     });
     if (!ok) return;
     setBusy(true);
+    // Sticky "in progress" toast — bridges the gap between dialog close
+    // and the success/error toast so the user can see the merge is
+    // running. Dismissed before we push the final outcome.
+    const pendingId = pushToast({
+      kind: 'info',
+      message: `Merging ${target} into ${into}…`,
+      sticky: true,
+    });
     try {
       const res = await mergeBranchAction(repoId, target, 'merge');
+      dismissToast(pendingId);
       if (!res.ok) {
         pushToast({ kind: 'error', message: res.error ?? 'Merge failed' });
+      } else if (res.alreadyUpToDate) {
+        pushToast({
+          kind: 'info',
+          message: `Already up to date — ${into} already contains every commit on ${target}.`,
+        });
+      } else {
+        pushToast({ kind: 'success', message: `Merged ${target} into ${into}.` });
       }
       onClose();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onRename = async (b: BranchSummary, next: string) => {
+    setBusy(true);
+    try {
+      // Branch picker only ever renames local branches (the rename
+      // affordance is hidden on remote rows). For the *current* branch
+      // we pass `null` so git renames HEAD's branch directly — equivalent
+      // but avoids an explicit `<from>` arg.
+      const from = b.isCurrent ? null : b.shortName;
+      const res = await renameBranchAction(repoId, from, next, false);
+      if (!res.ok) {
+        pushToast({ kind: 'error', message: res.error ?? 'Rename failed' });
+        return false;
+      }
+      await refresh(repoId);
+      await refreshBranches(repoId);
+      return true;
     } finally {
       setBusy(false);
     }
@@ -262,6 +314,7 @@ export function BranchPicker({ repoId, anchorRef, initialMode, onClose }: Props)
             setMode({ kind: 'create' });
           }}
           onCherryPickFrom={(b) => setMode({ kind: 'cherryPickFrom', branch: b })}
+          onRenameBranch={(b) => setMode({ kind: 'rename', branch: b })}
           onMerge={onMerge}
           onRebase={onRebase}
           currentBranchLabel={status?.branch ?? null}
@@ -284,6 +337,18 @@ export function BranchPicker({ repoId, anchorRef, initialMode, onClose }: Props)
           onClose={onClose}
         />
       )}
+      {mode.kind === 'rename' && (
+        <RenameMode
+          inputRef={inputRef}
+          busy={busy}
+          branch={mode.branch}
+          onCancel={() => setMode({ kind: 'list' })}
+          onSubmit={async (next) => {
+            const ok = await onRename(mode.branch, next);
+            if (ok) setMode({ kind: 'list' });
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -300,6 +365,7 @@ function ListMode({
   onSwitch,
   onStartCreate,
   onCherryPickFrom,
+  onRenameBranch,
   onMerge,
   onRebase,
   currentBranchLabel,
@@ -315,6 +381,7 @@ function ListMode({
   onSwitch: (b: BranchSummary) => void;
   onStartCreate: () => void;
   onCherryPickFrom: (b: BranchSummary) => void;
+  onRenameBranch: (b: BranchSummary) => void;
   onMerge: (b: BranchSummary) => void;
   onRebase: (b: BranchSummary) => void;
   currentBranchLabel: string | null;
@@ -365,6 +432,7 @@ function ListMode({
                     onSelect={() => onSwitch(b)}
                     onHover={() => setActiveIdx(idx)}
                     onCherryPickFrom={() => onCherryPickFrom(b)}
+                    onRenameBranch={() => onRenameBranch(b)}
                     onMerge={() => onMerge(b)}
                     onRebase={() => onRebase(b)}
                   />
@@ -375,12 +443,17 @@ function ListMode({
         )}
       </div>
       <div className="border-t border-card p-2 flex items-center justify-between gap-2 text-[11px]">
-        <button
-          onClick={onStartCreate}
-          className="text-ink-muted hover:text-ink rounded px-2 py-1 hover:bg-card"
+        <Explain
+          command="git checkout -b <new-branch>"
+          plain="Create a new branch starting from your current commit and switch to it."
         >
-          + Create branch
-        </button>
+          <button
+            onClick={onStartCreate}
+            className="text-ink-muted hover:text-ink rounded px-2 py-1 hover:bg-card"
+          >
+            + Create branch
+          </button>
+        </Explain>
         <span className="text-ink-faint">
           ↑↓ to move · Enter to switch · Esc to close
         </span>
@@ -396,6 +469,7 @@ function BranchRow({
   onSelect,
   onHover,
   onCherryPickFrom,
+  onRenameBranch,
   onMerge,
   onRebase,
 }: {
@@ -405,6 +479,7 @@ function BranchRow({
   onSelect: () => void;
   onHover: () => void;
   onCherryPickFrom: () => void;
+  onRenameBranch: () => void;
   onMerge: () => void;
   onRebase: () => void;
 }): JSX.Element {
@@ -413,6 +488,9 @@ function BranchRow({
   // self is always a no-op. We hide both actions for the current row
   // so the affordance stays meaningful.
   const showMergeRebase = !branch.isCurrent;
+  // Rename only applies to local branches — `git branch -m` doesn't
+  // rename remote-tracking refs, that requires renaming server-side.
+  const showRename = branch.kind === 'local';
   return (
     <div
       onMouseEnter={onHover}
@@ -420,6 +498,20 @@ function BranchRow({
         active ? 'bg-accent/15' : ''
       }`}
     >
+      <Explain
+        command={
+          branch.kind === 'remote'
+            ? `git checkout ${branch.shortName}`
+            : `git checkout ${branch.shortName}`
+        }
+        plain={
+          branch.isCurrent
+            ? `You are already on ${branch.shortName}.`
+            : branch.kind === 'remote'
+              ? `Switch to ${branch.shortName} — creates a local branch tracking this remote.`
+              : `Switch HEAD to ${branch.shortName}. Your working tree updates to match.`
+        }
+      >
       <button
         disabled={busy}
         onClick={onSelect}
@@ -449,6 +541,7 @@ function BranchRow({
           <span className="ml-auto whitespace-nowrap">{relativeTime(branch.date)}</span>
         </div>
       </button>
+      </Explain>
       <div
         className={`flex gap-1 transition-opacity ${
           active ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
@@ -456,38 +549,70 @@ function BranchRow({
       >
         {showMergeRebase && (
           <>
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onMerge();
-              }}
-              className="text-[10px] px-1.5 py-1 rounded border border-card hover:bg-card"
-              title={`Merge ${branch.shortName} into current branch`}
+            <Explain
+              command={`git merge ${branch.shortName}`}
+              plain={`Bring commits from ${branch.shortName} into your current branch as a merge commit.`}
             >
-              Merge
-            </button>
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onRebase();
-              }}
-              className="text-[10px] px-1.5 py-1 rounded border border-card hover:bg-card"
-              title={`Rebase current branch onto ${branch.shortName}`}
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onMerge();
+                }}
+                className="text-[10px] px-1.5 py-1 rounded border border-card hover:bg-card"
+                title={`Merge ${branch.shortName} into current branch`}
+              >
+                Merge
+              </button>
+            </Explain>
+            <Explain
+              command={`git rebase ${branch.shortName}`}
+              plain={`Replay your current branch's commits on top of ${branch.shortName}. Rewrites history.`}
             >
-              Rebase
-            </button>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onRebase();
+                }}
+                className="text-[10px] px-1.5 py-1 rounded border border-card hover:bg-card"
+                title={`Rebase current branch onto ${branch.shortName}`}
+              >
+                Rebase
+              </button>
+            </Explain>
           </>
         )}
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onCherryPickFrom();
-          }}
-          className="text-[10px] px-1.5 py-1 rounded border border-card hover:bg-card"
-          title={`Cherry-pick commits from ${branch.shortName}`}
+        {showRename && (
+          <Explain
+            command={`git branch -m ${branch.shortName} <new-name>`}
+            plain={`Rename ${branch.shortName} in place. The branch keeps its history.`}
+          >
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onRenameBranch();
+              }}
+              className="text-[10px] px-1.5 py-1 rounded border border-card hover:bg-card"
+              title={`Rename ${branch.shortName}`}
+            >
+              Rename
+            </button>
+          </Explain>
+        )}
+        <Explain
+          command={`git cherry-pick <commit>`}
+          plain={`Pick individual commits from ${branch.shortName} to copy onto your current branch.`}
         >
-          ⋯
-        </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onCherryPickFrom();
+            }}
+            className="text-[10px] px-1.5 py-1 rounded border border-card hover:bg-card"
+            title={`Cherry-pick commits from ${branch.shortName}`}
+          >
+            ⋯
+          </button>
+        </Explain>
       </div>
     </div>
   );
@@ -596,6 +721,79 @@ function CreateMode({
           className="text-xs px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
         >
           {busy ? 'Working…' : 'Create & switch'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function RenameMode({
+  inputRef,
+  busy,
+  branch,
+  onCancel,
+  onSubmit,
+}: {
+  inputRef: React.RefObject<HTMLInputElement>;
+  busy: boolean;
+  branch: BranchSummary;
+  onCancel: () => void;
+  onSubmit: (next: string) => void;
+}): JSX.Element {
+  const [name, setName] = useState(branch.shortName);
+  const sanitized = useMemo(() => sanitizeBranchName(name), [name]);
+  const unchanged = sanitized.value === branch.shortName;
+  const submit = () => {
+    if (!sanitized.value || sanitized.error || unchanged) return;
+    onSubmit(sanitized.value);
+  };
+  return (
+    <div className="p-3 flex flex-col gap-2">
+      <div className="text-[10px] uppercase tracking-wide text-ink-faint">
+        Rename branch
+      </div>
+      <div className="text-[11px] text-ink-muted">
+        From <span className="font-mono text-ink">{branch.shortName}</span>
+      </div>
+      <input
+        ref={inputRef}
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        disabled={busy}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') submit();
+          else if (e.key === 'Escape') onCancel();
+        }}
+        placeholder="new-branch-name"
+        className="field px-2 py-1.5 text-xs"
+      />
+      {name.trim() && sanitized.error ? (
+        <div className="text-[11px] text-red-400">{sanitized.error}</div>
+      ) : (
+        sanitized.changed && !unchanged && (
+          <div className="text-[11px] text-amber-300">
+            Will rename to <span className="font-mono">{sanitized.value}</span>
+          </div>
+        )
+      )}
+      <div className="text-[10px] text-ink-faint">
+        Local rename only — if this branch tracks a remote, the upstream
+        ref keeps its old name until you push and reset the upstream.
+      </div>
+      <div className="flex gap-2 justify-end">
+        <button
+          onClick={onCancel}
+          disabled={busy}
+          className="text-xs px-2.5 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
+        >
+          Back
+        </button>
+        <button
+          disabled={busy || !sanitized.value || !!sanitized.error || unchanged}
+          onClick={submit}
+          className="text-xs px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+        >
+          {busy ? 'Renaming…' : 'Rename'}
         </button>
       </div>
     </div>

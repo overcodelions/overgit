@@ -1305,16 +1305,87 @@ export async function mergeBranch(
   repoPath: string,
   branch: string,
   mode: 'merge' | 'ff-only' | 'squash',
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; error?: string; output?: string; alreadyUpToDate?: boolean }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
   if (!branch || /[\s;|`$]/.test(branch)) {
     return { ok: false, error: `Refusing to merge "${branch}"` };
   }
   const flag =
     mode === 'merge' ? '--no-ff' : mode === 'ff-only' ? '--ff-only' : '--squash';
-  const res = await run(repoPath, ['merge', flag, branch]);
+  // `--no-edit` keeps git from spawning an editor for the default merge
+  // commit message — Electron child processes have no TTY, so the editor
+  // would either hang or silently fail. Belt-and-suspenders: also pin
+  // GIT_MERGE_AUTOEDIT=no so any older git that ignores --no-edit still
+  // takes the default message.
+  const args =
+    mode === 'squash' ? ['merge', flag, branch] : ['merge', flag, '--no-edit', branch];
+  const res = await run(repoPath, args, { GIT_MERGE_AUTOEDIT: 'no' });
+  const output = (res.stdout + res.stderr).trim();
+  if (res.ok) {
+    const alreadyUpToDate = /already up[\s-]?to[\s-]?date/i.test(output);
+    return { ok: true, output, alreadyUpToDate };
+  }
+  return { ok: false, error: res.stderr.trim() || `git merge exited ${res.code}`, output };
+}
+
+/// Resolve a conflicted path by checking out one side wholesale and
+/// staging the result. Mirrors `git checkout --ours/--theirs <path>`
+/// followed by `git add <path>`.
+export async function resolveConflictSide(
+  repoPath: string,
+  path: string,
+  side: 'ours' | 'theirs',
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  if (!path.trim()) return { ok: false, error: 'Path required' };
+  const flag = side === 'ours' ? '--ours' : '--theirs';
+  const co = await run(repoPath, ['checkout', flag, '--', path]);
+  if (!co.ok) {
+    return { ok: false, error: co.stderr.trim() || `git checkout ${flag} exited ${co.code}` };
+  }
+  const add = await run(repoPath, ['add', '--', path]);
+  if (!add.ok) {
+    return { ok: false, error: add.stderr.trim() || `git add exited ${add.code}` };
+  }
+  return { ok: true };
+}
+
+/// Read `.git/MERGE_MSG`. Returns `message: null` (not an error) when
+/// the file doesn't exist — that's the no-merge-in-progress state.
+export async function readMergeMsg(
+  repoPath: string,
+): Promise<{ ok: boolean; message: string | null; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, message: null, error: 'Not a git repo' };
+  // `git rev-parse --git-path MERGE_MSG` resolves through worktrees and
+  // submodules — preferable to hardcoding `<repo>/.git/MERGE_MSG`.
+  const pathRes = await run(repoPath, ['rev-parse', '--git-path', 'MERGE_MSG']);
+  if (!pathRes.ok) return { ok: true, message: null };
+  const fp = pathRes.stdout.trim();
+  if (!fp) return { ok: true, message: null };
+  try {
+    const fs = await import('node:fs/promises');
+    const buf = await fs.readFile(fp, 'utf8');
+    return { ok: true, message: buf };
+  } catch {
+    return { ok: true, message: null };
+  }
+}
+
+/// Finalize an in-progress merge: `git commit --no-edit` uses MERGE_MSG
+/// as written. When the user supplied a custom message we pass `-m`
+/// instead so their text wins.
+export async function commitMerge(
+  repoPath: string,
+  message: string | null,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  const args =
+    message && message.trim()
+      ? ['commit', '-m', message]
+      : ['commit', '--no-edit'];
+  const res = await run(repoPath, args, { GIT_EDITOR: 'true' });
   if (res.ok) return { ok: true };
-  return { ok: false, error: res.stderr.trim() || `git merge exited ${res.code}` };
+  return { ok: false, error: res.stderr.trim() || `git commit exited ${res.code}` };
 }
 
 export async function abortMerge(
@@ -1975,6 +2046,27 @@ export async function deleteBranch(
   if (!name.trim()) return { ok: false, error: 'Branch name required' };
   const flag = force ? '-D' : '-d';
   const res = await run(repoPath, ['branch', flag, name.trim()]);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git branch exited ${res.code}` };
+}
+
+/// Rename a branch in place. `force` switches `-m` to `-M` so git will
+/// overwrite an existing ref of the new name. When `from` is omitted git
+/// renames the current branch.
+export async function renameBranch(
+  repoPath: string,
+  newName: string,
+  from: string | null,
+  force: boolean,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  const target = newName.trim();
+  if (!target) return { ok: false, error: 'New branch name required' };
+  const flag = force ? '-M' : '-m';
+  const args = ['branch', flag];
+  if (from && from.trim()) args.push(from.trim());
+  args.push(target);
+  const res = await run(repoPath, args);
   if (res.ok) return { ok: true };
   return { ok: false, error: res.stderr.trim() || `git branch exited ${res.code}` };
 }
