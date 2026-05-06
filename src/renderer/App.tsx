@@ -139,14 +139,14 @@ function ConfirmHost(): JSX.Element | null {
         if (e.target === e.currentTarget) onCancel();
       }}
     >
-      <div className="bg-surface-elevated border border-card rounded-lg shadow-2xl w-[440px] max-w-[92vw] overflow-hidden">
-        <div className="px-5 py-3 border-b border-card">
+      <div className="bg-surface-elevated border border-card rounded-lg shadow-2xl w-[440px] max-w-[92vw] max-h-[85vh] flex flex-col overflow-hidden">
+        <div className="px-5 py-3 border-b border-card flex-shrink-0">
           <h2 className="text-sm font-semibold">{pending.title}</h2>
         </div>
-        <div className="px-5 py-4 text-[13px] text-ink-muted whitespace-pre-wrap">
+        <div className="px-5 py-4 text-[13px] text-ink-muted whitespace-pre-wrap overflow-y-auto flex-1 min-h-0">
           {pending.body}
         </div>
-        <div className="px-5 py-3 border-t border-card flex justify-end gap-2">
+        <div className="px-5 py-3 border-t border-card flex justify-end gap-2 flex-shrink-0">
           <button
             onClick={onCancel}
             className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
@@ -185,16 +185,29 @@ function ToastHost(): JSX.Element | null {
     error: 'bg-red-500/15 border-red-500/30 text-red-200',
   };
   return (
-    <div className="fixed bottom-4 right-4 z-[55] flex flex-col gap-2 w-[360px] max-w-[80vw] pointer-events-none">
+    <div className="fixed bottom-4 right-4 z-[55] flex flex-col gap-2 w-[420px] max-w-[80vw] pointer-events-none">
       {toasts.map((t) => (
-        <button
+        <div
           key={t.id}
-          onClick={() => dismiss(t.id)}
-          className={`pointer-events-auto text-left text-xs px-3 py-2 rounded border shadow-lg whitespace-pre-wrap ${tone[t.kind] ?? tone.info}`}
-          title="Click to dismiss"
+          className={`pointer-events-auto text-xs rounded border shadow-lg overflow-hidden ${tone[t.kind] ?? tone.info}`}
         >
-          {t.message}
-        </button>
+          <button
+            onClick={() => dismiss(t.id)}
+            className="block w-full text-left px-3 py-2 whitespace-pre-wrap hover:bg-black/10"
+            title="Click to dismiss"
+          >
+            {t.message}
+          </button>
+          {t.details && t.details.length > 0 && (
+            <ul className="border-t border-current/20 max-h-[40vh] overflow-y-auto px-3 py-1.5 font-mono text-[11px] leading-relaxed bg-black/15">
+              {t.details.map((d, i) => (
+                <li key={i} className="py-0.5 break-words">
+                  {d}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       ))}
     </div>
   );
@@ -1231,6 +1244,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
   const archiveWs = useStore((s) => s.archiveWorkspace);
   const requestConfirm = useStore((s) => s.requestConfirm);
   const pushToast = useStore((s) => s.pushToast);
+  const dismissToast = useStore((s) => s.dismissToast);
 
   const [busy, setBusy] = useState(false);
   const [view, setView] = useState<'overview' | 'commit'>('overview');
@@ -1501,10 +1515,35 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
             confirmLabel: 'Reset & archive',
           });
           if (!ok) return;
-          const outcomes = await window.overgit.invoke(
-            'workspace:resetToDefault',
-            workspaceId,
-          );
+          // Long-running per-repo loop (fetch + checkout + pull on each
+          // member can run 10–60s on a big workset). Two visible signals:
+          // a sticky "in progress" toast that's globally visible, plus
+          // the Archive button's own busy spinner. Without these, the
+          // confirm modal closes and the user sees no movement until
+          // archiveWs runs and the view disappears.
+          const progressId = pushToast({
+            kind: 'info',
+            sticky: true,
+            message: `Resetting ${memberCount} ${memberCount === 1 ? 'repo' : 'repos'} to default — fetching, switching, pulling…`,
+          });
+          let outcomes;
+          try {
+            outcomes = await window.overgit.invoke(
+              'workspace:resetToDefault',
+              workspaceId,
+            );
+          } catch (err) {
+            dismissToast(progressId);
+            pushToast({
+              kind: 'error',
+              message: `Reset failed: ${
+                err instanceof Error ? err.message : String(err)
+              }. Workset not archived — restart the app if you just updated.`,
+              sticky: true,
+            });
+            return;
+          }
+          dismissToast(progressId);
           const failed = outcomes.filter((o) => o.result !== 'reset');
           if (failed.length > 0) {
             const summaryStr = failed
@@ -2242,8 +2281,9 @@ function LifecycleStepper({
   boundBranch: string | null;
   onBoundBranchCount: number;
   summary: { dirty: number; ahead: number; loaded: number };
-  onArchive: () => void;
+  onArchive: () => Promise<void> | void;
 }): JSX.Element {
+  const [archiving, setArchiving] = useState(false);
   const branchMet =
     boundBranch !== null &&
     summary.loaded > 0 &&
@@ -2279,20 +2319,38 @@ function LifecycleStepper({
       <Step label="Push" met={pushMet} hint={pushHint} />
       <StepConnector met={canArchive} />
       <button
-        onClick={onArchive}
-        disabled={!canArchive}
+        onClick={async () => {
+          if (archiving) return;
+          setArchiving(true);
+          try {
+            await onArchive();
+          } finally {
+            setArchiving(false);
+          }
+        }}
+        disabled={!canArchive || archiving}
         title={
-          canArchive
-            ? 'Archive — hide this workset from the active list (reversible)'
-            : 'Branch, commit, and push everywhere before archiving'
+          archiving
+            ? 'Resetting members to default and archiving…'
+            : canArchive
+              ? 'Archive — reset every member to default with a fresh pull, then hide from the active list (reversible)'
+              : 'Branch, commit, and push everywhere before archiving'
         }
-        className={`text-xs px-3 py-1.5 rounded font-medium ${
-          canArchive
-            ? 'bg-emerald-600 text-white hover:bg-emerald-500'
-            : 'bg-card text-ink-faint cursor-not-allowed'
+        className={`text-xs px-3 py-1.5 rounded font-medium inline-flex items-center gap-1.5 ${
+          archiving
+            ? 'bg-emerald-600/70 text-white cursor-wait'
+            : canArchive
+              ? 'bg-emerald-600 text-white hover:bg-emerald-500'
+              : 'bg-card text-ink-faint cursor-not-allowed'
         }`}
       >
-        Archive
+        {archiving && (
+          <svg width="11" height="11" viewBox="0 0 24 24" className="animate-spin" aria-hidden>
+            <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" opacity="0.25" fill="none" />
+            <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" strokeWidth="3" fill="none" strokeLinecap="round" />
+          </svg>
+        )}
+        <span>{archiving ? 'Archiving…' : 'Archive'}</span>
       </button>
     </section>
   );

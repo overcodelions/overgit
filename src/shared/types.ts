@@ -355,6 +355,46 @@ export interface BranchSummary {
   upstream: string | null;
 }
 
+/// A local branch that is likely safe to delete. The Prune sheet
+/// surfaces these so the user can review-then-sweep instead of running
+/// `git branch -d` per branch. `reasons` is an array (not a single
+/// enum) because a branch can carry several signals at once — e.g. a
+/// PR that was squash-merged AND had its remote branch deleted will
+/// show both `squashed` and `gone`. Surfacing every match helps the
+/// user trust the suggestion.
+///
+/// Reasons:
+///   - `merged`   — fully merged into the default branch (ancestor).
+///   - `gone`     — local upstream tracking ref no longer exists on
+///                  the remote.
+///   - `squashed` — every commit's patch-id is present on the default
+///                  branch, even though git records no parent edge —
+///                  i.e. the branch was squash-merged via PR.
+export interface BranchPruneCandidate {
+  name: string;
+  sha: string;
+  shortSha: string;
+  subject: string;
+  reasons: ('gone' | 'merged' | 'squashed')[];
+  upstream: string | null;
+}
+
+/// Advisory link from a local branch tip to the commit on the default
+/// branch that absorbed its work via a squash merge. Used by the
+/// History graph to draw a dashed connector — git itself records no
+/// parent edge for squash merges, so without this the orphan tip just
+/// dead-ends. `absorbingSha` may be null when patch-id matching can't
+/// pin down a single commit (e.g. the squash had whitespace fixes or
+/// conflict resolution); in that case `trunkTipSha` is the visual
+/// fallback so the connector still draws — anchored at the trunk's
+/// current tip rather than the exact absorbing commit.
+export interface SquashMergeLink {
+  branchName: string;
+  branchSha: string;
+  absorbingSha: string | null;
+  trunkTipSha: string | null;
+}
+
 /// One commit row in the project's branch visualization. `lane` and
 /// `parentLanes` come from a greedy stripe layout in main, so the
 /// renderer just draws lines between (lane, row) pairs. We carry
@@ -514,6 +554,18 @@ export interface IPCInvokeMap {
     from?: string;
   }) => { ok: boolean; error?: string };
   'repo:deleteBranch': (args: { repoId: UUID; name: string; force: boolean }) => { ok: boolean; error?: string };
+  /// Fast prune scan — gone-upstream and merged-into-default only.
+  /// Squash-merged branches are detected by `repo:pruneSquashCandidates`
+  /// and merged into the panel separately so the user doesn't have to
+  /// wait on patch-id work to start reviewing the obvious candidates.
+  'repo:pruneCandidates': (args: { repoId: UUID }) => BranchPruneCandidate[];
+  /// Slow companion: squash-merged branches via patch-id equivalence.
+  /// Returns the same shape so the renderer can merge results.
+  'repo:pruneSquashCandidates': (args: { repoId: UUID }) => BranchPruneCandidate[];
+  /// Advisory squash-merge links for the History graph: branch tip →
+  /// absorbing commit on default. Used to draw dashed connectors and
+  /// fade orphan branch tips that were absorbed by a PR squash merge.
+  'repo:squashMergeLinks': (args: { repoId: UUID }) => SquashMergeLink[];
   /// Rename a branch via `git branch -m` (or `-M` when `force`).
   /// `from === null` renames the current branch.
   'repo:renameBranch': (args: {

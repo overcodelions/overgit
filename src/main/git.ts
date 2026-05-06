@@ -11,6 +11,7 @@ import {
   BlameLine,
   ChangedFile,
   CheckoutOutcome,
+  BranchPruneCandidate,
   Commit,
   FileDiff,
   FileLogCommit,
@@ -91,6 +92,65 @@ function run(
 // that an open-ended wait is fine, but `fetch`/`pull`/`push` can hang on
 // a stalled remote, a slow auth prompt, or a tarpitting host.
 const NETWORK_TIMEOUT_MS = 90_000;
+
+/// Bounded `Promise.all`. Run `fn` over `items` with at most `limit`
+/// invocations in flight. Used by the squash-merge detector so a repo
+/// with hundreds of stale branches doesn't fan out hundreds of `git`
+/// processes simultaneously and pin the IPC bus.
+async function mapBounded<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const work = async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i]);
+    }
+  };
+  const workers: Promise<void>[] = [];
+  const n = Math.min(limit, items.length);
+  for (let i = 0; i < n; i += 1) workers.push(work());
+  await Promise.all(workers);
+  return results;
+}
+
+/// Run `git <args>` with a string fed to stdin. Used by the squash-merge
+/// detector so we can pipe `git log -p` output into `git patch-id`
+/// without going through a shell (no quoting, no injection surface).
+function runWithInput(cwd: string, args: string[], input: string): Promise<RunResult> {
+  return new Promise((resolve) => {
+    const child = spawn('git', args, { cwd, env: process.env });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const done = (r: RunResult) => {
+      if (settled) return;
+      settled = true;
+      resolve(r);
+    };
+    child.stdout.on('data', (b) => {
+      stdout += b.toString('utf8');
+    });
+    child.stderr.on('data', (b) => {
+      stderr += b.toString('utf8');
+    });
+    child.on('close', (code) => {
+      done({ ok: code === 0, stdout, stderr, code });
+    });
+    child.on('error', (err) => {
+      done({ ok: false, stdout, stderr: stderr || String(err), code: null });
+    });
+    child.stdin.on('error', () => {
+      // patch-id can close stdin early on malformed input; swallow EPIPE
+      // and let the close handler report the real exit status.
+    });
+    child.stdin.end(input);
+  });
+}
 
 /// Build the env override that pins author + committer for a single
 /// `git commit`. Returns undefined when no identity is supplied so
@@ -2048,6 +2108,435 @@ export async function deleteBranch(
   const res = await run(repoPath, ['branch', flag, name.trim()]);
   if (res.ok) return { ok: true };
   return { ok: false, error: res.stderr.trim() || `git branch exited ${res.code}` };
+}
+
+/// Detect local branches whose work was squash-merged into the default
+/// branch. Squash merges produce a single commit on default whose only
+/// parent is default's previous tip — there is no graph edge back to
+/// the source branch, so `--merged` (ancestor-based) silently misses
+/// them. We instead use git's patch-id equivalence:
+///
+///   1. For each local branch find merge-base with the trunk and run
+///      `git cherry trunk branch`. A line prefixed `-` means that
+///      commit's patch-id is already in the upstream — i.e. its work
+///      landed there. If every commit on the branch is `-`, the branch
+///      was fully absorbed (squash merge or rebase-and-merge).
+///   2. Bulk-compute patch-ids for the trunk's first-parent chain since
+///      the oldest candidate merge-base, in one `git log -p | git
+///      patch-id` pipe.
+///   3. For each candidate compute the patch-id of its full diff
+///      against the merge-base and look it up in the bulk map. The
+///      match is the absorbing commit on trunk.
+///
+/// `includeAbsorbing` controls whether step 3 runs. The Prune panel
+/// only needs the names (skip step 3, much faster); the graph wants
+/// the absorbing SHAs to draw advisory lines.
+///
+/// `skipBranches` lets the caller hand in a pre-computed exclusion set
+/// (current branch, default, worktree-checked-out, already-merged).
+/// Skipping already-merged branches in particular saves a `git cherry`
+/// per branch — they're handled by the ancestor-based `--merged` path
+/// and adding squash detection on top of that is pure waste.
+async function detectSquashMerges(
+  repoPath: string,
+  defaultBranch: string | null,
+  options?: { includeAbsorbing?: boolean; skipBranches?: Set<string> },
+): Promise<{
+  branchName: string;
+  branchSha: string;
+  absorbingSha: string | null;
+  trunkTipSha: string | null;
+}[]> {
+  if (!defaultBranch) return [];
+
+  // Resolve trunk: prefer the remote tracking ref because the local
+  // default branch can lag behind by however many times the user
+  // forgot to pull.
+  let trunkRef: string | null = null;
+  let trunkTipSha: string | null = null;
+  for (const ref of [`origin/${defaultBranch}`, defaultBranch]) {
+    const r = await run(repoPath, ['rev-parse', '--verify', ref]);
+    if (r.ok) {
+      trunkRef = ref;
+      trunkTipSha = r.stdout.trim() || null;
+      break;
+    }
+  }
+  if (!trunkRef) return [];
+
+  // List local branches with their tip SHAs in one shot.
+  const SEP = '\x1f';
+  const localsRes = await run(repoPath, [
+    'for-each-ref',
+    `--format=%(refname:short)${SEP}%(objectname)`,
+    'refs/heads',
+  ]);
+  if (!localsRes.ok) return [];
+
+  // Filter the branch list before we run any per-branch git work —
+  // every entry skipped here is two fewer subprocess spawns. Critical
+  // for repos with hundreds of stale branches; squash detection used
+  // to fan out an O(N) sequential pile of `git merge-base`+`git cherry`
+  // calls and dominate the prune flow.
+  const skip = options?.skipBranches ?? new Set<string>();
+  const branches: { name: string; sha: string }[] = [];
+  for (const line of localsRes.stdout.split('\n')) {
+    if (!line) continue;
+    const [name, sha] = line.split(SEP);
+    if (!name || !sha) continue;
+    if (name === defaultBranch) continue;
+    if (skip.has(name)) continue;
+    branches.push({ name, sha });
+  }
+  if (branches.length === 0) return [];
+
+  // Per-branch detection bounded to 4-wide. Each branch needs two
+  // cheap calls (merge-base + cherry). On a repo with 200+ branches,
+  // unbounded `Promise.all` would spawn 400+ concurrent `git`
+  // processes — Node handles the promises fine but the OS kept
+  // dropping us into the "Scanning branches…" spinner for seconds
+  // and Activity Monitor would fill with `git` rows. Four wide is
+  // enough to overlap I/O without saturating; per-op 30s timeout
+  // keeps a hung git from pinning a slot.
+  const PER_OP_TIMEOUT_MS = 30_000;
+  const trunkRefForLambda = trunkRef;
+  const perBranch = await mapBounded(branches, 4, async ({ name, sha }) => {
+    const [mb, cherry] = await Promise.all([
+      run(repoPath, ['merge-base', trunkRefForLambda, name], undefined, PER_OP_TIMEOUT_MS),
+      run(repoPath, ['cherry', trunkRefForLambda, name], undefined, PER_OP_TIMEOUT_MS),
+    ]);
+    if (!mb.ok || !cherry.ok) return null;
+    const mergeBase = mb.stdout.trim();
+    if (!mergeBase) return null;
+    // Branch tip already in trunk → not a squash case (handled by
+    // the regular `--merged` ancestor check upstream of this call).
+    if (mergeBase === sha) return null;
+    const lines = cherry.stdout
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (lines.length === 0) return null;
+    if (!lines.every((l) => l.startsWith('-'))) return null;
+    return { name, sha, mergeBase };
+  });
+  type Cand = { name: string; sha: string; mergeBase: string };
+  const candidates: Cand[] = perBranch.filter((c): c is Cand => c !== null);
+  if (candidates.length === 0) return [];
+
+  // The graph caller wants absorbing SHAs; the prune caller doesn't —
+  // skipping the patch-id work shaves the slowest piece of this whole
+  // detector for the case where it's pure waste.
+  if (!options?.includeAbsorbing) {
+    return candidates.map((c) => ({
+      branchName: c.name,
+      branchSha: c.sha,
+      absorbingSha: null,
+      trunkTipSha,
+    }));
+  }
+
+  // Build the patch-id lookup over trunk's recent first-parent chain.
+  // The oldest merge-base anchors how far back we need to scan; going
+  // further is wasted work, going closer would miss old absorbers.
+  const oldestRes = await run(repoPath, [
+    'rev-list',
+    '--topo-order',
+    '--reverse',
+    ...candidates.map((c) => c.mergeBase),
+  ]);
+  const oldestMergeBase = oldestRes.ok
+    ? (oldestRes.stdout.split('\n').find((l) => l.trim()) ?? candidates[0].mergeBase)
+    : candidates[0].mergeBase;
+
+  const trunkLog = await run(repoPath, [
+    'log',
+    '-p',
+    '--first-parent',
+    '--no-merges',
+    '--format=commit %H',
+    `${oldestMergeBase}..${trunkRef}`,
+  ]);
+  const patchIdToSha = new Map<string, string>();
+  if (trunkLog.ok && trunkLog.stdout.length > 0) {
+    const pidRes = await runWithInput(repoPath, ['patch-id', '--stable'], trunkLog.stdout);
+    if (pidRes.ok) {
+      for (const line of pidRes.stdout.split('\n')) {
+        const [pid, sha] = line.trim().split(/\s+/);
+        if (pid && sha) patchIdToSha.set(pid, sha);
+      }
+    }
+  }
+
+  // Per-candidate patch-id matching, also bounded to 4-wide.
+  return mapBounded(candidates, 4, async (c) => {
+    let absorbingSha: string | null = null;
+    if (patchIdToSha.size > 0) {
+      const diff = await run(
+        repoPath,
+        ['diff', `${c.mergeBase}..${c.sha}`],
+        undefined,
+        PER_OP_TIMEOUT_MS,
+      );
+      if (diff.ok && diff.stdout.length > 0) {
+        const pidRes = await runWithInput(
+          repoPath,
+          ['patch-id', '--stable'],
+          diff.stdout,
+        );
+        if (pidRes.ok) {
+          const pid = pidRes.stdout.trim().split(/\s+/)[0];
+          if (pid) absorbingSha = patchIdToSha.get(pid) ?? null;
+        }
+      }
+    }
+    return { branchName: c.name, branchSha: c.sha, absorbingSha, trunkTipSha };
+  });
+}
+
+/// Public wrapper for the squash-merge detector. Used by the History
+/// graph to draw advisory connectors from orphan tips to the commit on
+/// trunk that absorbed them.
+export async function squashMergeLinks(
+  repoPath: string,
+  defaultBranch: string | null,
+): Promise<{
+  branchName: string;
+  branchSha: string;
+  absorbingSha: string | null;
+  trunkTipSha: string | null;
+}[]> {
+  if (!looksLikeRepo(repoPath)) return [];
+  return detectSquashMerges(repoPath, defaultBranch, { includeAbsorbing: true });
+}
+
+/// Find local branches likely safe to delete. Three signals combine:
+///   1. `[gone]` from `%(upstream:track)` — the branch was tracking a
+///      remote ref that no longer exists, the canonical "this PR was
+///      merged-and-deleted" footprint.
+///   2. `--merged <ref>` against the default branch (preferring its
+///      `origin/` upstream so a stale local default doesn't hide
+///      already-merged work).
+///   3. Squash-merge detection via patch-id equivalence — catches the
+///      branches that landed on default as a single squashed commit
+///      and so are invisible to `--merged` (which is ancestor-based).
+/// Branches checked out in any worktree, the current HEAD, and the
+/// default branch itself are never returned — git would refuse the
+/// delete anyway and silently skipping them keeps the list trustworthy.
+export async function pruneCandidates(
+  repoPath: string,
+  defaultBranch: string | null,
+): Promise<BranchPruneCandidate[]> {
+  if (!looksLikeRepo(repoPath)) return [];
+
+  const SEP = '\x1f';
+  const fmt = [
+    '%(refname:short)',
+    '%(objectname)',
+    '%(objectname:short)',
+    '%(subject)',
+    '%(upstream:short)',
+    '%(upstream:track)',
+  ].join(SEP);
+
+  const [headRes, localsRes, wtRes] = await Promise.all([
+    run(repoPath, ['rev-parse', '--abbrev-ref', 'HEAD']),
+    run(repoPath, ['for-each-ref', `--format=${fmt}`, 'refs/heads']),
+    run(repoPath, ['worktree', 'list', '--porcelain']),
+  ]);
+
+  if (!localsRes.ok) return [];
+  const currentBranch = headRes.ok ? headRes.stdout.trim() : '';
+
+  // Branches that are checked out in *any* worktree (including the
+  // main one) — `git branch -d` refuses to delete those, so they'd
+  // only ever appear as failures in the bulk delete loop.
+  const checkedOut = new Set<string>();
+  if (wtRes.ok) {
+    for (const line of wtRes.stdout.split('\n')) {
+      const m = line.match(/^branch\s+refs\/heads\/(.+)$/);
+      if (m) checkedOut.add(m[1]);
+    }
+  }
+
+  type Row = {
+    name: string;
+    sha: string;
+    shortSha: string;
+    subject: string;
+    upstream: string | null;
+    gone: boolean;
+  };
+  const rows: Row[] = [];
+  for (const line of localsRes.stdout.split('\n')) {
+    if (!line) continue;
+    const [name, sha, shortSha, subject, upstream, track] = line.split(SEP);
+    if (!name) continue;
+    rows.push({
+      name,
+      sha: sha ?? '',
+      shortSha: shortSha ?? '',
+      subject: subject ?? '',
+      upstream: upstream && upstream.length > 0 ? upstream : null,
+      gone: typeof track === 'string' && track.includes('[gone]'),
+    });
+  }
+
+  // Prefer `origin/<default>` as the merge target — local default can
+  // lag behind, which would hide branches whose work has already
+  // landed upstream. Fall back to the local default if the remote
+  // tracking ref doesn't exist (offline clone, no remote).
+  const mergedSet = new Set<string>();
+  if (defaultBranch) {
+    for (const ref of [`origin/${defaultBranch}`, defaultBranch]) {
+      const exists = await run(repoPath, [
+        'rev-parse',
+        '--verify',
+        '--quiet',
+        ref,
+      ]);
+      if (!exists.ok) continue;
+      const merged = await run(repoPath, [
+        'for-each-ref',
+        '--format=%(refname:short)',
+        '--merged',
+        ref,
+        'refs/heads',
+      ]);
+      if (merged.ok) {
+        for (const ln of merged.stdout.split('\n')) {
+          const t = ln.trim();
+          if (t) mergedSet.add(t);
+        }
+        break;
+      }
+    }
+  }
+
+  // pruneCandidates intentionally returns ONLY the gone+merged set
+  // here. Squash detection is the slow path (per-branch `git cherry`
+  // even at bounded concurrency takes seconds on 200-branch repos),
+  // so the renderer pulls it from `repo:pruneSquashCandidates` in
+  // parallel and merges the results into the panel as they arrive.
+  // That keeps the panel interactive within ~200ms regardless of
+  // squash detection's depth.
+  const out: BranchPruneCandidate[] = [];
+  for (const r of rows) {
+    if (r.name === currentBranch) continue;
+    if (defaultBranch && r.name === defaultBranch) continue;
+    if (checkedOut.has(r.name)) continue;
+    const reasons: ('gone' | 'merged' | 'squashed')[] = [];
+    if (r.gone) reasons.push('gone');
+    if (mergedSet.has(r.name)) reasons.push('merged');
+    if (reasons.length === 0) continue;
+    out.push({
+      name: r.name,
+      sha: r.sha,
+      shortSha: r.shortSha,
+      subject: r.subject,
+      reasons,
+      upstream: r.upstream,
+    });
+  }
+  return out;
+}
+
+/// Slow companion to `pruneCandidates` — detects squash-merged
+/// branches via patch-id equivalence and returns them in the same
+/// `BranchPruneCandidate` shape, so the renderer can merge the two
+/// result sets without translating shapes. Uses the same
+/// current/default/worktree/already-merged exclusions so the second
+/// call doesn't redo work the first call already covered.
+export async function pruneSquashCandidates(
+  repoPath: string,
+  defaultBranch: string | null,
+): Promise<BranchPruneCandidate[]> {
+  if (!looksLikeRepo(repoPath)) return [];
+  if (!defaultBranch) return [];
+
+  const SEP = '\x1f';
+  const fmt = [
+    '%(refname:short)',
+    '%(objectname)',
+    '%(objectname:short)',
+    '%(subject)',
+    '%(upstream:short)',
+  ].join(SEP);
+
+  const [headRes, localsRes, wtRes] = await Promise.all([
+    run(repoPath, ['rev-parse', '--abbrev-ref', 'HEAD']),
+    run(repoPath, ['for-each-ref', `--format=${fmt}`, 'refs/heads']),
+    run(repoPath, ['worktree', 'list', '--porcelain']),
+  ]);
+  if (!localsRes.ok) return [];
+  const currentBranch = headRes.ok ? headRes.stdout.trim() : '';
+  const checkedOut = new Set<string>();
+  if (wtRes.ok) {
+    for (const line of wtRes.stdout.split('\n')) {
+      const m = line.match(/^branch\s+refs\/heads\/(.+)$/);
+      if (m) checkedOut.add(m[1]);
+    }
+  }
+
+  const meta = new Map<
+    string,
+    { sha: string; shortSha: string; subject: string; upstream: string | null }
+  >();
+  for (const line of localsRes.stdout.split('\n')) {
+    if (!line) continue;
+    const [name, sha, shortSha, subject, upstream] = line.split(SEP);
+    if (!name) continue;
+    meta.set(name, {
+      sha: sha ?? '',
+      shortSha: shortSha ?? '',
+      subject: subject ?? '',
+      upstream: upstream && upstream.length > 0 ? upstream : null,
+    });
+  }
+
+  // Compute the already-merged set first (cheap, single git call) so
+  // squash detection skips ancestor-merged branches.
+  const mergedSet = new Set<string>();
+  for (const ref of [`origin/${defaultBranch}`, defaultBranch]) {
+    const exists = await run(repoPath, ['rev-parse', '--verify', '--quiet', ref]);
+    if (!exists.ok) continue;
+    const merged = await run(repoPath, [
+      'for-each-ref',
+      '--format=%(refname:short)',
+      '--merged',
+      ref,
+      'refs/heads',
+    ]);
+    if (merged.ok) {
+      for (const ln of merged.stdout.split('\n')) {
+        const t = ln.trim();
+        if (t) mergedSet.add(t);
+      }
+      break;
+    }
+  }
+
+  const skipSquash = new Set<string>(mergedSet);
+  if (currentBranch) skipSquash.add(currentBranch);
+  for (const n of checkedOut) skipSquash.add(n);
+
+  const squashed = await detectSquashMerges(repoPath, defaultBranch, {
+    skipBranches: skipSquash,
+  });
+
+  const out: BranchPruneCandidate[] = [];
+  for (const s of squashed) {
+    const m = meta.get(s.branchName);
+    if (!m) continue;
+    out.push({
+      name: s.branchName,
+      sha: m.sha,
+      shortSha: m.shortSha,
+      subject: m.subject,
+      reasons: ['squashed'],
+      upstream: m.upstream,
+    });
+  }
+  return out;
 }
 
 /// Rename a branch in place. `force` switches `-m` to `-M` so git will

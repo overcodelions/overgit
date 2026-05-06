@@ -48,7 +48,10 @@ import {
   listSubmodules,
   listTags,
   listWorktrees,
+  pruneCandidates,
+  pruneSquashCandidates,
   pruneWorktrees,
+  squashMergeLinks,
   pushTag,
   removeRemote,
   removeWorktree,
@@ -596,6 +599,33 @@ function registerIpc(): void {
       return deleteBranch(repo.path, args.name, args.force);
     },
   );
+
+  ipcMain.handle('repo:pruneCandidates', async (_e, args: { repoId: string }) => {
+    const repo = repoFromArg(args);
+    if (!repo) return [];
+    // Trust the user's stored override when present, otherwise detect
+    // — we never want to suggest deleting a branch the user considers
+    // their trunk, regardless of what `origin/HEAD` says.
+    const def = repo.defaultBranch ?? (await detectDefaultBranch(repo.path));
+    return pruneCandidates(repo.path, def);
+  });
+
+  ipcMain.handle(
+    'repo:pruneSquashCandidates',
+    async (_e, args: { repoId: string }) => {
+      const repo = repoFromArg(args);
+      if (!repo) return [];
+      const def = repo.defaultBranch ?? (await detectDefaultBranch(repo.path));
+      return pruneSquashCandidates(repo.path, def);
+    },
+  );
+
+  ipcMain.handle('repo:squashMergeLinks', async (_e, args: { repoId: string }) => {
+    const repo = repoFromArg(args);
+    if (!repo) return [];
+    const def = repo.defaultBranch ?? (await detectDefaultBranch(repo.path));
+    return squashMergeLinks(repo.path, def);
+  });
 
   ipcMain.handle(
     'repo:renameBranch',

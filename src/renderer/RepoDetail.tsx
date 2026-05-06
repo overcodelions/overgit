@@ -5,6 +5,7 @@ import { BranchPicker } from './BranchPicker';
 import { Explain } from './Explain';
 import { sanitizeBranchName } from '@shared/branch-name';
 import type {
+  BranchPruneCandidate,
   ChangedFile,
   Commit,
   FileDiff,
@@ -12,6 +13,7 @@ import type {
   LlmTool,
   RepoStatus,
   ResolvedIdentity,
+  SquashMergeLink,
   UUID,
   Worktree,
 } from '@shared/types';
@@ -2565,11 +2567,13 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
   const [acting, setActing] = useState<string | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
   const [filter, setFilter] = useState('');
+  const [showPrune, setShowPrune] = useState(false);
 
   useEffect(() => {
     void refreshWorktrees(repoId);
     void refreshBranches(repoId);
     setFilter('');
+    setShowPrune(false);
   }, [refreshWorktrees, refreshBranches, repoId]);
 
   const onRefresh = async () => {
@@ -2754,13 +2758,26 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
             checked out elsewhere on disk.
           </p>
         </div>
-        <button
-          onClick={onRefresh}
-          disabled={busy}
-          className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
-        >
-          {busy ? 'Refreshing…' : 'Refresh'}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowPrune((v) => !v)}
+            className={`text-xs px-3 py-1.5 rounded border ${
+              showPrune
+                ? 'border-accent/40 bg-accent/[0.06] text-accent'
+                : 'border-card hover:bg-card'
+            }`}
+            title="Find local branches that were merged into the default branch or whose upstream is gone"
+          >
+            {showPrune ? 'Close prune' : 'Prune…'}
+          </button>
+          <button
+            onClick={onRefresh}
+            disabled={busy}
+            className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+          >
+            {busy ? 'Refreshing…' : 'Refresh'}
+          </button>
+        </div>
       </header>
 
       <div className="flex items-center gap-2">
@@ -2780,6 +2797,16 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
           </button>
         )}
       </div>
+
+      {showPrune && (
+        <BranchPrunePanel
+          repoId={repoId}
+          onClose={() => setShowPrune(false)}
+          onAfterDelete={() => {
+            void refreshBranches(repoId);
+          }}
+        />
+      )}
 
       <section className="flex flex-col gap-2">
         <div className="flex items-baseline justify-between">
@@ -2878,6 +2905,315 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
         )}
       </section>
     </main>
+  );
+}
+
+/// Inline panel surfaced from the Branches tab that lists local
+/// branches likely safe to delete. We surface the *why* (gone-upstream
+/// vs. merged-into-default) on every row so the user can audit each
+/// suggestion rather than trusting a black-box sweep — pruning is the
+/// kind of action people regret silently. Default selection picks
+/// only `merged` candidates because those are deletion-safe (their
+/// commits live in the trunk's history); `gone` rows often need `-D`,
+/// which we hide behind an explicit toggle.
+function BranchPrunePanel({
+  repoId,
+  onClose,
+  onAfterDelete,
+}: {
+  repoId: UUID;
+  onClose: () => void;
+  onAfterDelete: () => void;
+}): JSX.Element {
+  const fetchCandidates = useStore((s) => s.fetchBranchPruneCandidates);
+  const fetchSquashCandidates = useStore((s) => s.fetchBranchPruneSquashCandidates);
+  const deleteRepoBranch = useStore((s) => s.deleteRepoBranch);
+  const pushToast = useStore((s) => s.pushToast);
+  const requestConfirm = useStore((s) => s.requestConfirm);
+
+  const [loading, setLoading] = useState(true);
+  const [scanningSquash, setScanningSquash] = useState(false);
+  const [candidates, setCandidates] = useState<BranchPruneCandidate[]>([]);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [force, setForce] = useState(false);
+  const [working, setWorking] = useState(false);
+
+  const reload = useCallback(async () => {
+    setLoading(true);
+    setScanningSquash(true);
+    // Token guards against a stale slow-path resolution stomping a
+    // newer scan's results when the user clicks Rescan rapidly.
+    const token = Symbol('prune-scan');
+    (reload as unknown as { token?: symbol }).token = token;
+
+    // Fast path — paint gone+merged immediately so the panel is
+    // interactive within one frame on big repos.
+    try {
+      const next = await fetchCandidates(repoId);
+      if ((reload as unknown as { token?: symbol }).token !== token) return;
+      setCandidates(next);
+      setSelected(
+        new Set(next.filter((c) => c.reasons.includes('merged')).map((c) => c.name)),
+      );
+    } finally {
+      if ((reload as unknown as { token?: symbol }).token === token) setLoading(false);
+    }
+
+    // Slow path — squash detection runs in the background and merges
+    // into the existing list as it completes. A branch already in the
+    // gone+merged list gets `squashed` appended to its reasons; new
+    // squash-only branches are pushed to the end.
+    try {
+      const squashed = await fetchSquashCandidates(repoId);
+      if ((reload as unknown as { token?: symbol }).token !== token) return;
+      setCandidates((prev) => {
+        const byName = new Map(prev.map((c) => [c.name, c]));
+        for (const s of squashed) {
+          const existing = byName.get(s.name);
+          if (existing) {
+            byName.set(s.name, {
+              ...existing,
+              reasons: [...existing.reasons, 'squashed'],
+            });
+          } else {
+            byName.set(s.name, s);
+          }
+        }
+        return Array.from(byName.values());
+      });
+      setSelected((prev) => {
+        const next = new Set(prev);
+        for (const s of squashed) next.add(s.name);
+        return next;
+      });
+    } finally {
+      if ((reload as unknown as { token?: symbol }).token === token) {
+        setScanningSquash(false);
+      }
+    }
+  }, [fetchCandidates, fetchSquashCandidates, repoId]);
+
+  useEffect(() => {
+    void reload();
+  }, [reload]);
+
+  const toggleOne = (name: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  };
+  const toggleAll = () => {
+    setSelected((prev) =>
+      prev.size === candidates.length ? new Set() : new Set(candidates.map((c) => c.name)),
+    );
+  };
+
+  const onDelete = async () => {
+    const names = candidates
+      .filter((c) => selected.has(c.name))
+      .map((c) => c.name);
+    if (names.length === 0) return;
+    const PREVIEW = 10;
+    const previewList = names.slice(0, PREVIEW).map((n) => `  • ${n}`).join('\n');
+    const remainder = names.length - PREVIEW;
+    const ok = await requestConfirm({
+      title: `Delete ${names.length} branch${names.length === 1 ? '' : 'es'}?`,
+      body:
+        `Run \`git branch ${force ? '-D' : '-d'}\` on these branches (local only — remote branches are untouched):\n\n` +
+        previewList +
+        (remainder > 0 ? `\n  …and ${remainder} more` : '') +
+        (force
+          ? '\n\nForce mode is ON — branches will be deleted even if not fully merged anywhere.'
+          : '\n\nGit will refuse any branch that is not fully merged. Toggle Force to override.'),
+      confirmLabel: 'Delete',
+    });
+    if (!ok) return;
+
+    setWorking(true);
+    try {
+      let succeeded = 0;
+      const failures: { name: string; error: string }[] = [];
+      for (const name of names) {
+        const res = await deleteRepoBranch(repoId, name, force);
+        if (res.ok) succeeded += 1;
+        else failures.push({ name, error: res.error ?? 'delete failed' });
+      }
+      if (failures.length === 0) {
+        pushToast({
+          kind: 'success',
+          message: `Pruned ${succeeded} branch${succeeded === 1 ? '' : 'es'}.`,
+        });
+      } else {
+        const unmergedHint = failures.some((f) => /not fully merged/i.test(f.error))
+          ? ' Enable Force to delete unmerged branches.'
+          : '';
+        const summary =
+          succeeded > 0
+            ? `Pruned ${succeeded}. ${failures.length} failed.`
+            : `${failures.length} failed.`;
+        pushToast({
+          kind: 'error',
+          message: summary + unmergedHint,
+          details: failures.map((f) => `${f.name} — ${f.error}`),
+          sticky: true,
+        });
+      }
+      onAfterDelete();
+      await reload();
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  const allChecked = candidates.length > 0 && selected.size === candidates.length;
+
+  return (
+    <section className="flex flex-col gap-2 p-3 rounded border border-accent/30 bg-accent/[0.03]">
+      <div className="flex items-baseline justify-between gap-2">
+        <div>
+          <h3 className="text-[10px] uppercase tracking-wide text-accent">
+            Prune local branches
+          </h3>
+          <p className="text-[11px] text-ink-faint">
+            Branches merged into the default branch, squash-merged via PR, or whose
+            remote upstream is gone.
+          </p>
+        </div>
+        <button
+          onClick={onClose}
+          className="text-[10px] text-ink-muted hover:text-ink px-1.5 py-1 rounded hover:bg-card"
+          title="Close"
+        >
+          ✕
+        </button>
+      </div>
+
+      {loading ? (
+        <div className="text-xs text-ink-faint p-3">Scanning branches…</div>
+      ) : candidates.length === 0 && !scanningSquash ? (
+        <div className="text-xs text-ink-faint p-3 rounded border border-card bg-card">
+          Nothing to prune. No local branches are merged into the default branch and no
+          upstreams are gone.
+        </div>
+      ) : (
+        <>
+          <div className="flex items-center justify-between gap-2 px-1">
+            <label className="flex items-center gap-2 text-[11px] text-ink-muted cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={allChecked}
+                onChange={toggleAll}
+                className="accent-accent"
+              />
+              {selected.size} of {candidates.length} selected
+              {scanningSquash && (
+                <span className="text-ink-faint">· still scanning squash-merges…</span>
+              )}
+            </label>
+            <label
+              className="flex items-center gap-2 text-[11px] text-ink-muted cursor-pointer select-none"
+              title="Use `git branch -D` instead of `-d`. Required to delete branches whose commits aren't merged anywhere."
+            >
+              <input
+                type="checkbox"
+                checked={force}
+                onChange={(e) => setForce(e.target.checked)}
+                className="accent-accent"
+              />
+              Force delete (-D)
+            </label>
+          </div>
+
+          <ul className="flex flex-col gap-1">
+            {candidates.map((c) => (
+              <li
+                key={c.name}
+                className="flex items-center gap-3 px-2 py-1 rounded border border-card bg-card"
+              >
+                <input
+                  type="checkbox"
+                  checked={selected.has(c.name)}
+                  onChange={() => toggleOne(c.name)}
+                  disabled={working}
+                  className="accent-accent"
+                />
+                <span className="font-mono text-sm truncate flex-1" title={c.name}>
+                  {c.name}
+                </span>
+                <span className="flex items-center gap-1">
+                  {c.reasons.includes('merged') && (
+                    <span
+                      className="text-[10px] px-1.5 py-0.5 rounded border border-emerald-500/30 text-emerald-400 bg-emerald-500/5"
+                      title="Fully merged into the default branch (or its upstream)"
+                    >
+                      merged
+                    </span>
+                  )}
+                  {c.reasons.includes('squashed') && (
+                    <span
+                      className="text-[10px] px-1.5 py-0.5 rounded border border-sky-500/30 text-sky-300 bg-sky-500/5"
+                      title="Every commit on this branch has a matching patch-id on the default branch — its work was squash-merged via PR"
+                    >
+                      squashed
+                    </span>
+                  )}
+                  {c.reasons.includes('gone') && (
+                    <span
+                      className="text-[10px] px-1.5 py-0.5 rounded border border-amber-500/30 text-amber-300 bg-amber-500/5"
+                      title={
+                        c.upstream
+                          ? `Tracked ${c.upstream}, which no longer exists on the remote`
+                          : 'Upstream is gone'
+                      }
+                    >
+                      gone
+                    </span>
+                  )}
+                </span>
+                <span
+                  className="text-[11px] text-ink-faint truncate max-w-[40%]"
+                  title={c.subject}
+                >
+                  {c.subject}
+                </span>
+                <span className="text-[11px] text-ink-faint font-mono">{c.shortSha}</span>
+              </li>
+            ))}
+          </ul>
+
+          <div className="flex items-center justify-end gap-2 pt-1">
+            <button
+              onClick={() => void reload()}
+              disabled={working}
+              className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-surface-elevated disabled:opacity-50"
+            >
+              Rescan
+            </button>
+            <Explain
+              command={`git branch ${force ? '-D' : '-d'} <selected>`}
+              plain={
+                force
+                  ? 'Force-delete the selected local branches, even if their commits live nowhere else.'
+                  : 'Delete the selected local branches. Git refuses any that are not fully merged.'
+              }
+            >
+              <button
+                onClick={onDelete}
+                disabled={working || selected.size === 0}
+                className="text-[11px] px-2 py-0.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+              >
+                {working
+                  ? 'Deleting…'
+                  : `Delete ${selected.size} selected`}
+              </button>
+            </Explain>
+          </div>
+        </>
+      )}
+    </section>
   );
 }
 
@@ -3439,6 +3775,7 @@ const NODE_RADIUS = 4;
 const PADDING_X = 10;
 
 const EMPTY_GRAPH: GraphCommit[] = [];
+const EMPTY_SQUASH_LINKS: SquashMergeLink[] = [];
 
 /// Combined graph + history view. The left rail draws each commit's
 /// lane and parent lines; commits then render to the right with refs,
@@ -3454,7 +3791,9 @@ const RAIL_BASE_WIDTH = 56;
 
 function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
   const commits = useStore((s) => s.repoGraph[repoId] ?? EMPTY_GRAPH);
+  const squashLinks = useStore((s) => s.repoSquashLinks[repoId] ?? EMPTY_SQUASH_LINKS);
   const refreshGraph = useStore((s) => s.refreshRepoGraph);
+  const refreshSquashLinks = useStore((s) => s.refreshRepoSquashLinks);
   const refreshDiff = useStore((s) => s.refreshRepoDiff);
   const diffEntry = useStore((s) => s.repoDiff[repoId]);
   const asideWidth = useStore((s) => s.settings.historyAsideWidth);
@@ -3480,12 +3819,19 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
   const [menu, setMenu] = useState<{ sha: string; x: number; y: number } | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
 
+  // Keep squash-link state co-resident with the rest of the tab's
+  // mount work, but don't block on it. The graph paints from
+  // `commits` alone; squash connectors stream in separately.
+  const haveSquashLinks = useStore(
+    (s) => s.repoSquashLinks[repoId] !== undefined,
+  );
   useEffect(() => {
     refreshGraph(repoId);
+    if (!haveSquashLinks) refreshSquashLinks(repoId);
     refreshDiff(repoId, undefined);
     setSelected('working');
     setFilter('');
-  }, [refreshGraph, refreshDiff, repoId]);
+  }, [refreshGraph, refreshSquashLinks, refreshDiff, repoId, haveSquashLinks]);
 
   const filteredCommits = useMemo(() => {
     const q = filter.trim().toLowerCase();
@@ -3512,12 +3858,43 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
     () => filteredCommits.reduce((m, c) => Math.max(m, c.lane, ...c.parentLanes), 0),
     [filteredCommits],
   );
-  const railWidth = Math.max(RAIL_BASE_WIDTH, PADDING_X * 2 + (maxLane + 1) * LANE_WIDTH);
+  // Add half a lane of slack so the dashed squash-merge connector's
+  // control point doesn't get clipped at the right edge.
+  const railWidth = Math.max(RAIL_BASE_WIDTH, PADDING_X * 2 + (maxLane + 1.5) * LANE_WIDTH);
 
   const headSha = useMemo(() => {
     const head = commits.find((c) => c.refs.some((r) => r.startsWith('HEAD')));
     return head?.sha ?? null;
   }, [commits]);
+
+  // SHAs that exist *only* as ancestors of squash-merged orphan tips.
+  // We start a BFS from every commit that is NOT a squash-merged tip
+  // and mark each ancestor as "live"; anything left over is orphan-only
+  // and gets faded so the trunk + active branches read clearly.
+  const orphanShas = useMemo(() => {
+    if (squashLinks.length === 0) return new Set<string>();
+    const squashedTips = new Set(squashLinks.map((l) => l.branchSha));
+    const bySha = new Map<string, GraphCommit>();
+    for (const c of commits) bySha.set(c.sha, c);
+    const live = new Set<string>();
+    const stack: string[] = [];
+    for (const c of commits) {
+      if (squashedTips.has(c.sha)) continue;
+      if (live.has(c.sha)) continue;
+      stack.push(c.sha);
+      while (stack.length > 0) {
+        const sha = stack.pop()!;
+        if (live.has(sha)) continue;
+        live.add(sha);
+        const node = bySha.get(sha);
+        if (!node) continue;
+        for (const p of node.parents) stack.push(p);
+      }
+    }
+    const orphan = new Set<string>();
+    for (const c of commits) if (!live.has(c.sha)) orphan.add(c.sha);
+    return orphan;
+  }, [commits, squashLinks]);
 
   const onPickCommit = (sha: string) => {
     setSelected(sha);
@@ -3690,53 +4067,109 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
               height={totalHeight}
               className="absolute left-0 top-0 pointer-events-none"
             >
-              {filteredCommits.map((c, i) => (
-                <g key={c.sha}>
-                  {c.parentLanes.map((pLane, idx) => {
-                    const parentIdx = indexBySha.get(c.parents[idx]);
-                    if (parentIdx == null) return null;
-                    const x1 = PADDING_X + c.lane * LANE_WIDTH + LANE_WIDTH / 2;
-                    const y1 = (i + 1) * ROW_HEIGHT + ROW_HEIGHT / 2;
-                    const x2 = PADDING_X + pLane * LANE_WIDTH + LANE_WIDTH / 2;
-                    const y2 = (parentIdx + 1) * ROW_HEIGHT + ROW_HEIGHT / 2;
-                    const cy = y1 + ROW_HEIGHT * 0.6;
-                    const d =
-                      x1 === x2
-                        ? `M${x1},${y1} L${x2},${y2}`
-                        : `M${x1},${y1} Q${x1},${cy} ${(x1 + x2) / 2},${cy} T${x2},${y2}`;
-                    return (
-                      <path
-                        key={`${c.sha}:${idx}`}
-                        d={d}
-                        stroke={laneColor(pLane)}
-                        strokeWidth="1.5"
+              {filteredCommits.map((c, i) => {
+                const isOrphan = orphanShas.has(c.sha);
+                // Faded opacity for commits that only exist as ancestors
+                // of squash-merged dead-end branches. Half-strength is
+                // dim enough to recede but bright enough that hovers
+                // and the dashed advisory still find the node.
+                const nodeOpacity = isOrphan ? 0.35 : 1;
+                const edgeOpacity = isOrphan ? 0.25 : 0.85;
+                return (
+                  <g key={c.sha}>
+                    {c.parentLanes.map((pLane, idx) => {
+                      const parentIdx = indexBySha.get(c.parents[idx]);
+                      if (parentIdx == null) return null;
+                      const x1 = PADDING_X + c.lane * LANE_WIDTH + LANE_WIDTH / 2;
+                      const y1 = (i + 1) * ROW_HEIGHT + ROW_HEIGHT / 2;
+                      const x2 = PADDING_X + pLane * LANE_WIDTH + LANE_WIDTH / 2;
+                      const y2 = (parentIdx + 1) * ROW_HEIGHT + ROW_HEIGHT / 2;
+                      const cy = y1 + ROW_HEIGHT * 0.6;
+                      const d =
+                        x1 === x2
+                          ? `M${x1},${y1} L${x2},${y2}`
+                          : `M${x1},${y1} Q${x1},${cy} ${(x1 + x2) / 2},${cy} T${x2},${y2}`;
+                      return (
+                        <path
+                          key={`${c.sha}:${idx}`}
+                          d={d}
+                          stroke={laneColor(pLane)}
+                          strokeWidth="1.5"
+                          fill="none"
+                          opacity={edgeOpacity}
+                        />
+                      );
+                    })}
+                    {c.sha === headSha && (
+                      <circle
+                        cx={PADDING_X + c.lane * LANE_WIDTH + LANE_WIDTH / 2}
+                        cy={(i + 1) * ROW_HEIGHT + ROW_HEIGHT / 2}
+                        r={NODE_RADIUS + 4}
                         fill="none"
+                        stroke="var(--c-accent)"
+                        strokeWidth="1.5"
                         opacity="0.85"
                       />
-                    );
-                  })}
-                  {c.sha === headSha && (
-                    // HEAD halo — a wider ring behind the node circle
-                    // so the active commit pops without changing the
-                    // base node size and disturbing the row rhythm.
+                    )}
                     <circle
                       cx={PADDING_X + c.lane * LANE_WIDTH + LANE_WIDTH / 2}
                       cy={(i + 1) * ROW_HEIGHT + ROW_HEIGHT / 2}
-                      r={NODE_RADIUS + 4}
-                      fill="none"
-                      stroke="var(--c-accent)"
-                      strokeWidth="1.5"
-                      opacity="0.85"
+                      r={NODE_RADIUS}
+                      fill={laneColor(c.lane)}
+                      opacity={nodeOpacity}
                     />
-                  )}
-                  <circle
-                    cx={PADDING_X + c.lane * LANE_WIDTH + LANE_WIDTH / 2}
-                    cy={(i + 1) * ROW_HEIGHT + ROW_HEIGHT / 2}
-                    r={NODE_RADIUS}
-                    fill={laneColor(c.lane)}
-                  />
-                </g>
-              ))}
+                  </g>
+                );
+              })}
+
+              {/*
+                Advisory squash-merge connectors. Git records no parent
+                edge for a squash merge, so without this the orphan
+                branch tip just dead-ends in the rail. The exact
+                absorbing commit comes from patch-id matching when
+                possible; otherwise we anchor at the trunk tip so the
+                user still sees "this work landed in main" instead of
+                an unexplained dead end.
+              */}
+              {squashLinks.map((link) => {
+                const fromIdx = indexBySha.get(link.branchSha);
+                if (fromIdx == null) return null;
+                const exact = link.absorbingSha != null;
+                const targetSha = link.absorbingSha ?? link.trunkTipSha;
+                if (!targetSha) return null;
+                const toIdx = indexBySha.get(targetSha);
+                if (toIdx == null) return null;
+                const fromCommit = filteredCommits[fromIdx];
+                const toCommit = filteredCommits[toIdx];
+                if (!fromCommit || !toCommit) return null;
+                const x1 = PADDING_X + fromCommit.lane * LANE_WIDTH + LANE_WIDTH / 2;
+                const y1 = (fromIdx + 1) * ROW_HEIGHT + ROW_HEIGHT / 2;
+                const x2 = PADDING_X + toCommit.lane * LANE_WIDTH + LANE_WIDTH / 2;
+                const y2 = (toIdx + 1) * ROW_HEIGHT + ROW_HEIGHT / 2;
+                // One-control-point quadratic. The control point sits
+                // half a lane to the right of whichever endpoint is
+                // furthest right and at the y-midpoint, giving a
+                // smooth bow that stays inside the rail.
+                const cx = Math.max(x1, x2) + LANE_WIDTH * 0.5;
+                const cy = (y1 + y2) / 2;
+                const d = `M${x1},${y1} Q${cx},${cy} ${x2},${y2}`;
+                const tip = exact
+                  ? `Squash-merged into ${targetSha.slice(0, 7)}`
+                  : 'Squash-merged into the default branch (exact commit unidentified)';
+                return (
+                  <path
+                    key={`squash:${link.branchSha}`}
+                    d={d}
+                    stroke="var(--c-accent, #8a78ff)"
+                    strokeWidth="1.25"
+                    strokeDasharray={exact ? '4,3' : '2,4'}
+                    fill="none"
+                    opacity={exact ? 0.7 : 0.45}
+                  >
+                    <title>{tip}</title>
+                  </path>
+                );
+              })}
             </svg>
           </div>
         </div>
