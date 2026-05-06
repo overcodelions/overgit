@@ -7,6 +7,7 @@
 import { create } from 'zustand';
 import type {
   AppSettings,
+  BranchPruneCandidate,
   BranchSummary,
   CheckoutOutcome,
   CliPresence,
@@ -18,6 +19,7 @@ import type {
   RepoChanges,
   RepoPRs,
   RepoStatus,
+  SquashMergeLink,
   Stash,
   StoreSnapshot,
   UUID,
@@ -62,6 +64,11 @@ export interface Toast {
   kind: 'info' | 'success' | 'warn' | 'error';
   message: string;
   sticky?: boolean;
+  /// Optional per-line detail strings, rendered below `message` in a
+  /// monospace, scrollable list. Lets bulk-action results (e.g. a
+  /// prune that failed on 12 branches) stay readable without cramming
+  /// every entry into a single wrapped paragraph.
+  details?: string[];
 }
 
 /// Modeless confirmation request. `requestConfirm` returns a promise so
@@ -106,6 +113,10 @@ interface UiState {
   repoBranches: Record<UUID, { local: string[]; remote: string[] }>;
   repoBranchSummaries: Record<UUID, BranchSummary[]>;
   repoGraph: Record<UUID, GraphCommit[]>;
+  /// Advisory squash-merge links per repo. Refreshed alongside the
+  /// graph so the History view can render dashed connectors from
+  /// orphan branch tips to the absorbing commit on default.
+  repoSquashLinks: Record<UUID, SquashMergeLink[]>;
   repoFileList: Record<UUID, Array<{ path: string; ignored: boolean }>>;
   repoStashes: Record<UUID, Stash[]>;
   cliPresence: CliPresence | null;
@@ -209,6 +220,7 @@ interface UiState {
   refreshRepoBranches: (id: UUID) => Promise<void>;
   refreshRepoBranchSummaries: (id: UUID) => Promise<void>;
   refreshRepoGraph: (id: UUID) => Promise<void>;
+  refreshRepoSquashLinks: (id: UUID) => Promise<void>;
   refreshRepoFileList: (id: UUID) => Promise<void>;
   refreshRepoStashes: (id: UUID) => Promise<void>;
   applyStash: (
@@ -272,6 +284,8 @@ interface UiState {
     from?: string,
   ) => Promise<{ ok: boolean; error?: string }>;
   deleteRepoBranch: (id: UUID, name: string, force: boolean) => Promise<{ ok: boolean; error?: string }>;
+  fetchBranchPruneCandidates: (id: UUID) => Promise<BranchPruneCandidate[]>;
+  fetchBranchPruneSquashCandidates: (id: UUID) => Promise<BranchPruneCandidate[]>;
   renameRepoBranch: (
     id: UUID,
     from: string | null,
@@ -352,6 +366,7 @@ export const useStore = create<UiState>((set, get) => ({
   repoBranches: {},
   repoBranchSummaries: {},
   repoGraph: {},
+  repoSquashLinks: {},
   repoFileList: {},
   repoStashes: {},
   cliPresence: null,
@@ -694,20 +709,37 @@ export const useStore = create<UiState>((set, get) => ({
   refreshAllRepoStatuses: async () => {
     const ids = get().repos.map((r) => r.id);
     if (ids.length === 0) return;
-    const results = await Promise.all(
-      ids.map((id) =>
-        window.overgit
-          .invoke('repo:status', id)
-          .then((st) => [id, st] as const)
-          .catch(() => null),
-      ),
+    // Bound the fan-out so a 24-repo workspace doesn't fire 24
+    // simultaneous `repo:status` IPCs (each of which spawns several
+    // git processes). Without this cap the periodic 60s tick + a
+    // running squash scan was painting Activity Monitor with
+    // hundreds of `git` rows. 4 in flight is enough to keep the
+    // sidebar fresh without thrashing.
+    const STATUS_CONCURRENCY = 4;
+    const results: ([UUID, Awaited<ReturnType<typeof window.overgit.invoke<'repo:status'>>>] | null)[] = new Array(ids.length);
+    let next = 0;
+    const worker = async () => {
+      while (true) {
+        const i = next++;
+        if (i >= ids.length) return;
+        const id = ids[i];
+        try {
+          const st = await window.overgit.invoke('repo:status', id);
+          results[i] = [id, st];
+        } catch {
+          results[i] = null;
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(STATUS_CONCURRENCY, ids.length) }, worker),
     );
-    const next = { ...get().repoStatus };
+    const merged = { ...get().repoStatus };
     for (const row of results) {
       if (!row) continue;
-      next[row[0]] = row[1];
+      merged[row[0]] = row[1];
     }
-    set({ repoStatus: next });
+    set({ repoStatus: merged });
   },
 
   fetchAllReposQuiet: async () => {
@@ -884,6 +916,14 @@ export const useStore = create<UiState>((set, get) => ({
     return res;
   },
 
+  fetchBranchPruneCandidates: async (id) => {
+    return window.overgit.invoke('repo:pruneCandidates', { repoId: id });
+  },
+
+  fetchBranchPruneSquashCandidates: async (id) => {
+    return window.overgit.invoke('repo:pruneSquashCandidates', { repoId: id });
+  },
+
   renameRepoBranch: async (id, from, to, force) => {
     const res = await window.overgit.invoke('repo:renameBranch', {
       repoId: id,
@@ -914,6 +954,11 @@ export const useStore = create<UiState>((set, get) => ({
   refreshRepoGraph: async (id) => {
     const commits = await window.overgit.invoke('repo:graph', { repoId: id, limit: 200 });
     set({ repoGraph: { ...get().repoGraph, [id]: commits } });
+  },
+
+  refreshRepoSquashLinks: async (id) => {
+    const links = await window.overgit.invoke('repo:squashMergeLinks', { repoId: id });
+    set({ repoSquashLinks: { ...get().repoSquashLinks, [id]: links } });
   },
 
   refreshRepoFileList: async (id) => {
