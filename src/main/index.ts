@@ -84,6 +84,7 @@ import {
   workspaceFetch,
   workspaceListPRs,
   workspaceOpenPRs,
+  workspaceResetToDefault,
   workspacePushAll,
   workspaceStatus,
   workspaceSyncAndBranch,
@@ -985,6 +986,11 @@ function registerIpc(): void {
       );
     },
   );
+
+  ipcMain.handle('workspace:resetToDefault', async (_e, workspaceId: string) => {
+    const { workspaces, repos } = Store.load();
+    return workspaceResetToDefault(workspaceId, workspaces, repos);
+  });
 
   ipcMain.handle('repo:worktrees', async (_e, repoId: string) => {
     const repo = Store.load().repos.find((r) => r.id === repoId);

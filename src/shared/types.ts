@@ -233,6 +233,25 @@ export interface SyncAndBranchOutcome {
   message?: string;
 }
 
+/// Per-repo result of the workset Archive flow's "reset to default"
+/// step: fetch → switch each repo to its detected default branch → pull.
+/// Surfaced so a partial failure (one repo dirty, one repo with no
+/// detected default) is readable in the post-archive toast / sheet.
+export interface WorkspaceResetOutcome {
+  repoId: UUID;
+  /// Default branch we tried to reset to. Null when the repo has no
+  /// detected default and no override.
+  defaultBranch: string | null;
+  result:
+    | 'reset'
+    | 'no-default-branch'
+    | 'dirty'
+    | 'fetch-failed'
+    | 'switch-failed'
+    | 'pull-failed';
+  message?: string;
+}
+
 /// Detected installed CLIs we can shell out to. The first three are
 /// review-host CLIs (PR/MR data). The rest are LLM CLIs that can review
 /// or comment on a diff in non-interactive mode. Discovered once at
@@ -779,6 +798,14 @@ export interface IPCInvokeMap {
     body: string;
     draft: boolean;
   }) => WorkspaceOpenPROutcome[];
+  /// Reset every member of a workset to its default branch with a fresh
+  /// pull. Used by the Archive flow so worksets close out with each repo
+  /// in a clean "ready for next work" state on its trunk, not parked on
+  /// a now-merged feature branch. Sequential per-repo so outcomes
+  /// narrate cleanly.
+  'workspace:resetToDefault': (
+    workspaceId: UUID,
+  ) => WorkspaceResetOutcome[];
 
   'cli:detect': () => CliPresence;
   'cli:reviewChanges': (args: {
