@@ -1003,13 +1003,16 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
         </div>
       )}
       {unpushedHint && (
-        <div className="col-span-2 row-start-1 px-4 py-2 bg-accent/10 border-b border-accent/30 flex items-center gap-3 text-xs">
-          <span className="text-accent font-medium">↑</span>
-          <span className="flex-1 text-ink">{unpushedHint}</span>
+        <div className="col-span-2 row-start-1 h-[34px] px-4 bg-accent/[0.03] border-b border-card flex items-center gap-3 text-[12px]">
+          <span className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-accent shrink-0">
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent" />
+            Unpushed
+          </span>
+          <span className="min-w-0 flex-1 truncate text-ink-muted">{unpushedHint}</span>
           <button
             onClick={() => void onPushFromBanner()}
             disabled={pushing}
-            className="text-[11px] px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+            className="text-[11px] px-2 py-0.5 rounded text-accent hover:bg-accent/10 disabled:opacity-50 shrink-0"
             title="Push (⌘P)"
           >
             {pushing ? 'Pushing…' : 'Push now'}
