@@ -75,6 +75,7 @@ import {
   stashDiff,
   stashFiles as gitStashFiles,
   status as gitStatus,
+  undoLastCommit,
   unstageFiles,
 } from './git';
 import { listFilesUnder, listRepoFiles, readFileUnderRoot, writeFileUnderRoot } from './fs';
@@ -87,6 +88,7 @@ import {
   workspaceFetch,
   workspaceListPRs,
   workspaceOpenPRs,
+  resetReposToDefault,
   workspaceResetToDefault,
   workspacePushAll,
   workspaceStatus,
@@ -145,6 +147,11 @@ async function resolveDisplayIdentity(repo: Repo): Promise<ResolvedIdentity> {
 const DEV_URL = process.env.VITE_DEV_SERVER_URL;
 const isDev = !!DEV_URL;
 
+// build/icon.png is the master used by electron-builder to derive
+// .icns/.ico at packaging time. We also point at it directly so the
+// dock/window shows our mark when running unpackaged (npm run dev).
+const ICON_PATH = path.resolve(__dirname, '..', '..', 'build', 'icon.png');
+
 let mainWindow: BrowserWindow | null = null;
 
 function createWindow(): void {
@@ -156,6 +163,7 @@ function createWindow(): void {
     title: 'overgit',
     titleBarStyle: 'hiddenInset',
     backgroundColor: '#1c1c21',
+    icon: ICON_PATH,
     webPreferences: {
       preload: path.join(__dirname, '..', 'preload', 'index.js'),
       contextIsolation: true,
@@ -431,6 +439,12 @@ function registerIpc(): void {
     if (!repo) return { ok: false, error: 'Unknown repo' };
     const identity = await pickCommitIdentity(repo);
     return commitStaged(repo.path, args.message, identity);
+  });
+
+  ipcMain.handle('repo:undoLastCommit', async (_e, args: { repoId: string }) => {
+    const repo = repoFromArg(args);
+    if (!repo) return { ok: false, error: 'Unknown repo' };
+    return undoLastCommit(repo.path);
   });
 
   ipcMain.handle('repo:push', async (_e, repoId: string) => {
@@ -1017,9 +1031,32 @@ function registerIpc(): void {
     },
   );
 
-  ipcMain.handle('workspace:resetToDefault', async (_e, workspaceId: string) => {
-    const { workspaces, repos } = Store.load();
-    return workspaceResetToDefault(workspaceId, workspaces, repos);
+  ipcMain.handle(
+    'workspace:resetToDefault',
+    async (
+      _e,
+      args: { workspaceId: string; cleanupBranch?: string },
+    ) => {
+      const { workspaces, repos } = Store.load();
+      return workspaceResetToDefault(
+        args.workspaceId,
+        workspaces,
+        repos,
+        args.cleanupBranch,
+      );
+    },
+  );
+
+  ipcMain.handle('repos:resetAllToDefault', async (_e, repoIds?: string[]) => {
+    const { repos } = Store.load();
+    // Optional ID list lets the caller hand-pick the subset (e.g.
+    // skipping known-dirty repos surfaced in the pre-flight); empty
+    // or absent means "every repo in the sidebar".
+    const targets =
+      repoIds && repoIds.length > 0
+        ? repos.filter((r) => repoIds.includes(r.id))
+        : repos;
+    return resetReposToDefault(targets);
   });
 
   ipcMain.handle('repo:worktrees', async (_e, repoId: string) => {
@@ -1171,6 +1208,16 @@ function registerIpc(): void {
 }
 
 app.whenReady().then(() => {
+  // In packaged macOS builds the .app bundle's .icns drives the dock
+  // icon, but unpackaged runs (npm run dev, plain `electron .`) show
+  // the default Electron mark unless we set it explicitly.
+  if (process.platform === 'darwin' && !app.isPackaged && app.dock) {
+    try {
+      app.dock.setIcon(ICON_PATH);
+    } catch {
+      // ignore: missing/unreadable icon shouldn't block startup
+    }
+  }
   registerIpc();
   createWindow();
 

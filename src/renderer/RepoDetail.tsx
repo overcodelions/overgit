@@ -329,14 +329,24 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
           </button>
         </Explain>
         <Explain
-          command={`git push${status?.branch ? ` origin ${status.branch}` : ''}`}
+          command={`git push${status?.branch ? ` origin ${status.branch}` : ''}${status && !status.hasUpstream ? ' -u' : ''}`}
           plain="Send your local commits up to the remote."
         >
           <button
             disabled={busy || !status?.branch}
             onClick={onAction('push', () => pushRepo(repoId))}
-            title="Push (⌘P)"
-            className="text-xs px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50 flex items-center gap-1.5"
+            title={
+              status?.ahead
+                ? `${status.ahead} commit${status.ahead === 1 ? '' : 's'} to push (⌘P)`
+                : status?.branch && !status.hasUpstream
+                  ? `Branch has no upstream — first push will set origin/${status.branch} (⌘P)`
+                  : 'Push (⌘P)'
+            }
+            className={
+              (status?.ahead ?? 0) > 0 || (status?.branch && !status.hasUpstream)
+                ? 'text-xs px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50 flex items-center gap-1.5 shadow-[0_0_0_1px_rgba(124,58,237,0.55),0_0_12px_rgba(124,58,237,0.5)]'
+                : 'text-xs px-2.5 py-1 rounded bg-accent/30 text-ink-muted hover:bg-accent/50 hover:text-ink disabled:opacity-50 flex items-center gap-1.5'
+            }
           >
             {pending === 'push' ? (
               <>
@@ -345,7 +355,11 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
               </>
             ) : (
               <>
-                <span>Push{status?.ahead ? ` ↑${status.ahead}` : ''}</span>
+                <span>
+                  Push
+                  {status?.ahead ? ` ↑${status.ahead}` : ''}
+                  {status?.branch && !status.hasUpstream && !status?.ahead ? ' ↑*' : ''}
+                </span>
                 <kbd className="text-[11px] text-white/85 font-mono">⌘P</kbd>
               </>
             )}
@@ -614,6 +628,21 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
   const stashFilesAction = useStore((s) => s.stashFiles);
   const pushToast = useStore((s) => s.pushToast);
   const requestConfirm = useStore((s) => s.requestConfirm);
+  const pushRepo = useStore((s) => s.pushRepo);
+  const refreshRepoStatus = useStore((s) => s.refreshRepoStatus);
+  const [pushing, setPushing] = useState(false);
+  const onPushFromBanner = async () => {
+    setPushing(true);
+    try {
+      const res = await pushRepo(repoId);
+      if (!res.ok) {
+        pushToast({ kind: 'error', message: res.error ?? 'Push failed' });
+      }
+      await refreshRepoStatus(repoId);
+    } finally {
+      setPushing(false);
+    }
+  };
   // Last commit — pulled from the graph (already cached for History)
   // so this doesn't trigger an extra IPC call.
   const lastCommit = useStore((s) => s.repoGraph[repoId]?.[0]);
@@ -956,11 +985,35 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
     if (selected?.path === file.path) setSelected(null);
   };
 
+  const unpushedHint =
+    repoStatus &&
+    repoStatus.branch !== null &&
+    !repoStatus.inProgress &&
+    ((repoStatus.ahead ?? 0) > 0 || !repoStatus.hasUpstream)
+      ? !repoStatus.hasUpstream
+        ? `Branch ${repoStatus.branch} has no upstream — first push will set origin/${repoStatus.branch}`
+        : `${repoStatus.ahead} unpushed commit${repoStatus.ahead === 1 ? '' : 's'} on ${repoStatus.branch}`
+      : null;
+
   return (
     <div className="grid grid-cols-[360px_1fr] grid-rows-[auto_1fr] overflow-hidden">
       {repoStatus?.inProgress && (
         <div className="col-span-2 row-start-1">
           <ConflictBanner repoId={repoId} status={repoStatus} />
+        </div>
+      )}
+      {unpushedHint && (
+        <div className="col-span-2 row-start-1 px-4 py-2 bg-accent/10 border-b border-accent/30 flex items-center gap-3 text-xs">
+          <span className="text-accent font-medium">↑</span>
+          <span className="flex-1 text-ink">{unpushedHint}</span>
+          <button
+            onClick={() => void onPushFromBanner()}
+            disabled={pushing}
+            className="text-[11px] px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+            title="Push (⌘P)"
+          >
+            {pushing ? 'Pushing…' : 'Push now'}
+          </button>
         </div>
       )}
       <aside className="border-r border-card overflow-y-auto flex flex-col col-start-1 row-start-2">
@@ -3799,6 +3852,8 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
   const asideWidth = useStore((s) => s.settings.historyAsideWidth);
   const setAsideWidth = useStore((s) => s.setHistoryAsideWidth);
   const createBranch = useStore((s) => s.createRepoBranch);
+  const undoLastCommit = useStore((s) => s.undoLastCommit);
+  const repoStatus = useStore((s) => s.repoStatus[repoId]);
   const repoPath = useStore((s) => s.repos.find((r) => r.id === repoId)?.path);
   const openRepoFile = useStore((s) => s.openRepoFile);
   const pushToast = useStore((s) => s.pushToast);
@@ -4212,6 +4267,13 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
           x={menu.x}
           y={menu.y}
           onClose={() => setMenu(null)}
+          // Soft-undo only makes sense on the HEAD commit and only when
+          // it isn't already on the upstream — otherwise the local
+          // history would silently diverge.
+          canUndo={
+            menu.sha === headSha &&
+            (repoStatus?.ahead == null || repoStatus.ahead > 0)
+          }
           onCopySha={() => void navigator.clipboard.writeText(menu.sha)}
           onCopyShortSha={() => {
             const c = commits.find((cc) => cc.sha === menu.sha);
@@ -4244,6 +4306,19 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
               await useStore.getState().refreshRepoStatus(repoId);
             }
           }}
+          onUndo={async () => {
+            const res = await undoLastCommit(repoId);
+            if (!res.ok) {
+              pushToast({ kind: 'error', message: res.error ?? 'Undo failed' });
+            } else {
+              pushToast({
+                kind: 'success',
+                message: 'Last commit undone — changes staged',
+              });
+              setSelected('working');
+              refreshDiff(repoId, undefined);
+            }
+          }}
         />
       )}
     </div>
@@ -4254,20 +4329,24 @@ function CommitContextMenu({
   x,
   y,
   onClose,
+  canUndo,
   onCopySha,
   onCopyShortSha,
   onCopyMessage,
   onBranchFromHere,
   onCheckout,
+  onUndo,
 }: {
   x: number;
   y: number;
   onClose: () => void;
+  canUndo: boolean;
   onCopySha: () => void;
   onCopyShortSha: () => void;
   onCopyMessage: () => void;
   onBranchFromHere: (name: string) => void | Promise<void>;
   onCheckout: () => void;
+  onUndo: () => void | Promise<void>;
 }): JSX.Element {
   // Two modes: 'list' shows the menu, 'branch' shows an inline branch-
   // name input. We don't drop into window.prompt because Electron
@@ -4345,6 +4424,19 @@ function CommitContextMenu({
             }}
             tone="warn"
           />
+          {canUndo && (
+            <>
+              <div className="my-1 border-t border-card" />
+              <CtxItem
+                label="Undo this commit (soft reset)"
+                onClick={() => {
+                  void onUndo();
+                  onClose();
+                }}
+                tone="warn"
+              />
+            </>
+          )}
         </>
       ) : (
         <div className="px-3 py-2 flex flex-col gap-2">
@@ -5027,7 +5119,7 @@ function DiffView({
   );
 }
 
-function FileDiffBlock({
+export function FileDiffBlock({
   file,
   onOpenFile,
 }: {

@@ -1,22 +1,26 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useStore } from './store';
-import { RepoDetail } from './RepoDetail';
+import { RepoDetail, FileDiffBlock } from './RepoDetail';
 import { TitleBar } from './TitleBar';
-import { SheetHost } from './Sheets';
+import { SheetHost, ReviewBody, formatBytes } from './Sheets';
 import { CommandPalette } from './CommandPalette';
 import { Explain } from './Explain';
 import type {
   ChangedFile,
   CheckoutOutcome,
   CliPresence,
+  FileDiff,
+  LlmTool,
   PullRequest,
   Repo,
   RepoPRs,
   RepoStatus,
+  ReviewResult,
   SyncAndBranchOutcome,
   UUID,
   Workspace,
   WorkspaceActivity,
+  WorkspaceDiffTruncation,
   Worktree,
 } from '@shared/types';
 import { SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH } from '@shared/types';
@@ -267,8 +271,9 @@ function SidebarWithResize(): JSX.Element {
   );
 }
 
-/// Background freshness for the sidebar dirty / ahead / behind dots.
-/// Three triggers, all running the same fan-out (`refreshAllRepoStatuses`):
+/// Background freshness for the sidebar dirty / ahead / behind dots
+/// AND the currently-selected workset's per-member status. Three
+/// triggers, all running the same fan-outs:
 ///   1. Window focus — the common case. The user did something in a
 ///      terminal, alt-tabs back, expects the sidebar to reflect reality.
 ///   2. visibilitychange to "visible" — same idea, covers tab-style
@@ -276,11 +281,19 @@ function SidebarWithResize(): JSX.Element {
 ///   3. A 60s interval as a last-ditch backstop, but only while the
 ///      window is actually visible. We don't want a hidden background
 ///      window shelling out `git status` across 20 repos every minute.
-/// All three converge on a single store action so duplicate fires (e.g.
-/// focus + visibilitychange in quick succession) just race harmlessly
-/// toward the same merged state.
+/// All three converge on the same store actions so duplicate fires
+/// (e.g. focus + visibilitychange in quick succession) just race
+/// harmlessly toward the same merged state.
+///
+/// `refreshAllRepoStatuses` populates only the per-repo cache. The
+/// workset commit view reads `workspaceStatuses[id]`, which is a
+/// separate cache populated by `refreshWorkspaceStatus`. Without
+/// re-running that here, a user sitting on the workset's Commit tab
+/// would see "all clean" forever after editing files in a terminal,
+/// because `selectWorkspace` only fires on a fresh re-selection.
 function useSidebarStatusRefresh(): void {
   const refreshAll = useStore((s) => s.refreshAllRepoStatuses);
+  const refreshWsStatus = useStore((s) => s.refreshWorkspaceStatus);
   const loaded = useStore((s) => s.loaded);
 
   useEffect(() => {
@@ -296,6 +309,8 @@ function useSidebarStatusRefresh(): void {
       if (now - lastRun < COALESCE_MS) return;
       lastRun = now;
       void refreshAll();
+      const wsId = useStore.getState().selectedWorkspaceId;
+      if (wsId) void refreshWsStatus(wsId);
     };
     const onFocus = () => run();
     const onVisibility = () => {
@@ -312,7 +327,7 @@ function useSidebarStatusRefresh(): void {
       document.removeEventListener('visibilitychange', onVisibility);
       window.clearInterval(interval);
     };
-  }, [loaded, refreshAll]);
+  }, [loaded, refreshAll, refreshWsStatus]);
 }
 
 /// Background fetch so the sidebar's ahead/behind dots reflect the
@@ -527,6 +542,8 @@ function Sidebar(): JSX.Element {
   const archiveWorkspace = useStore((s) => s.archiveWorkspace);
   const unarchiveWorkspace = useStore((s) => s.unarchiveWorkspace);
   const requestConfirm = useStore((s) => s.requestConfirm);
+  const runResetAllReposFlow = useStore((s) => s.runResetAllReposFlow);
+  const [resetting, setResetting] = useState(false);
 
   const [search, setSearch] = useState('');
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set());
@@ -539,17 +556,18 @@ function Sidebar(): JSX.Element {
   /// who type → arrow get the obvious behavior.
   const [activeIdx, setActiveIdx] = useState<number>(-1);
 
-  const visibleRepos = useMemo(
-    () =>
-      query
-        ? repos.filter(
-            (r) =>
-              r.name.toLowerCase().includes(query) ||
-              r.path.toLowerCase().includes(query),
-          )
-        : repos,
-    [repos, query],
-  );
+  const visibleRepos = useMemo(() => {
+    const list = query
+      ? repos.filter(
+          (r) =>
+            r.name.toLowerCase().includes(query) ||
+            r.path.toLowerCase().includes(query),
+        )
+      : repos;
+    return [...list].sort((a, b) =>
+      a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }),
+    );
+  }, [repos, query]);
 
   const visibleWorkspaces = useMemo(
     () =>
@@ -652,6 +670,16 @@ function Sidebar(): JSX.Element {
     return m;
   }, [flatRows]);
 
+  const onResetAll = async () => {
+    if (resetting) return;
+    setResetting(true);
+    try {
+      await runResetAllReposFlow();
+    } finally {
+      setResetting(false);
+    }
+  };
+
   return (
     <aside
       className="flex-1 min-w-0 flex flex-col border-r border-card bg-surface-muted"
@@ -672,7 +700,22 @@ function Sidebar(): JSX.Element {
 
       <nav ref={navRef} className="flex-1 min-h-0 overflow-y-auto px-1 pb-2">
         {/* Repos on top — that's where users start. */}
-        <SectionHeader label="Repos" count={visibleRepos.length} />
+        <SectionHeader
+          label="Repos"
+          count={visibleRepos.length}
+          action={
+            repos.length > 0 ? (
+              <button
+                onClick={onResetAll}
+                disabled={resetting}
+                title="Fetch, switch to default branch, and pull on every repo. Dirty repos are skipped."
+                className="text-[10px] text-ink-faint hover:text-ink px-1.5 py-0.5 rounded hover:bg-card disabled:opacity-50"
+              >
+                {resetting ? 'Resetting…' : 'Reset all'}
+              </button>
+            ) : null
+          }
+        />
         {visibleRepos.length === 0 ? (
           <EmptyHint
             text={query ? 'No repos match.' : 'Add a local git repo to start.'}
@@ -887,11 +930,24 @@ function shortenPath(p: string): string {
   return '…' + sep + parts.slice(-2).join(sep);
 }
 
-function SectionHeader({ label, count }: { label: string; count: number }): JSX.Element {
+function SectionHeader({
+  label,
+  count,
+  action,
+}: {
+  label: string;
+  count: number;
+  /// Optional trailing element rendered right-aligned in the header
+  /// row. Used by the Repos section to surface a "Reset all to default"
+  /// affordance without bolting another control elsewhere in the
+  /// sidebar.
+  action?: React.ReactNode;
+}): JSX.Element {
   return (
     <div className="mt-3 first:mt-1 px-2 py-1 flex items-center gap-2">
       <span className="text-[10px] uppercase tracking-wide text-ink-faint">{label}</span>
       <span className="text-[10px] text-ink-faint">{count}</span>
+      {action && <div className="ml-auto">{action}</div>}
     </div>
   );
 }
@@ -1282,6 +1338,31 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
     const dirty = statuses.filter((s) => s.dirtyCount > 0).length;
     const ahead = statuses.filter((s) => (s.ahead ?? 0) > 0).length;
     const behind = statuses.filter((s) => (s.behind ?? 0) > 0).length;
+    // "Needs first push" — branch exists, hasn't been pushed yet
+    // (no upstream tracking ref), AND has at least one commit beyond
+    // the repo's default branch. `git push -u origin HEAD` would
+    // wire it up; the workspace-level Push handler reports these
+    // back as `pushed-new-upstream`, so the button should enable
+    // for them even though `ahead` reads as null.
+    //
+    // Branches with no commits beyond default (just-created and never
+    // committed to) are excluded — pushing them publishes nothing
+    // useful, and gating the lifecycle on them traps the user when
+    // they want to abandon an empty workset.
+    const needsFirstPush = statuses.filter(
+      (s) =>
+        s.branch !== null &&
+        !s.hasUpstream &&
+        (s.aheadDefault ?? 0) > 0,
+    ).length;
+    // PR-eligible: on a non-default branch (we don't probe gh here
+    // for already-open PRs — that's the per-row outcome's job).
+    const prCandidates = statuses.filter((s) => {
+      if (s.branch === null) return false;
+      const repo = repos.find((r) => r.id === s.repoId);
+      const def = repo?.defaultBranch;
+      return !def || s.branch !== def;
+    }).length;
     // Repos in the middle of a merge / rebase / cherry-pick. Surfaced
     // in the overview because a workspace-wide op (rebase the workspace
     // onto main) can leave several repos paused on conflicts at once;
@@ -1297,8 +1378,19 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
       branchTally.set(b, (branchTally.get(b) ?? 0) + 1);
     }
     const sortedBranches = [...branchTally.entries()].sort((a, b) => b[1] - a[1]);
-    return { total, loaded, dirty, ahead, behind, inProgress, conflictedFiles, sortedBranches };
-  }, [ws?.repoIds.length, statuses]);
+    return {
+      total,
+      loaded,
+      dirty,
+      ahead,
+      behind,
+      needsFirstPush,
+      prCandidates,
+      inProgress,
+      conflictedFiles,
+      sortedBranches,
+    };
+  }, [ws?.repoIds.length, statuses, repos]);
 
   if (!ws) return <main className="flex-1" />;
 
@@ -1365,76 +1457,83 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
           </div>
         </div>
         <div className="flex gap-2">
-          <Explain
-            command="for repo in workspace; do git checkout default && git pull && git checkout -b <new>; done"
-            plain="Sync every repo to its default branch, pull, and create a shared new branch in each."
-          >
-            <button
-              onClick={() => setSheet({ kind: 'newBranchInWorkspace', workspaceId })}
-              disabled={ws.repoIds.length === 0}
-              title="Sync each repo to its default branch, pull, and create a new branch — all in one go"
-              className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+          {/* "New branch" only makes sense before the workset is settled
+              on its bound branch. Once preferredBranch is set and every
+              loaded member is on it, branching again is ambiguous —
+              it'd either rebind the workset (surprising) or fork a
+              sibling (no first-class semantic). Hide it; the lifecycle
+              tells the user to commit / push / archive instead. */}
+          {(!ws.preferredBranch || drifters > 0 || summary.loaded === 0) && (
+            <Explain
+              command="for repo in workspace; do git checkout default && git pull && git checkout -b <new>; done"
+              plain="Sync every repo to its default branch, pull, and create a shared new branch in each."
             >
-              + New branch
-            </button>
-          </Explain>
-          <Explain
-            command='for repo in dirty; do git add -A && git commit -m "…"; done'
-            plain="Stage every change in every dirty repo and commit them all with a shared message."
-          >
-            <button
-              onClick={() => setSheet({ kind: 'commitAllInWorkspace', workspaceId })}
-              disabled={summary.dirty === 0 || hasDrift}
-              title={
-                hasDrift
-                  ? driftTooltip!
-                  : summary.dirty === 0
-                    ? 'Nothing to commit — all repos are clean'
-                    : `Stage and commit every dirty repo with a shared message (${summary.dirty} dirty)`
-              }
-              className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+              <button
+                onClick={() => setSheet({ kind: 'newBranchInWorkspace', workspaceId })}
+                disabled={ws.repoIds.length === 0}
+                title="Sync each repo to its default branch, pull, and create a new branch — all in one go"
+                className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+              >
+                + New branch
+              </button>
+            </Explain>
+          )}
+          {/* Toolbar buttons hide when the action would be a no-op.
+              The lifecycle stepper above already tells the user *why*
+              they can't act (drift, dirty, ahead, etc.), so disabled
+              greyed-out buttons here add noise without information. */}
+          {summary.dirty > 0 && !hasDrift && (
+            <Explain
+              command='for repo in dirty; do git add -A && git commit -m "…"; done'
+              plain="Stage every change in every dirty repo and commit them all with a shared message."
             >
-              Commit all
-            </button>
-          </Explain>
-          <Explain
-            command="for repo in ahead; do git push; done"
-            plain="Send local commits up to the remote for every repo that's ahead of upstream."
-          >
-            <button
-              onClick={() => setSheet({ kind: 'pushAllInWorkspace', workspaceId })}
-              disabled={hasDrift || (summary.ahead === 0 && summary.total > 0)}
-              title={
-                hasDrift
-                  ? driftTooltip!
-                  : summary.ahead === 0
-                    ? 'Nothing to push — every repo is already in sync'
-                    : `Push every repo whose branch is ahead of upstream (${summary.ahead} ahead)`
-              }
-              className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+              <button
+                onClick={() => setSheet({ kind: 'commitAllInWorkspace', workspaceId })}
+                title={`Stage and commit every dirty repo with a shared message (${summary.dirty} dirty)`}
+                className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
+              >
+                Commit all
+              </button>
+            </Explain>
+          )}
+          {!hasDrift && (summary.ahead > 0 || summary.needsFirstPush > 0) && (
+            <Explain
+              command="for repo in ahead; do git push; done"
+              plain="Send local commits up to the remote for every repo that's ahead of upstream."
             >
-              Push all{summary.ahead > 0 ? ` ↑${summary.ahead}` : ''}
-            </button>
-          </Explain>
-          <Explain
-            command="gh pr create"
-            plain="Open a GitHub pull request for each repo using a shared title and body."
-          >
-            <button
-              onClick={() => setSheet({ kind: 'openPRsInWorkspace', workspaceId })}
-              disabled={!cli?.gh || ws.repoIds.length === 0 || hasDrift}
-              title={
-                !cli?.gh
-                  ? 'Install gh to open PRs from overgit'
-                  : hasDrift
-                    ? driftTooltip!
-                    : 'Open a GitHub PR per repo with a shared title and body'
-              }
-              className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+              <button
+                onClick={() => setSheet({ kind: 'pushAllInWorkspace', workspaceId })}
+                title={
+                  summary.needsFirstPush > 0 && summary.ahead === 0
+                    ? `Push ${summary.needsFirstPush} ${summary.needsFirstPush === 1 ? 'repo' : 'repos'} for the first time (sets upstream)`
+                    : `Push every repo whose branch is ahead of upstream (${summary.ahead} ahead${summary.needsFirstPush > 0 ? `, ${summary.needsFirstPush} first-push` : ''})`
+                }
+                className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
+              >
+                Push all
+                {summary.ahead > 0 ? ` ↑${summary.ahead}` : ''}
+                {summary.needsFirstPush > 0 ? ` ↑${summary.needsFirstPush}*` : ''}
+              </button>
+            </Explain>
+          )}
+          {!hasDrift && summary.prCandidates > 0 && (
+            <Explain
+              command="gh pr create"
+              plain="Open a pull request for each repo using a shared title and body. GitHub repos run gh; Bitbucket repos open the create-PR form in your browser."
             >
-              Open PRs
-            </button>
-          </Explain>
+              <button
+                onClick={() => setSheet({ kind: 'openPRsInWorkspace', workspaceId })}
+                title={
+                  !cli?.gh
+                    ? 'GitHub needs gh installed; Bitbucket opens in the browser'
+                    : 'Open a PR per repo with a shared title and body'
+                }
+                className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
+              >
+                Open PRs
+              </button>
+            </Explain>
+          )}
           <Explain
             command=""
             plain="Add or remove repos in this workset, rename it, or pick a default branch."
@@ -1530,7 +1629,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
           try {
             outcomes = await window.overgit.invoke(
               'workspace:resetToDefault',
-              workspaceId,
+              { workspaceId, cleanupBranch: ws.preferredBranch },
             );
           } catch (err) {
             dismissToast(progressId);
@@ -1545,6 +1644,10 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
           }
           dismissToast(progressId);
           const failed = outcomes.filter((o) => o.result !== 'reset');
+          const cleanedCount = outcomes.filter((o) => o.cleanedUpBranch).length;
+          const cleanupSuffix = cleanedCount > 0
+            ? ` Removed empty branch from ${cleanedCount} ${cleanedCount === 1 ? 'repo' : 'repos'}.`
+            : '';
           if (failed.length > 0) {
             const summaryStr = failed
               .map((o) => {
@@ -1556,7 +1659,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
               kind: 'warn',
               message: `Archived. ${failed.length} of ${outcomes.length} ${
                 failed.length === 1 ? 'repo' : 'repos'
-              } not reset — ${summaryStr}.`,
+              } not reset — ${summaryStr}.${cleanupSuffix}`,
               sticky: true,
             });
           } else {
@@ -1564,7 +1667,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
               kind: 'success',
               message: `Archived. All ${outcomes.length} ${
                 outcomes.length === 1 ? 'repo is' : 'repos are'
-              } back on default.`,
+              } back on default.${cleanupSuffix}`,
             });
           }
           void archiveWs(workspaceId);
@@ -1654,24 +1757,36 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
         )}
       </section>
 
-      {lastCheckout && lastCheckout.workspaceId === workspaceId && lastCheckout.outcomes.length > 0 && (
-        <section className="mb-6 p-3 rounded-lg bg-card border border-card">
-          <div className="text-[10px] uppercase tracking-wide text-ink-faint mb-2">
-            Last switch · {lastCheckout.branch}
-          </div>
-          <ul className="flex flex-col gap-1.5">
-            {lastCheckout.outcomes.map((o) => (
-              <CheckoutOutcomeRow
-                key={o.repoId}
-                outcome={o}
-                repoName={reposById.get(o.repoId)?.name ?? o.repoId}
-                workspaceId={workspaceId}
-                branch={lastCheckout.branch}
-              />
-            ))}
-          </ul>
-        </section>
-      )}
+      {lastCheckout && lastCheckout.workspaceId === workspaceId && (() => {
+        // Drop failure outcomes whose repo has since landed on the
+        // target branch — the user resolved the situation via another
+        // path (branch picker, "Create from default", external git)
+        // and the stale row would otherwise nag forever.
+        const visibleOutcomes = lastCheckout.outcomes.filter((o) => {
+          if (o.result === 'switched' || o.result === 'already-on-branch') return true;
+          const st = statuses.find((s) => s.repoId === o.repoId);
+          return !st || st.branch !== lastCheckout.branch;
+        });
+        if (visibleOutcomes.length === 0) return null;
+        return (
+          <section className="mb-6 p-3 rounded-lg bg-card border border-card">
+            <div className="text-[10px] uppercase tracking-wide text-ink-faint mb-2">
+              Last switch · {lastCheckout.branch}
+            </div>
+            <ul className="flex flex-col gap-1.5">
+              {visibleOutcomes.map((o) => (
+                <CheckoutOutcomeRow
+                  key={o.repoId}
+                  outcome={o}
+                  repoName={reposById.get(o.repoId)?.name ?? o.repoId}
+                  workspaceId={workspaceId}
+                  branch={lastCheckout.branch}
+                />
+              ))}
+            </ul>
+          </section>
+        );
+      })()}
 
       {/* PRs only show when gh is installed AND at least one repo
           successfully returned PR data. If every entry errored (no
@@ -1784,6 +1899,38 @@ function WorkspaceUnifiedCommit({
   const unstage = useStore((s) => s.unstageFiles);
   const commitRepo = useStore((s) => s.commitRepo);
   const pushToast = useStore((s) => s.pushToast);
+  const cli = useStore((s) => s.cliPresence);
+
+  // Inline diff cache, keyed by `${repoId}::${path}`. Populated lazily
+  // when the user expands a file row — the workset commit pane defaults
+  // to a file list and only fetches diffs for what the user actually
+  // wants to inspect, since worksets can have many repos × many files
+  // and pre-fetching everything would be wasteful.
+  const [expandedFiles, setExpandedFiles] = useState<Set<string>>(new Set());
+  const [fileDiffs, setFileDiffs] = useState<Record<string, FileDiff[] | 'loading' | 'error'>>({});
+  const fileKey = (repoId: UUID, path: string) => `${repoId}::${path}`;
+  const toggleFileExpanded = (repoId: UUID, path: string) => {
+    const k = fileKey(repoId, path);
+    setExpandedFiles((cur) => {
+      const next = new Set(cur);
+      if (next.has(k)) {
+        next.delete(k);
+        return next;
+      }
+      next.add(k);
+      // Fire the diff fetch on first expand. Using `combined` so the
+      // body the user sees is the same union of staged + unstaged that
+      // a checked file actually commits.
+      if (fileDiffs[k] === undefined) {
+        setFileDiffs((d) => ({ ...d, [k]: 'loading' }));
+        void window.overgit
+          .invoke('repo:diffFile', { repoId, path, side: 'combined' })
+          .then((files) => setFileDiffs((d) => ({ ...d, [k]: files })))
+          .catch(() => setFileDiffs((d) => ({ ...d, [k]: 'error' })));
+      }
+      return next;
+    });
+  };
 
   const dirtyOnBranch = useMemo(
     () => statuses.filter((s) => s.dirtyCount > 0 && s.branch !== null),
@@ -1861,6 +2008,38 @@ function WorkspaceUnifiedCommit({
   const [outcomes, setOutcomes] = useState<Record<UUID, Outcome>>({});
   const [busy, setBusy] = useState(false);
 
+  // LLM affordances. The list of detected tools comes from cliPresence —
+  // we hide the whole bar when no tool is installed so the UI doesn't
+  // tease features the user can't reach. State machine mirrors the one
+  // in WorkspaceCommitAllSheet so the affordance behaves identically
+  // whether the user invokes it inline or from the sheet.
+  const availableTools: LlmTool[] = useMemo(() => {
+    const out: LlmTool[] = [];
+    if (cli?.claude) out.push('claude');
+    if (cli?.codex) out.push('codex');
+    if (cli?.gemini) out.push('gemini');
+    return out;
+  }, [cli]);
+  const [tool, setTool] = useState<LlmTool | null>(availableTools[0] ?? null);
+  useEffect(() => {
+    if (!tool && availableTools.length > 0) setTool(availableTools[0]);
+  }, [tool, availableTools]);
+  type CliStatus =
+    | { kind: 'idle' }
+    | { kind: 'drafting'; tool: LlmTool }
+    | { kind: 'reviewing'; tool: LlmTool }
+    | { kind: 'drafted'; tool: LlmTool }
+    | { kind: 'err'; message: string };
+  const [cliStatus, setCliStatus] = useState<CliStatus>({ kind: 'idle' });
+  const [review, setReview] = useState<ReviewResult | null>(null);
+  const [truncated, setTruncated] = useState<WorkspaceDiffTruncation[]>([]);
+  const cliBusy = cliStatus.kind === 'drafting' || cliStatus.kind === 'reviewing';
+  useEffect(() => {
+    if (cliStatus.kind !== 'drafted') return;
+    const t = setTimeout(() => setCliStatus({ kind: 'idle' }), 2500);
+    return () => clearTimeout(t);
+  }, [cliStatus]);
+
   const messageFor = (id: UUID) =>
     overrides.has(id) ? perRepoMessage[id] ?? '' : sharedMessage;
 
@@ -1930,6 +2109,43 @@ function WorkspaceUnifiedCommit({
     }
   };
 
+  const onDraftMessage = async () => {
+    if (!tool || dirtyOnBranch.length === 0) return;
+    setCliStatus({ kind: 'drafting', tool });
+    try {
+      const res = await window.overgit.invoke('workspace:suggestCommitMessage', {
+        workspaceId,
+        tool,
+      });
+      setTruncated(res.truncated);
+      if (!res.ok) {
+        setCliStatus({ kind: 'err', message: res.error });
+        return;
+      }
+      setSharedMessage(res.message);
+      setCliStatus({ kind: 'drafted', tool: res.tool });
+    } catch (err: unknown) {
+      setCliStatus({ kind: 'err', message: String(err) });
+    }
+  };
+
+  const onReviewChanges = async () => {
+    if (!tool || dirtyOnBranch.length === 0) return;
+    setReview(null);
+    setCliStatus({ kind: 'reviewing', tool });
+    try {
+      const res = await window.overgit.invoke('workspace:reviewChanges', {
+        workspaceId,
+        tool,
+      });
+      setTruncated(res.truncated);
+      setReview(res);
+      setCliStatus({ kind: 'idle' });
+    } catch (err: unknown) {
+      setCliStatus({ kind: 'err', message: String(err) });
+    }
+  };
+
   if (dirtyOnBranch.length === 0 && dirtyDetached.length === 0) {
     return (
       <div className="text-xs text-ink-faint p-4 rounded border border-card bg-card">
@@ -1942,9 +2158,31 @@ function WorkspaceUnifiedCommit({
     <div className="flex flex-col gap-4">
       <section className="p-3 rounded-lg border border-card bg-card flex flex-col gap-2">
         <label className="flex flex-col gap-1">
-          <span className="text-[10px] uppercase tracking-wide text-ink-faint">
-            Shared commit message
-          </span>
+          <div className="flex items-center justify-between text-[10px]">
+            <span className="uppercase tracking-wide text-ink-faint">
+              Shared commit message
+            </span>
+            {cliStatus.kind === 'drafting' && (
+              <span className="text-ink-faint">
+                Drafting with <span className="font-mono">{cliStatus.tool}</span>…
+              </span>
+            )}
+            {cliStatus.kind === 'reviewing' && (
+              <span className="text-ink-faint">
+                Reviewing with <span className="font-mono">{cliStatus.tool}</span>…
+              </span>
+            )}
+            {cliStatus.kind === 'drafted' && (
+              <span className="text-emerald-400">
+                ✓ drafted with <span className="font-mono">{cliStatus.tool}</span>
+              </span>
+            )}
+            {cliStatus.kind === 'err' && (
+              <span className="text-red-400 truncate" title={cliStatus.message}>
+                {cliStatus.message}
+              </span>
+            )}
+          </div>
           <textarea
             value={sharedMessage}
             onChange={(e) => setSharedMessage(e.target.value)}
@@ -1954,6 +2192,60 @@ function WorkspaceUnifiedCommit({
             className="field px-2 py-1.5 text-sm resize-none"
           />
         </label>
+        {availableTools.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2 text-[11px]">
+            <span className="text-[10px] uppercase tracking-wide text-ink-faint">
+              CLI
+            </span>
+            <div className="flex gap-1">
+              {availableTools.map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setTool(t)}
+                  disabled={cliBusy}
+                  className={`text-[11px] font-mono px-2 py-0.5 rounded border ${
+                    tool === t
+                      ? 'bg-accent text-white border-accent'
+                      : 'border-card hover:bg-surface-elevated'
+                  } disabled:opacity-50`}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={() => void onDraftMessage()}
+              disabled={cliBusy || busy || !tool || dirtyOnBranch.length === 0}
+              className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-surface-elevated disabled:opacity-50"
+              title="Draft a shared commit message from the aggregated workset diff"
+            >
+              ✨ Draft message
+            </button>
+            <button
+              onClick={() => void onReviewChanges()}
+              disabled={cliBusy || busy || !tool || dirtyOnBranch.length === 0}
+              className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-surface-elevated disabled:opacity-50"
+              title="Pipe the aggregated workset diff to the CLI for review"
+            >
+              Review changes
+            </button>
+            <span className="ml-auto text-[10px] text-ink-faint">
+              Aggregates dirty diffs across {dirtyOnBranch.length}{' '}
+              {dirtyOnBranch.length === 1 ? 'repo' : 'repos'} into one prompt.
+            </span>
+          </div>
+        )}
+        {truncated.length > 0 && (
+          <div className="text-[11px] text-amber-400 bg-amber-500/[0.06] border border-amber-700/40 rounded px-3 py-2">
+            Diff too large for {truncated.length}{' '}
+            {truncated.length === 1 ? 'repo' : 'repos'} — sent shortstat summary
+            instead of full diff:{' '}
+            {truncated
+              .map((t) => `${t.repoName} (${formatBytes(t.originalBytes)})`)
+              .join(', ')}
+            .
+          </div>
+        )}
         <div className="flex items-center justify-between gap-2 text-[11px] text-ink-faint">
           <span>
             {committable.length} of {dirtyOnBranch.length} repos ready to commit
@@ -1979,6 +2271,24 @@ function WorkspaceUnifiedCommit({
           </div>
         </div>
       </section>
+
+      {review && (
+        <section className="p-3 rounded-lg border border-card bg-card flex flex-col gap-2">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] uppercase tracking-wide text-ink-faint">
+              Review
+            </span>
+            <button
+              onClick={() => setReview(null)}
+              className="text-ink-faint hover:text-ink text-xs"
+              title="Dismiss review"
+            >
+              ✕
+            </button>
+          </div>
+          <ReviewBody result={review} />
+        </section>
+      )}
 
       {dirtyDetached.length > 0 && (
         <div className="text-[11px] text-amber-400 bg-amber-500/[0.06] border border-amber-700/40 rounded px-3 py-2">
@@ -2109,28 +2419,60 @@ function WorkspaceUnifiedCommit({
                         </span>
                       </div>
                       <ul className="flex flex-col">
-                        {allFiles.map((f) => (
-                          <li
-                            key={f.path}
-                            className="flex items-center gap-2 py-0.5 text-[12px]"
-                          >
-                            <input
-                              type="checkbox"
-                              checked={ck.has(f.path)}
-                              onChange={() => toggleOne(f.path)}
-                              disabled={busy}
-                            />
-                            <UnifiedFileBadge file={f} />
-                            <span className="font-mono truncate" title={f.path}>
-                              {f.path}
-                            </span>
-                            {f.origPath && (
-                              <span className="text-[11px] text-ink-faint italic truncate">
-                                ← {f.origPath}
-                              </span>
-                            )}
-                          </li>
-                        ))}
+                        {allFiles.map((f) => {
+                          const k = fileKey(s.repoId, f.path);
+                          const fileExpanded = expandedFiles.has(k);
+                          const diff = fileDiffs[k];
+                          return (
+                            <li key={f.path} className="flex flex-col">
+                              <div className="flex items-center gap-2 py-0.5 text-[12px]">
+                                <input
+                                  type="checkbox"
+                                  checked={ck.has(f.path)}
+                                  onChange={() => toggleOne(f.path)}
+                                  disabled={busy}
+                                />
+                                <UnifiedFileBadge file={f} />
+                                <button
+                                  onClick={() => toggleFileExpanded(s.repoId, f.path)}
+                                  className="font-mono truncate text-left hover:underline min-w-0 flex-1"
+                                  title={`${f.path} — click to ${fileExpanded ? 'hide' : 'show'} diff`}
+                                >
+                                  {f.path}
+                                </button>
+                                {f.origPath && (
+                                  <span className="text-[11px] text-ink-faint italic truncate">
+                                    ← {f.origPath}
+                                  </span>
+                                )}
+                                <span className="text-[10px] text-ink-faint w-3 text-right">
+                                  {fileExpanded ? '▾' : '▸'}
+                                </span>
+                              </div>
+                              {fileExpanded && (
+                                <div className="ml-6 my-1">
+                                  {diff === undefined || diff === 'loading' ? (
+                                    <div className="text-[11px] text-ink-faint px-3 py-2 border border-card rounded bg-card/40">
+                                      Loading diff…
+                                    </div>
+                                  ) : diff === 'error' ? (
+                                    <div className="text-[11px] text-red-400 px-3 py-2 border border-red-500/30 rounded bg-red-500/[0.06]">
+                                      Failed to load diff for {f.path}
+                                    </div>
+                                  ) : diff.length === 0 ? (
+                                    <div className="text-[11px] text-ink-faint px-3 py-2 border border-card rounded bg-card/40">
+                                      No diff body — likely a binary or rename-only change.
+                                    </div>
+                                  ) : (
+                                    diff.map((fd) => (
+                                      <FileDiffBlock key={fd.path} file={fd} />
+                                    ))
+                                  )}
+                                </div>
+                              )}
+                            </li>
+                          );
+                        })}
                       </ul>
                     </>
                   )}
@@ -2280,7 +2622,7 @@ function LifecycleStepper({
 }: {
   boundBranch: string | null;
   onBoundBranchCount: number;
-  summary: { dirty: number; ahead: number; loaded: number };
+  summary: { dirty: number; ahead: number; needsFirstPush: number; loaded: number };
   onArchive: () => Promise<void> | void;
 }): JSX.Element {
   const [archiving, setArchiving] = useState(false);
@@ -2289,7 +2631,8 @@ function LifecycleStepper({
     summary.loaded > 0 &&
     onBoundBranchCount === summary.loaded;
   const commitMet = branchMet && summary.dirty === 0;
-  const pushMet = commitMet && summary.ahead === 0;
+  const pushMet =
+    commitMet && summary.ahead === 0 && summary.needsFirstPush === 0;
   const canArchive = pushMet;
 
   const branchHint = !boundBranch
@@ -2306,9 +2649,13 @@ function LifecycleStepper({
       : 'all clean';
   const pushHint = !commitMet
     ? 'Commit first'
-    : summary.ahead > 0
-      ? `${summary.ahead} ahead`
-      : 'all pushed';
+    : summary.ahead > 0 && summary.needsFirstPush > 0
+      ? `${summary.ahead} ahead · ${summary.needsFirstPush} unpushed`
+      : summary.ahead > 0
+        ? `${summary.ahead} ahead`
+        : summary.needsFirstPush > 0
+          ? `${summary.needsFirstPush} ${summary.needsFirstPush === 1 ? 'branch' : 'branches'} unpushed`
+          : 'all pushed';
 
   return (
     <section className="mb-4 px-3 py-2.5 rounded-lg border border-card bg-card/40 flex items-center gap-3">

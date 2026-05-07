@@ -35,6 +35,14 @@ interface RunResult {
   code: number | null;
 }
 
+// Cap on accumulated stdout/stderr per child. V8's max string length is
+// ~512 MB; once we cross it `s += chunk.toString()` throws RangeError
+// and kills the main process. 128 MB is far below the limit and far
+// above any plausible legitimate diff/log output we'd parse here — if
+// we hit it, something pathological is happening (binary diff, runaway
+// patch-id stream) and killing the child is the right call.
+const MAX_GIT_OUTPUT_BYTES = 128 * 1024 * 1024;
+
 function run(
   cwd: string,
   args: string[],
@@ -48,6 +56,9 @@ function run(
     const child = spawn('git', args, { cwd, env });
     let stdout = '';
     let stderr = '';
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let truncated: 'stdout' | 'stderr' | null = null;
     let settled = false;
     const done = (r: RunResult) => {
       if (settled) return;
@@ -73,13 +84,46 @@ function run(
           });
         }, timeoutMs)
       : null;
-    child.stdout.on('data', (b) => {
+    child.stdout.on('data', (b: Buffer) => {
+      if (truncated) return;
+      if (stdoutBytes + b.length > MAX_GIT_OUTPUT_BYTES) {
+        truncated = 'stdout';
+        try {
+          child.kill('SIGTERM');
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+      stdoutBytes += b.length;
       stdout += b.toString('utf8');
     });
-    child.stderr.on('data', (b) => {
+    child.stderr.on('data', (b: Buffer) => {
+      if (truncated) return;
+      if (stderrBytes + b.length > MAX_GIT_OUTPUT_BYTES) {
+        truncated = 'stderr';
+        try {
+          child.kill('SIGTERM');
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+      stderrBytes += b.length;
       stderr += b.toString('utf8');
     });
     child.on('close', (code) => {
+      if (truncated) {
+        done({
+          ok: false,
+          stdout,
+          stderr:
+            stderr ||
+            `git ${args[0] ?? ''} produced more than ${Math.round(MAX_GIT_OUTPUT_BYTES / (1024 * 1024))} MB on ${truncated} — killed`,
+          code: null,
+        });
+        return;
+      }
       done({ ok: code === 0, stdout, stderr, code });
     });
     child.on('error', (err) => {
@@ -126,19 +170,55 @@ function runWithInput(cwd: string, args: string[], input: string): Promise<RunRe
     const child = spawn('git', args, { cwd, env: process.env });
     let stdout = '';
     let stderr = '';
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let truncated: 'stdout' | 'stderr' | null = null;
     let settled = false;
     const done = (r: RunResult) => {
       if (settled) return;
       settled = true;
       resolve(r);
     };
-    child.stdout.on('data', (b) => {
+    child.stdout.on('data', (b: Buffer) => {
+      if (truncated) return;
+      if (stdoutBytes + b.length > MAX_GIT_OUTPUT_BYTES) {
+        truncated = 'stdout';
+        try {
+          child.kill('SIGTERM');
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+      stdoutBytes += b.length;
       stdout += b.toString('utf8');
     });
-    child.stderr.on('data', (b) => {
+    child.stderr.on('data', (b: Buffer) => {
+      if (truncated) return;
+      if (stderrBytes + b.length > MAX_GIT_OUTPUT_BYTES) {
+        truncated = 'stderr';
+        try {
+          child.kill('SIGTERM');
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+      stderrBytes += b.length;
       stderr += b.toString('utf8');
     });
     child.on('close', (code) => {
+      if (truncated) {
+        done({
+          ok: false,
+          stdout,
+          stderr:
+            stderr ||
+            `git ${args[0] ?? ''} produced more than ${Math.round(MAX_GIT_OUTPUT_BYTES / (1024 * 1024))} MB on ${truncated} — killed`,
+          code: null,
+        });
+        return;
+      }
       done({ ok: code === 0, stdout, stderr, code });
     });
     child.on('error', (err) => {
@@ -239,6 +319,7 @@ export async function status(
       worktreeDels: null,
       ahead: null,
       behind: null,
+      hasUpstream: false,
       aheadDefault: null,
       behindDefault: null,
       defaultRef: null,
@@ -280,6 +361,7 @@ export async function status(
 
   let ahead: number | null = null;
   let behind: number | null = null;
+  let hasUpstream = false;
   if (branch) {
     const upstreamRes = await run(repoPath, [
       'rev-list',
@@ -288,6 +370,7 @@ export async function status(
       '@{u}...HEAD',
     ]);
     if (upstreamRes.ok) {
+      hasUpstream = true;
       const [b, a] = upstreamRes.stdout.trim().split(/\s+/).map((n) => Number.parseInt(n, 10));
       if (Number.isFinite(b) && Number.isFinite(a)) {
         behind = b;
@@ -368,6 +451,7 @@ export async function status(
     worktreeDels,
     ahead,
     behind,
+    hasUpstream,
     aheadDefault,
     behindDefault,
     defaultRef,
@@ -1174,7 +1258,29 @@ export async function applyStash(
   const ref = `stash@{${index}}`;
   const res = await run(repoPath, ['stash', pop ? 'pop' : 'apply', ref]);
   if (res.ok) return { ok: true };
-  const stderr = res.stderr.trim() || `git stash exited ${res.code}`;
+
+  // Content-merge conflicts ("CONFLICT (content): Merge conflict in foo")
+  // print to STDOUT, not stderr — and stderr in that case is often
+  // empty or just "error: could not restore index from stash". Without
+  // pulling stdout in, the renderer just shows "git stash exited 1".
+  // We surface the conflicting files and tell the user the stash
+  // partially applied so they know to resolve markers in place. The
+  // stash entry is preserved by git in this case (apply OR pop), so
+  // we don't conflate this with the untracked-file collision case
+  // that the force-overwrite affordance is built for.
+  const contentConflicts = parseContentConflicts(res.stdout);
+  if (contentConflicts.length) {
+    const list = contentConflicts.map((p) => `  • ${p}`).join('\n');
+    return {
+      ok: false,
+      error:
+        `Stash applied with conflicts in:\n${list}\n\n` +
+        `Resolve the conflict markers, then \`git add\` each file. ` +
+        `The stash entry is still in your list — drop it once you're happy.`,
+    };
+  }
+
+  const stderr = res.stderr.trim() || res.stdout.trim() || `git stash exited ${res.code}`;
   // Detect the "untracked file already exists" failure shape so the
   // renderer can offer a force-overwrite affordance instead of just
   // surfacing a wall of git output.
@@ -1190,6 +1296,19 @@ function parseAlreadyExistsConflicts(stderr: string): string[] {
   const out: string[] = [];
   for (const line of stderr.split('\n')) {
     const m = line.match(/^(.+) already exists, no checkout$/);
+    if (m) out.push(m[1].trim());
+  }
+  return out;
+}
+
+function parseContentConflicts(stdout: string): string[] {
+  // `git stash apply` writes "CONFLICT (content): Merge conflict in <path>"
+  // to stdout for each file with merge conflicts. Some conflict types
+  // use different parenthetical tags (add/add, modify/delete) — we
+  // accept any "CONFLICT (...): ... in <path>" shape.
+  const out: string[] = [];
+  for (const line of stdout.split('\n')) {
+    const m = line.match(/^CONFLICT \([^)]+\):.* in (.+)$/);
     if (m) out.push(m[1].trim());
   }
   return out;
@@ -1715,6 +1834,23 @@ export async function discardFiles(
     }
   }
   return { ok: true };
+}
+
+/// Undo the most recent commit while preserving the working tree and
+/// keeping the changes staged — `git reset --soft HEAD~1`. Caller is
+/// expected to gate on "unpushed only" (we don't check ahead/behind
+/// here so this stays a pure local op the caller can also use after a
+/// confirm-then-force-push flow). Refuses on the initial commit
+/// because HEAD~1 doesn't resolve there.
+export async function undoLastCommit(
+  repoPath: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  const parent = await run(repoPath, ['rev-parse', '--verify', '--quiet', 'HEAD~1']);
+  if (!parent.ok) return { ok: false, error: 'No previous commit to undo to' };
+  const res = await run(repoPath, ['reset', '--soft', 'HEAD~1']);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git reset exited ${res.code}` };
 }
 
 /// Commit ONLY what's currently staged. Distinct from `commitAll`, which

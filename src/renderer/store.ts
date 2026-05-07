@@ -27,6 +27,7 @@ import type {
   WorkspaceActivity,
   WorkspaceOpenPROutcome,
   WorkspacePushOutcome,
+  WorkspaceResetOutcome,
   Worktree,
 } from '@shared/types';
 
@@ -211,6 +212,16 @@ interface UiState {
   /// each one. Failures on individual repos are swallowed — a single
   /// broken repo shouldn't blank out the markers for the rest.
   refreshAllRepoStatuses: () => Promise<void>;
+  /// Fan out fetch → switch to default → pull across every repo in
+  /// the sidebar. Returns per-repo outcomes so the caller can surface
+  /// dirty/failed reasons.
+  resetAllReposToDefault: () => Promise<WorkspaceResetOutcome[]>;
+  /// User-facing wrapper around `resetAllReposToDefault` — handles
+  /// the dirty-repo pre-flight confirm, the in-flight progress toast,
+  /// and the per-outcome result toast. Used by both the Sidebar
+  /// header button and the command palette so the UX stays in one
+  /// place.
+  runResetAllReposFlow: () => Promise<void>;
   /// Fan out `git fetch` for every known repo so the sidebar's
   /// ahead/behind dots reflect the remote, not just the stale local
   /// tracking refs. Errors are swallowed — a flaky remote or auth
@@ -268,6 +279,7 @@ interface UiState {
   unstageFiles: (id: UUID, paths: string[]) => Promise<void>;
   discardFiles: (id: UUID, paths: string[]) => Promise<void>;
   commitRepo: (id: UUID, message: string) => Promise<{ ok: boolean; error?: string }>;
+  undoLastCommit: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
   pushRepo: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
   pullRepo: (id: UUID) => Promise<{ ok: boolean; error?: string; conflicts?: string[] }>;
   pullForce: (
@@ -706,6 +718,77 @@ export const useStore = create<UiState>((set, get) => ({
     set({ repoStatus: { ...get().repoStatus, [id]: st } });
   },
 
+  resetAllReposToDefault: async () => {
+    return window.overgit.invoke('repos:resetAllToDefault');
+  },
+
+  runResetAllReposFlow: async () => {
+    const state = get();
+    const repos = state.repos;
+    if (repos.length === 0) return;
+    const dirty = repos.filter(
+      (r) => (state.repoStatus[r.id]?.dirtyCount ?? 0) > 0,
+    );
+    const dirtyList = dirty
+      .slice(0, 12)
+      .map((r) => `  • ${r.name}`)
+      .join('\n');
+    const dirtyMore = dirty.length - 12;
+    const body =
+      `Fetch, switch to default branch, and pull on every repo (${repos.length}). ` +
+      `Repos with uncommitted changes will be skipped.` +
+      (dirty.length > 0
+        ? `\n\nWill skip ${dirty.length} dirty ${dirty.length === 1 ? 'repo' : 'repos'}:\n${dirtyList}` +
+          (dirtyMore > 0 ? `\n  …and ${dirtyMore} more` : '')
+        : '');
+    const ok = await state.requestConfirm({
+      title: 'Reset all repos to default?',
+      body,
+      confirmLabel: 'Reset all',
+    });
+    if (!ok) return;
+
+    const progressId = state.pushToast({
+      kind: 'info',
+      sticky: true,
+      message: `Resetting ${repos.length} ${repos.length === 1 ? 'repo' : 'repos'} to default — fetching, switching, pulling…`,
+    });
+    try {
+      const outcomes = await get().resetAllReposToDefault();
+      get().dismissToast(progressId);
+      const reposById = new Map(get().repos.map((r) => [r.id, r] as const));
+      const failed = outcomes.filter((o) => o.result !== 'reset');
+      if (failed.length === 0) {
+        get().pushToast({
+          kind: 'success',
+          message: `All ${outcomes.length} ${outcomes.length === 1 ? 'repo is' : 'repos are'} on default.`,
+        });
+      } else {
+        const succeeded = outcomes.length - failed.length;
+        get().pushToast({
+          kind: failed.length === outcomes.length ? 'error' : 'warn',
+          message:
+            succeeded > 0
+              ? `${succeeded} reset, ${failed.length} skipped or failed.`
+              : `${failed.length} of ${outcomes.length} ${failed.length === 1 ? 'repo' : 'repos'} not reset.`,
+          details: failed.map((o) => {
+            const name = reposById.get(o.repoId)?.name ?? o.repoId;
+            return `${name} — ${o.result}${o.message ? `: ${o.message}` : ''}`;
+          }),
+          sticky: true,
+        });
+      }
+      void get().refreshAllRepoStatuses();
+    } catch (err) {
+      get().dismissToast(progressId);
+      get().pushToast({
+        kind: 'error',
+        message: `Reset failed: ${err instanceof Error ? err.message : String(err)}`,
+        sticky: true,
+      });
+    }
+  },
+
   refreshAllRepoStatuses: async () => {
     const ids = get().repos.map((r) => r.id);
     if (ids.length === 0) return;
@@ -802,6 +885,21 @@ export const useStore = create<UiState>((set, get) => ({
       // Refresh log + changes + status; the new commit changes all three.
       await Promise.all([
         get().refreshRepoLog(id),
+        get().refreshRepoChanges(id),
+        get().refreshRepoStatus(id),
+      ]);
+    }
+    return res;
+  },
+
+  undoLastCommit: async (id) => {
+    const res = await window.overgit.invoke('repo:undoLastCommit', { repoId: id });
+    if (res.ok) {
+      // Soft reset rewinds HEAD and re-stages the commit's tree, so
+      // history, graph, status, and the Changes pane all shift.
+      await Promise.all([
+        get().refreshRepoLog(id),
+        get().refreshRepoGraph(id),
         get().refreshRepoChanges(id),
         get().refreshRepoStatus(id),
       ]);

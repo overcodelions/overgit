@@ -101,6 +101,13 @@ export interface RepoStatus {
   /// Commits ahead/behind upstream. null if no upstream is configured.
   ahead: number | null;
   behind: number | null;
+  /// True when the current branch has an upstream tracking ref
+  /// (`@{u}` resolves). Distinguishes "branch is in sync" (ahead=0,
+  /// hasUpstream=true) from "branch was just created and has never
+  /// been pushed" (ahead=null, hasUpstream=false) — the second still
+  /// has commits to ship via `git push -u`, even though `ahead` can't
+  /// be measured.
+  hasUpstream: boolean;
   /// Commits ahead/behind the repo's default branch — `origin/<default>`
   /// when available, else the local default. The renderer surfaces
   /// this as a pill so the user knows whether their feature branch is
@@ -203,10 +210,15 @@ export interface WorkspaceOpenPROutcome {
     | 'unpushed'
     | 'no-gh'
     | 'no-remote'
-    | 'create-failed';
+    | 'create-failed'
+    /// Repo is on Bitbucket (or another non-`gh` provider) — we can't
+    /// open a PR via CLI but we built a "create-PR" URL the user can
+    /// finish in the browser. Title/branch are encoded in the URL where
+    /// the provider's web form supports it; the user clicks Create.
+    | 'opened-in-browser';
   branch?: string;
   baseBranch?: string;
-  /// PR url — set on `created` and `already-open`.
+  /// PR url — set on `created`, `already-open`, and `opened-in-browser`.
   url?: string;
   /// PR number — set on `created` and `already-open`.
   number?: number;
@@ -250,6 +262,12 @@ export interface WorkspaceResetOutcome {
     | 'switch-failed'
     | 'pull-failed';
   message?: string;
+  /// True when the workset's bound branch was safely deleted from this
+  /// repo as part of the archive (it had no commits beyond default,
+  /// or every commit was already merged). Branches with unpushed work
+  /// stay put — `git branch -d` refuses unmerged branches, so this is
+  /// always safe and we don't ask for confirmation.
+  cleanedUpBranch?: boolean;
 }
 
 /// Detected installed CLIs we can shell out to. The first three are
@@ -543,6 +561,10 @@ export interface IPCInvokeMap {
   'repo:unstageFiles': (args: { repoId: UUID; paths: string[] }) => { ok: boolean; error?: string };
   'repo:discardFiles': (args: { repoId: UUID; paths: string[] }) => { ok: boolean; error?: string };
   'repo:commit': (args: { repoId: UUID; message: string }) => { ok: boolean; error?: string };
+  /// `git reset --soft HEAD~1` — undoes the last commit and re-stages
+  /// its changes. Only safe when the commit hasn't been pushed; the
+  /// renderer gates the affordance on that.
+  'repo:undoLastCommit': (args: { repoId: UUID }) => { ok: boolean; error?: string };
   'repo:push': (repoId: UUID) => { ok: boolean; error?: string };
   'repo:fetch': (repoId: UUID) => { ok: boolean; error?: string };
   'repo:createBranch': (args: {
@@ -856,8 +878,20 @@ export interface IPCInvokeMap {
   /// a now-merged feature branch. Sequential per-repo so outcomes
   /// narrate cleanly.
   'workspace:resetToDefault': (
-    workspaceId: UUID,
+    args: {
+      workspaceId: UUID;
+      /// Optional: a branch to safely delete from each repo after it
+      /// switches back to default. Used by the Archive flow to sweep
+      /// up the workset's now-finished feature branch. We use git's
+      /// safe delete (`-d`), which refuses any branch with unmerged
+      /// commits — so passing this can never lose work.
+      cleanupBranch?: string;
+    },
   ) => WorkspaceResetOutcome[];
+  /// Global "reset all repos to default" — fan out fetch → switch →
+  /// pull across every repo in the sidebar (or the optional explicit
+  /// subset, used when the renderer wants to skip known-dirty repos).
+  'repos:resetAllToDefault': (repoIds?: UUID[]) => WorkspaceResetOutcome[];
 
   'cli:detect': () => CliPresence;
   'cli:reviewChanges': (args: {
