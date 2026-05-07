@@ -294,6 +294,10 @@ function SidebarWithResize(): JSX.Element {
 function useSidebarStatusRefresh(): void {
   const refreshAll = useStore((s) => s.refreshAllRepoStatuses);
   const refreshWsStatus = useStore((s) => s.refreshWorkspaceStatus);
+  const refreshRepoLog = useStore((s) => s.refreshRepoLog);
+  const refreshRepoChanges = useStore((s) => s.refreshRepoChanges);
+  const refreshRepoStatus = useStore((s) => s.refreshRepoStatus);
+  const refreshRepoBranches = useStore((s) => s.refreshRepoBranches);
   const loaded = useStore((s) => s.loaded);
 
   useEffect(() => {
@@ -309,8 +313,19 @@ function useSidebarStatusRefresh(): void {
       if (now - lastRun < COALESCE_MS) return;
       lastRun = now;
       void refreshAll();
-      const wsId = useStore.getState().selectedWorkspaceId;
+      const { selectedWorkspaceId: wsId, selectedRepoId: repoId } = useStore.getState();
       if (wsId) void refreshWsStatus(wsId);
+      /// Re-run the same per-repo refresh fan-out `selectRepo` uses
+      /// (log / changes / status / branches) for the already-open repo
+      /// so RepoDetail picks up changes made in a terminal while
+      /// overgit was backgrounded. Without this, the user has to
+      /// deselect and reselect the repo to see new commits or dirty files.
+      if (repoId) {
+        void refreshRepoLog(repoId);
+        void refreshRepoChanges(repoId);
+        void refreshRepoStatus(repoId);
+        void refreshRepoBranches(repoId);
+      }
     };
     const onFocus = () => run();
     const onVisibility = () => {
@@ -327,7 +342,15 @@ function useSidebarStatusRefresh(): void {
       document.removeEventListener('visibilitychange', onVisibility);
       window.clearInterval(interval);
     };
-  }, [loaded, refreshAll, refreshWsStatus]);
+  }, [
+    loaded,
+    refreshAll,
+    refreshWsStatus,
+    refreshRepoLog,
+    refreshRepoChanges,
+    refreshRepoStatus,
+    refreshRepoBranches,
+  ]);
 }
 
 /// Background fetch so the sidebar's ahead/behind dots reflect the
