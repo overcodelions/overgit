@@ -235,6 +235,19 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
 
   const branchLabel = status?.branch ?? '(detached)';
 
+  /// "1 unpushed commit on main" — same wording the in-view banner used
+  /// before this moved into the top bar. Hidden during merge/rebase
+  /// in-progress (push isn't safe then) and when nothing is ahead.
+  const unpushedHint =
+    status &&
+    status.branch !== null &&
+    !status.inProgress &&
+    ((status.ahead ?? 0) > 0 || !status.hasUpstream)
+      ? !status.hasUpstream
+        ? `Branch ${status.branch} has no upstream`
+        : `${status.ahead} unpushed commit${status.ahead === 1 ? '' : 's'} on ${status.branch}`
+      : null;
+
   return (
     <header className="px-6 py-3 border-b border-card flex items-center gap-4 relative">
       {/* Indeterminate progress bar — sits at the very top of the header
@@ -273,6 +286,15 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
           </button>
         </Explain>
 
+        {unpushedHint && (
+          <span
+            className="inline-flex items-center gap-1.5 text-[12px] px-2.5 py-1 rounded-md bg-card text-accent"
+            title="Push (⌘P) to send these to the remote"
+          >
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
+            <span className="truncate max-w-[280px]">{unpushedHint}</span>
+          </span>
+        )}
         {status && <WorktreeDeltaPill status={status} />}
         {status && <TrunkDistancePill status={status} />}
 
@@ -344,7 +366,7 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
             }
             className={
               (status?.ahead ?? 0) > 0 || (status?.branch && !status.hasUpstream)
-                ? 'text-xs px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50 flex items-center gap-1.5 shadow-[0_0_0_1px_rgba(124,58,237,0.55),0_0_12px_rgba(124,58,237,0.5)]'
+                ? 'text-xs px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50 flex items-center gap-1.5 animate-push-pulse'
                 : 'text-xs px-2.5 py-1 rounded bg-accent/30 text-ink-muted hover:bg-accent/50 hover:text-ink disabled:opacity-50 flex items-center gap-1.5'
             }
           >
@@ -628,21 +650,6 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
   const stashFilesAction = useStore((s) => s.stashFiles);
   const pushToast = useStore((s) => s.pushToast);
   const requestConfirm = useStore((s) => s.requestConfirm);
-  const pushRepo = useStore((s) => s.pushRepo);
-  const refreshRepoStatus = useStore((s) => s.refreshRepoStatus);
-  const [pushing, setPushing] = useState(false);
-  const onPushFromBanner = async () => {
-    setPushing(true);
-    try {
-      const res = await pushRepo(repoId);
-      if (!res.ok) {
-        pushToast({ kind: 'error', message: res.error ?? 'Push failed' });
-      }
-      await refreshRepoStatus(repoId);
-    } finally {
-      setPushing(false);
-    }
-  };
   // Last commit — pulled from the graph (already cached for History)
   // so this doesn't trigger an extra IPC call.
   const lastCommit = useStore((s) => s.repoGraph[repoId]?.[0]);
@@ -985,38 +992,11 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
     if (selected?.path === file.path) setSelected(null);
   };
 
-  const unpushedHint =
-    repoStatus &&
-    repoStatus.branch !== null &&
-    !repoStatus.inProgress &&
-    ((repoStatus.ahead ?? 0) > 0 || !repoStatus.hasUpstream)
-      ? !repoStatus.hasUpstream
-        ? `Branch ${repoStatus.branch} has no upstream — first push will set origin/${repoStatus.branch}`
-        : `${repoStatus.ahead} unpushed commit${repoStatus.ahead === 1 ? '' : 's'} on ${repoStatus.branch}`
-      : null;
-
   return (
     <div className="grid grid-cols-[360px_1fr] grid-rows-[auto_1fr] overflow-hidden">
       {repoStatus?.inProgress && (
         <div className="col-span-2 row-start-1">
           <ConflictBanner repoId={repoId} status={repoStatus} />
-        </div>
-      )}
-      {unpushedHint && (
-        <div className="col-span-2 row-start-1 h-[34px] px-4 bg-accent/[0.03] border-b border-card flex items-center gap-3 text-[12px]">
-          <span className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-accent shrink-0">
-            <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent" />
-            Unpushed
-          </span>
-          <span className="min-w-0 flex-1 truncate text-ink-muted">{unpushedHint}</span>
-          <button
-            onClick={() => void onPushFromBanner()}
-            disabled={pushing}
-            className="text-[11px] px-2 py-0.5 rounded text-accent hover:bg-accent/10 disabled:opacity-50 shrink-0"
-            title="Push (⌘P)"
-          >
-            {pushing ? 'Pushing…' : 'Push now'}
-          </button>
         </div>
       )}
       <aside className="border-r border-card overflow-y-auto flex flex-col col-start-1 row-start-2">

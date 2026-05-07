@@ -118,3 +118,23 @@ body {
 .animate-progress-slide {
   animation: progress-slide 1.4s cubic-bezier(0.4, 0, 0.2, 1) infinite;
 }
+
+/* Soft halo breath on the Push button when there are unpushed commits.
+ * Anchored on the same accent rgba values the static button shadow uses
+ * so the rest state matches the non-pulsing button exactly. */
+@keyframes push-pulse {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 1px rgba(124, 58, 237, 0.55),
+      0 0 12px rgba(124, 58, 237, 0.5);
+  }
+  50% {
+    box-shadow:
+      0 0 0 2px rgba(124, 58, 237, 0.8),
+      0 0 22px rgba(124, 58, 237, 0.95);
+  }
+}
+.animate-push-pulse {
+  animation: push-pulse 1.8s ease-in-out infinite;
+}
