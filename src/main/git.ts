@@ -320,6 +320,7 @@ export async function status(
       ahead: null,
       behind: null,
       hasUpstream: false,
+      upstreamGone: false,
       aheadDefault: null,
       behindDefault: null,
       defaultRef: null,
@@ -362,6 +363,7 @@ export async function status(
   let ahead: number | null = null;
   let behind: number | null = null;
   let hasUpstream = false;
+  let upstreamGone = false;
   if (branch) {
     const upstreamRes = await run(repoPath, [
       'rev-list',
@@ -376,6 +378,14 @@ export async function status(
         behind = b;
         ahead = a;
       }
+    } else {
+      // rev-list against @{u} fails for two distinct cases: (1) no
+      // upstream ever configured, and (2) upstream was configured but
+      // its remote-tracking ref is gone (merged + pruned). Tell them
+      // apart by reading config directly — `branch.<name>.merge` sticks
+      // around even after `git fetch --prune` removes the ref.
+      const cfg = await run(repoPath, ['config', '--get', `branch.${branch}.merge`]);
+      if (cfg.ok && cfg.stdout.trim().length > 0) upstreamGone = true;
     }
   }
 
@@ -452,6 +462,7 @@ export async function status(
     ahead,
     behind,
     hasUpstream,
+    upstreamGone,
     aheadDefault,
     behindDefault,
     defaultRef,
@@ -797,7 +808,8 @@ export async function pruneWorktrees(
 }
 
 function classifyFailure(repoId: UUID, branch: string, r: RunResult): CheckoutOutcome {
-  const text = `${r.stdout}\n${r.stderr}`.toLowerCase();
+  const combined = `${r.stdout}\n${r.stderr}`;
+  const text = combined.toLowerCase();
   // Git's "would be overwritten by checkout" / "local changes" messages
   // are stable enough to pattern-match — the alternative is parsing
   // porcelain status, which is the same information at higher cost.
@@ -807,6 +819,20 @@ function classifyFailure(repoId: UUID, branch: string, r: RunResult): CheckoutOu
     text.includes('uncommitted changes')
   ) {
     return { repoId, result: 'dirty', branch, message: r.stderr.trim() };
+  }
+  // `fatal: 'feature/x' is already checked out at '/path/to/worktree'`
+  // — a sibling worktree already owns the branch. We surface the path
+  // so the renderer can offer to adopt (remove the worktree, switch in
+  // main) without the user hand-running git.
+  const wt = /already checked out at ['"]([^'"]+)['"]/i.exec(combined);
+  if (wt) {
+    return {
+      repoId,
+      result: 'worktree-conflict',
+      branch,
+      message: r.stderr.trim(),
+      worktreePath: wt[1],
+    };
   }
   return { repoId, result: 'error', branch, message: r.stderr.trim() || `git exited ${r.code}` };
 }

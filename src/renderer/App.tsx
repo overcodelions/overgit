@@ -1376,6 +1376,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
       (s) =>
         s.branch !== null &&
         !s.hasUpstream &&
+        !s.upstreamGone &&
         (s.aheadDefault ?? 0) > 0,
     ).length;
     // PR-eligible: on a non-default branch (we don't probe gh here
