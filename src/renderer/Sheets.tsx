@@ -1504,6 +1504,20 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
   );
   const [branch, setBranch] = useState(editing?.preferredBranch ?? '');
   const [busy, setBusy] = useState(false);
+  const [repoFilter, setRepoFilter] = useState('');
+  const [showSelectedOnly, setShowSelectedOnly] = useState(false);
+
+  const visibleRepos = useMemo(() => {
+    const q = repoFilter.trim().toLowerCase();
+    let list = repos;
+    if (showSelectedOnly) list = list.filter((r) => picked.has(r.id));
+    if (!q) return list;
+    return list.filter(
+      (r) =>
+        r.name.toLowerCase().includes(q) ||
+        r.path.toLowerCase().includes(q),
+    );
+  }, [repos, repoFilter, showSelectedOnly, picked]);
 
   // Where the bound branch should come from for the auto-checkout step
   // on Create. Default to "from origin/<default>" — the safest base for
@@ -1863,6 +1877,9 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
                 <span className="text-xs uppercase tracking-wide text-ink-faint">Repos</span>
                 <span className="text-[11px] text-ink-faint">
                   {picked.size} of {repos.length} selected
+                  {(repoFilter.trim() || showSelectedOnly) && (
+                    <> · {visibleRepos.length} shown</>
+                  )}
                 </span>
               </div>
               {repos.length === 0 ? (
@@ -1871,26 +1888,76 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
                   overgit.
                 </div>
               ) : (
-                <ul className="border border-card rounded overflow-hidden max-h-[40vh] overflow-y-auto">
-                  {repos.map((r) => {
-                    const isPicked = picked.has(r.id);
-                    const previously = (editing?.repoIds ?? []).includes(r.id);
-                    return (
-                      <li key={r.id} className="border-b border-card last:border-0">
-                        <RepoPickRow
-                          repo={r}
-                          picked={isPicked}
-                          onToggle={() => toggle(r.id)}
-                          tag={
-                            isPicked && !previously && commonBranch
-                              ? `will sync to ${commonBranch}`
-                              : null
-                          }
-                        />
-                      </li>
-                    );
-                  })}
-                </ul>
+                <>
+                  <div className="flex items-center gap-2 mb-2">
+                    <input
+                      value={repoFilter}
+                      onChange={(e) => setRepoFilter(e.target.value)}
+                      placeholder="Filter by name or path…"
+                      className="field text-xs px-2 py-1 flex-1"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowSelectedOnly((v) => !v)}
+                      disabled={picked.size === 0}
+                      className={`text-[11px] px-2 py-1 rounded border ${
+                        showSelectedOnly
+                          ? 'border-accent bg-accent/10 text-accent'
+                          : 'border-card hover:bg-card'
+                      } disabled:opacity-40`}
+                      title="Show only currently-selected repos"
+                    >
+                      Selected ({picked.size})
+                    </button>
+                    {visibleRepos.length > 0 && (repoFilter.trim() || showSelectedOnly) && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const allVisiblePicked = visibleRepos.every((r) => picked.has(r.id));
+                          setPicked((cur) => {
+                            const next = new Set(cur);
+                            if (allVisiblePicked) {
+                              for (const r of visibleRepos) next.delete(r.id);
+                            } else {
+                              for (const r of visibleRepos) next.add(r.id);
+                            }
+                            return next;
+                          });
+                        }}
+                        className="text-[11px] px-2 py-1 rounded border border-card hover:bg-card"
+                        title="Toggle every repo currently visible"
+                      >
+                        {visibleRepos.every((r) => picked.has(r.id)) ? 'Unselect all' : 'Select all'}
+                      </button>
+                    )}
+                  </div>
+                  {visibleRepos.length === 0 ? (
+                    <div className="text-xs text-ink-faint p-3 rounded border border-card bg-card">
+                      No repos match.
+                    </div>
+                  ) : (
+                    <ul className="border border-card rounded overflow-hidden max-h-[40vh] overflow-y-auto">
+                      {visibleRepos.map((r) => {
+                        const isPicked = picked.has(r.id);
+                        const previously = (editing?.repoIds ?? []).includes(r.id);
+                        return (
+                          <li key={r.id} className="border-b border-card last:border-0">
+                            <RepoPickRow
+                              repo={r}
+                              picked={isPicked}
+                              onToggle={() => toggle(r.id)}
+                              tag={
+                                isPicked && !previously && commonBranch
+                                  ? `will sync to ${commonBranch}`
+                                  : null
+                              }
+                            />
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
+                </>
               )}
             </div>
 
@@ -2389,7 +2456,7 @@ function ScopeButton({
   );
 }
 
-function ReviewBody({ result }: { result: ReviewResult }): JSX.Element {
+export function ReviewBody({ result }: { result: ReviewResult }): JSX.Element {
   if (!result.ok) {
     return (
       <div className="flex flex-col gap-3 text-xs">
@@ -3319,7 +3386,7 @@ function WorkspaceCommitAllSheet({ workspaceId }: { workspaceId: UUID }): JSX.El
   );
 }
 
-function formatBytes(bytes: number): string {
+export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
@@ -3379,12 +3446,24 @@ function WorkspacePushAllSheet({ workspaceId }: { workspaceId: UUID }): JSX.Elem
     void refreshStatus(workspaceId);
   }, [refreshStatus, workspaceId]);
 
+  // For each on-branch repo, how many commits would actually move on
+  // push. When `ahead` is known we use that; when there's no upstream
+  // we fall back to `aheadDefault` (commits on this branch beyond the
+  // repo's default branch — what `git push -u` would publish on a
+  // freshly-created feature branch).
+  const commitsToPush = (s: RepoStatus): number =>
+    s.ahead ?? s.aheadDefault ?? 0;
+
   // Eligible = on a branch. Up-to-date repos still go through the call
   // so the result table is symmetric ("up-to-date" is a result, not a
   // skip), but we tell the user how many will actually push.
   const onBranch = useMemo(() => statuses.filter((s) => s.branch !== null), [statuses]);
   const willPush = useMemo(
-    () => onBranch.filter((s) => (s.ahead ?? 0) > 0 || s.ahead === null),
+    () => onBranch.filter((s) => commitsToPush(s) > 0),
+    [onBranch],
+  );
+  const upToDate = useMemo(
+    () => onBranch.filter((s) => commitsToPush(s) === 0),
     [onBranch],
   );
   const detached = useMemo(() => statuses.filter((s) => s.branch === null), [statuses]);
@@ -3410,24 +3489,25 @@ function WorkspacePushAllSheet({ workspaceId }: { workspaceId: UUID }): JSX.Elem
         <div>
           <div className="text-[10px] uppercase tracking-wide text-ink-faint mb-1">
             Will push {willPush.length} {willPush.length === 1 ? 'repo' : 'repos'}
-            {onBranch.length - willPush.length > 0 &&
-              ` · ${onBranch.length - willPush.length} already up to date`}
+            {upToDate.length > 0 &&
+              ` · ${upToDate.length} already up to date`}
           </div>
-          {onBranch.length === 0 ? (
+          {willPush.length === 0 ? (
             <div className="text-[11px] text-ink-faint">
-              No repos on a branch — nothing to push.
+              {onBranch.length === 0
+                ? 'No repos on a branch — nothing to push.'
+                : 'Every repo is already in sync with its upstream.'}
             </div>
           ) : (
             <ul className="text-[11px] text-ink-faint flex flex-col gap-0.5">
-              {onBranch.map((s) => (
+              {willPush.map((s) => (
                 <li key={s.repoId} className="flex justify-between gap-2">
                   <span className="truncate">
                     {reposById.get(s.repoId)?.name ?? s.repoId}
                   </span>
                   <span className="font-mono">
-                    {s.branch}
-                    {(s.ahead ?? 0) > 0 ? ` · ↑${s.ahead}` : ' · ↑0'}
-                    {s.ahead === null && ' · no upstream'}
+                    {s.branch} · ↑{commitsToPush(s)}
+                    {!s.hasUpstream && ' · no upstream'}
                   </span>
                 </li>
               ))}
@@ -3476,7 +3556,7 @@ function WorkspacePushAllSheet({ workspaceId }: { workspaceId: UUID }): JSX.Elem
           {ranSuccessfully ? 'Done' : 'Cancel'}
         </button>
         <button
-          disabled={busy || onBranch.length === 0}
+          disabled={busy || willPush.length === 0}
           onClick={onRun}
           className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
         >
@@ -3518,6 +3598,13 @@ function WorkspaceOpenPRsSheet({ workspaceId }: { workspaceId: UUID }): JSX.Elem
 
   const [title, setTitle] = useState('');
   const [body, setBody] = useState('');
+  // Track whether the user has edited the title, so the auto-prefill
+  // from the workset name doesn't clobber what they typed. Body is
+  // intentionally left blank — auto-prefilling from a commit message
+  // tends to surface stale history (old merge commits in the log)
+  // rather than the user's actual coordinated change, so we let them
+  // write the description themselves.
+  const [titleEdited, setTitleEdited] = useState(false);
   const [draft, setDraft] = useState(false);
   const [busy, setBusy] = useState(false);
   const [outcomes, setOutcomes] = useState<WorkspaceOpenPROutcome[] | null>(null);
@@ -3542,6 +3629,17 @@ function WorkspaceOpenPRsSheet({ workspaceId }: { workspaceId: UUID }): JSX.Elem
     });
   }, [statuses, reposById]);
 
+  // Default title = workset name. Reflects intent ("a coordinated
+  // change called RED-6148") rather than a single commit subject from
+  // one of the member repos — which often turned out to be an old merge
+  // commit from another developer's history rather than the user's
+  // actual work.
+  useEffect(() => {
+    if (titleEdited) return;
+    if (ws?.name && !title) setTitle(ws.name);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ws?.name]);
+
   const onRun = async () => {
     if (!title.trim()) return;
     setBusy(true);
@@ -3553,46 +3651,47 @@ function WorkspaceOpenPRsSheet({ workspaceId }: { workspaceId: UUID }): JSX.Elem
         draft,
       });
       setOutcomes(res);
+      // Bitbucket (and other no-CLI providers) come back with
+      // 'opened-in-browser' + a pre-filled web URL. Fire those off
+      // immediately — Electron's setWindowOpenHandler routes window.open
+      // to the system browser, so each becomes a tab in Safari/Chrome.
+      for (const o of res) {
+        if (o.result === 'opened-in-browser' && o.url) window.open(o.url);
+      }
     } finally {
       setBusy(false);
     }
   };
 
-  if (!cli?.gh) {
-    return (
-      <>
-        <SheetHeader title={`Open PRs · ${ws?.name ?? ''}`} onClose={() => setSheet(null)} />
-        <div className="flex-1 min-h-0 p-5 text-sm">
-          <div className="text-[12px] text-amber-400 bg-amber-500/[0.06] border border-amber-700/40 rounded px-3 py-2">
-            Install <span className="font-mono">gh</span> to open PRs from overgit.
-          </div>
-        </div>
-        <div className="px-5 py-3 border-t border-card flex justify-end">
-          <button
-            onClick={() => setSheet(null)}
-            className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
-          >
-            Close
-          </button>
-        </div>
-      </>
-    );
-  }
-
   return (
     <>
       <SheetHeader title={`Open PRs · ${ws?.name ?? ''}`} onClose={() => setSheet(null)} />
       <div className="flex-1 min-h-0 p-5 flex flex-col gap-4 text-sm overflow-y-auto">
+        {!cli?.gh && (
+          <div className="text-[12px] text-amber-400 bg-amber-500/[0.06] border border-amber-700/40 rounded px-3 py-2">
+            <span className="font-mono">gh</span> not installed — GitHub repos
+            will report <span className="font-mono">no-gh</span>. Bitbucket repos
+            still work via the browser.
+          </div>
+        )}
         <label className="flex flex-col gap-1">
           <span className="text-[10px] uppercase tracking-wide text-ink-faint">Title</span>
           <input
             autoFocus
             value={title}
-            onChange={(e) => setTitle(e.target.value)}
+            onChange={(e) => {
+              setTitle(e.target.value);
+              setTitleEdited(true);
+            }}
             placeholder="Shared PR title"
             disabled={busy}
             className="field px-2 py-1.5 text-sm"
           />
+          {ws?.name && !titleEdited && title === ws.name && (
+            <span className="text-[10px] text-ink-faint">
+              Pre-filled from workset name · type to override
+            </span>
+          )}
         </label>
         <label className="flex flex-col gap-1">
           <span className="text-[10px] uppercase tracking-wide text-ink-faint">Body</span>
@@ -3710,6 +3809,7 @@ function OpenPROutcomeBadge({
   const map: Record<WorkspaceOpenPROutcome['result'], { label: string; cls: string }> = {
     created: { label: 'created', cls: 'text-emerald-400' },
     'already-open': { label: 'already open', cls: 'text-sky-400' },
+    'opened-in-browser': { label: 'opened in browser', cls: 'text-emerald-400' },
     detached: { label: 'detached', cls: 'text-amber-400' },
     'on-default-branch': { label: 'default branch', cls: 'text-ink-faint' },
     unpushed: { label: 'unpushed', cls: 'text-amber-400' },

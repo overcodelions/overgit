@@ -26,10 +26,12 @@ import {
   checkoutBranch,
   commitAll as gitCommitAll,
   createBranch,
+  deleteBranch,
   detectDefaultBranch,
   fetch as gitFetch,
   hasUpstream,
   listBranches,
+  listRemotes,
   listWorktrees,
   log as gitLog,
   pull as gitPull,
@@ -50,6 +52,68 @@ async function pickIdentityFor(repo: Repo, settings: AppSettings): Promise<Ident
   return settings.defaultIdentity;
 }
 import { createPRWithGh, findOpenPRForCurrentBranch, listOpenPRs } from './cli';
+
+/// Identify the hosting provider for a remote URL. Used by the Open
+/// PRs flow to dispatch: GitHub → `gh pr create`, Bitbucket → web URL,
+/// anything else → fall through to the no-remote path.
+type RemoteProvider =
+  | { kind: 'github'; owner: string; repo: string }
+  | { kind: 'bitbucket'; workspace: string; repo: string }
+  | { kind: 'unknown' };
+
+function parseRemoteUrl(url: string): RemoteProvider {
+  const trimmed = url.trim().replace(/\.git$/, '');
+  // SSH form: git@host:owner/repo  (or :owner/repo for some hosts)
+  const sshMatch = /^(?:ssh:\/\/)?(?:[^@\s]+@)?([^:/\s]+)[:/](.+?)$/.exec(trimmed);
+  // HTTPS form: https://host/owner/repo
+  const httpsMatch = /^https?:\/\/(?:[^@\s]+@)?([^/\s]+)\/(.+?)$/.exec(trimmed);
+  const m = sshMatch ?? httpsMatch;
+  if (!m) return { kind: 'unknown' };
+  const host = m[1].toLowerCase();
+  const path = m[2];
+  const segments = path.split('/').filter(Boolean);
+  if (segments.length < 2) return { kind: 'unknown' };
+  const owner = segments[0];
+  const repo = segments[segments.length - 1];
+  if (host === 'github.com' || host.endsWith('.github.com')) {
+    return { kind: 'github', owner, repo };
+  }
+  if (host === 'bitbucket.org' || host.endsWith('.bitbucket.org')) {
+    return { kind: 'bitbucket', workspace: owner, repo };
+  }
+  return { kind: 'unknown' };
+}
+
+async function detectProvider(repoPath: string): Promise<RemoteProvider> {
+  const remotes = await listRemotes(repoPath);
+  // Prefer `origin` because that's where pushes go by default; fall
+  // back to the first remote if origin isn't configured (rare but
+  // possible — fork workflows, multi-remote setups).
+  const origin = remotes.find((r) => r.name === 'origin') ?? remotes[0];
+  if (!origin) return { kind: 'unknown' };
+  return parseRemoteUrl(origin.fetchUrl || origin.pushUrl);
+}
+
+function buildBitbucketCreatePRUrl(args: {
+  workspace: string;
+  repo: string;
+  source: string;
+  dest: string;
+  title?: string;
+}): string {
+  // Bitbucket Cloud accepts source/dest via query string; title isn't
+  // an officially supported param but Bitbucket's create form pre-fills
+  // its title from the latest commit subject anyway, so the user gets
+  // the same UX without us forcing it.
+  const params = new URLSearchParams({
+    source: args.source,
+    dest: args.dest,
+  });
+  if (args.title) params.set('t', args.title);
+  return `https://bitbucket.org/${encodeURIComponent(args.workspace)}/${encodeURIComponent(
+    args.repo,
+  )}/pull-requests/new?${params.toString()}`;
+}
 
 function reposFor(workspace: Workspace, repos: Repo[]): Repo[] {
   const byId = new Map(repos.map((r) => [r.id, r]));
@@ -287,76 +351,114 @@ export async function workspaceSyncAndBranch(
 }
 
 /// "Reset to default" workflow for the Archive flow. For each member,
+/// Reset a single repo to its detected default branch: fetch → switch
+/// → pull. Pulled out of `workspaceResetToDefault` so we can reuse the
+/// per-repo step from a global "reset all repos" action that doesn't
+/// belong to any one workspace.
+async function resetRepoToDefault(
+  r: Repo,
+  cleanupBranch?: string,
+): Promise<WorkspaceResetOutcome> {
+  const defaultBranch =
+    r.defaultBranch ?? (await detectDefaultBranch(r.path)) ?? null;
+  if (!defaultBranch) {
+    return {
+      repoId: r.id,
+      defaultBranch: null,
+      result: 'no-default-branch',
+      message: 'No default branch detected — set one in repo identity settings.',
+    };
+  }
+  const fetchRes = await gitFetch(r.path);
+  if (!fetchRes.ok) {
+    return {
+      repoId: r.id,
+      defaultBranch,
+      result: 'fetch-failed',
+      message: fetchRes.error,
+    };
+  }
+  const switchRes = await checkoutBranch(r.id, r.path, defaultBranch, false);
+  if (switchRes.result === 'dirty') {
+    return {
+      repoId: r.id,
+      defaultBranch,
+      result: 'dirty',
+      message: switchRes.message,
+    };
+  }
+  if (switchRes.result === 'error' || switchRes.result === 'missing-branch') {
+    return {
+      repoId: r.id,
+      defaultBranch,
+      result: 'switch-failed',
+      message: switchRes.message ?? `Could not switch to ${defaultBranch}`,
+    };
+  }
+  const pullRes = await gitPull(r.path);
+  if (!pullRes.ok) {
+    return {
+      repoId: r.id,
+      defaultBranch,
+      result: 'pull-failed',
+      message: pullRes.error,
+    };
+  }
+  // Best-effort branch sweep. `git branch -d` (safe delete) refuses any
+  // branch with unmerged commits, so passing through here can never lose
+  // work — empty workset branches go away, branches with unpushed work
+  // stay put. Skip when no cleanup branch was requested or when the
+  // branch IS the default (nothing to delete).
+  let cleanedUpBranch = false;
+  if (cleanupBranch && cleanupBranch !== defaultBranch) {
+    const del = await deleteBranch(r.path, cleanupBranch, false);
+    if (del.ok) cleanedUpBranch = true;
+  }
+  return { repoId: r.id, defaultBranch, result: 'reset', cleanedUpBranch };
+}
+
+/// Fan out `resetRepoToDefault` over every repo in the list. Bounded
+/// to 3-wide so a 24-repo workspace doesn't fire 24 simultaneous
+/// `git fetch` operations against the same remotes — credential
+/// helpers, rate-limited hosts, and the OS process budget all dislike
+/// that. Three is enough to overlap network latency without thrashing.
+export async function resetReposToDefault(
+  repos: Repo[],
+  cleanupBranch?: string,
+): Promise<WorkspaceResetOutcome[]> {
+  const out: WorkspaceResetOutcome[] = new Array(repos.length);
+  let next = 0;
+  const worker = async () => {
+    while (true) {
+      const i = next++;
+      if (i >= repos.length) return;
+      out[i] = await resetRepoToDefault(repos[i], cleanupBranch);
+    }
+  };
+  const concurrency = Math.min(3, repos.length);
+  await Promise.all(Array.from({ length: concurrency }, worker));
+  return out;
+}
+
 /// fetch → switch to its detected default branch → pull. Result is each
 /// repo on a clean tip-of-default state, ready for the next workset.
-/// Sequential per-repo so partial failures (no default, dirty, pull
-/// conflict) read in order. The Archive button is gated on the workset
-/// being clean + pushed, so dirty/conflict outcomes here are exceptional
-/// — but we surface them rather than failing silently because a stash
-/// the user forgot about could still be in play.
+/// The Archive button is gated on the workset being clean + pushed, so
+/// dirty/conflict outcomes here are exceptional — but we surface them
+/// rather than failing silently because a stash the user forgot about
+/// could still be in play.
 export async function workspaceResetToDefault(
   workspaceId: UUID,
   workspaces: Workspace[],
   repos: Repo[],
+  cleanupBranch?: string,
 ): Promise<WorkspaceResetOutcome[]> {
   const ws = workspaces.find((w) => w.id === workspaceId);
   if (!ws) return [];
-  const members = reposFor(ws, repos);
-  const out: WorkspaceResetOutcome[] = [];
-  for (const r of members) {
-    const defaultBranch =
-      r.defaultBranch ?? (await detectDefaultBranch(r.path)) ?? null;
-    if (!defaultBranch) {
-      out.push({
-        repoId: r.id,
-        defaultBranch: null,
-        result: 'no-default-branch',
-        message: 'No default branch detected — set one in repo identity settings.',
-      });
-      continue;
-    }
-    const fetchRes = await gitFetch(r.path);
-    if (!fetchRes.ok) {
-      out.push({
-        repoId: r.id,
-        defaultBranch,
-        result: 'fetch-failed',
-        message: fetchRes.error,
-      });
-      continue;
-    }
-    const switchRes = await checkoutBranch(r.id, r.path, defaultBranch, false);
-    if (switchRes.result === 'dirty') {
-      out.push({
-        repoId: r.id,
-        defaultBranch,
-        result: 'dirty',
-        message: switchRes.message,
-      });
-      continue;
-    }
-    if (switchRes.result === 'error' || switchRes.result === 'missing-branch') {
-      out.push({
-        repoId: r.id,
-        defaultBranch,
-        result: 'switch-failed',
-        message: switchRes.message ?? `Could not switch to ${defaultBranch}`,
-      });
-      continue;
-    }
-    const pullRes = await gitPull(r.path);
-    if (!pullRes.ok) {
-      out.push({
-        repoId: r.id,
-        defaultBranch,
-        result: 'pull-failed',
-        message: pullRes.error,
-      });
-      continue;
-    }
-    out.push({ repoId: r.id, defaultBranch, result: 'reset' });
-  }
-  return out;
+  // Default the cleanup target to the workset's bound branch — the
+  // Archive flow's intent is "this workset is done", and the bound
+  // branch is exactly what should go with it.
+  const branch = cleanupBranch ?? ws.preferredBranch;
+  return resetReposToDefault(reposFor(ws, repos), branch);
 }
 
 /// Bring a single repo into the workspace's common branch. Used after
@@ -577,7 +679,31 @@ export async function workspaceOpenPRs(
       });
       continue;
     }
-    // Probe gh first. If gh isn't even installed, surface that once per
+    // Branch by provider. GitHub goes through `gh pr create`; Bitbucket
+    // (no first-class CLI we trust) gets a pre-filled web URL the user
+    // finishes in the browser. Anything else falls through to the
+    // existing no-remote path.
+    const provider = await detectProvider(r.path);
+    if (provider.kind === 'bitbucket') {
+      const url = buildBitbucketCreatePRUrl({
+        workspace: provider.workspace,
+        repo: provider.repo,
+        source: st.branch,
+        dest: baseBranch,
+        title,
+      });
+      out.push({
+        repoId: r.id,
+        branch: st.branch,
+        baseBranch,
+        result: 'opened-in-browser',
+        url,
+        message:
+          'Bitbucket — opening browser to create PR (title pre-filled from latest commit)',
+      });
+      continue;
+    }
+    // Probe gh next. If gh isn't even installed, surface that once per
     // repo (not once globally) so the renderer's row treatment is
     // uniform — every row gets a result, not a banner.
     const existing = await findOpenPRForCurrentBranch(r.path);

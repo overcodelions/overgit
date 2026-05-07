@@ -62,8 +62,18 @@ export function CommandPalette(): JSX.Element | null {
   const stageFiles = useStore((s) => s.stageFiles);
   const unstageFiles = useStore((s) => s.unstageFiles);
   const fetchRepo = useStore((s) => s.fetchRepo);
+  const runResetAllReposFlow = useStore((s) => s.runResetAllReposFlow);
   const pullRepo = useStore((s) => s.pullRepo);
   const pushRepo = useStore((s) => s.pushRepo);
+  const undoLastCommit = useStore((s) => s.undoLastCommit);
+  const repoStatus = useStore((s) =>
+    selectedRepoId ? s.repoStatus[selectedRepoId] : undefined,
+  );
+  // `ahead === 0` with a configured upstream means HEAD is on the
+  // remote — undoing it would diverge silently. Allow when there are
+  // local-only commits (`ahead > 0`) or when no upstream exists yet.
+  const lastCommitUnpushed =
+    repoStatus?.ahead == null || repoStatus.ahead > 0;
   const openRepoFile = useStore((s) => s.openRepoFile);
   const pushToast = useStore((s) => s.pushToast);
 
@@ -111,6 +121,7 @@ export function CommandPalette(): JSX.Element | null {
         cli,
         selectedRepoId,
         selectedWsId,
+        lastCommitUnpushed,
         actions: {
           close: () => close(false),
           selectRepo,
@@ -124,8 +135,10 @@ export function CommandPalette(): JSX.Element | null {
           fetchRepo,
           pullRepo,
           pushRepo,
+          undoLastCommit,
           openRepoFile,
           pushToast,
+          runResetAllReposFlow,
         },
       }),
     [
@@ -139,6 +152,7 @@ export function CommandPalette(): JSX.Element | null {
       cli,
       selectedRepoId,
       selectedWsId,
+      lastCommitUnpushed,
       close,
       selectRepo,
       selectWorkspace,
@@ -151,8 +165,10 @@ export function CommandPalette(): JSX.Element | null {
       fetchRepo,
       pullRepo,
       pushRepo,
+      undoLastCommit,
       openRepoFile,
       pushToast,
+      runResetAllReposFlow,
     ],
   );
 
@@ -389,6 +405,7 @@ interface BuildArgs {
   cli: { gh?: boolean; claude?: boolean; codex?: boolean; gemini?: boolean } | null;
   selectedRepoId: UUID | null;
   selectedWsId: UUID | null;
+  lastCommitUnpushed: boolean;
   actions: {
     close: () => void;
     selectRepo: (id: UUID | null) => void;
@@ -406,8 +423,10 @@ interface BuildArgs {
     fetchRepo: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
     pullRepo: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
     pushRepo: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
+    undoLastCommit: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
     openRepoFile: (id: UUID, path: string) => Promise<unknown>;
     pushToast: (t: { kind: 'info' | 'success' | 'warn' | 'error'; message: string }) => string;
+    runResetAllReposFlow: () => Promise<void>;
   };
 }
 
@@ -423,6 +442,7 @@ function buildSections(args: BuildArgs): PaletteSection[] {
     cli,
     selectedRepoId,
     selectedWsId,
+    lastCommitUnpushed,
     actions,
   } = args;
   const stagedCount = stagedPaths.length;
@@ -510,6 +530,31 @@ function buildSections(args: BuildArgs): PaletteSection[] {
           actions.close();
         },
       },
+      ...(lastCommitUnpushed
+        ? [
+            {
+              id: 'undo-last-commit',
+              title: 'Undo last commit',
+              hint: 'git reset --soft HEAD~1 · keeps changes staged',
+              glyph: '↶',
+              perform: async () => {
+                const res = await actions.undoLastCommit(id);
+                if (!res.ok) {
+                  actions.pushToast({
+                    kind: 'error',
+                    message: res.error ?? 'Undo failed',
+                  });
+                } else {
+                  actions.pushToast({
+                    kind: 'success',
+                    message: 'Last commit undone — changes staged',
+                  });
+                }
+                actions.close();
+              },
+            } as PaletteItem,
+          ]
+        : []),
       {
         id: 'manage-tags',
         title: 'Manage tags',
@@ -655,6 +700,16 @@ function buildSections(args: BuildArgs): PaletteSection[] {
       perform: () => {
         actions.setSheet({ kind: 'newWorkspace' });
         actions.close();
+      },
+    },
+    {
+      id: 'reset-all-repos',
+      title: 'Reset all repos to default branch',
+      hint: 'fetch · checkout default · pull (skips dirty)',
+      glyph: '↻',
+      perform: async () => {
+        actions.close();
+        await actions.runResetAllReposFlow();
       },
     },
     {
