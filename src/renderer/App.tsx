@@ -2785,6 +2785,7 @@ function CheckoutOutcomeRow({
   const stash = useStore((s) => s.stashRepo);
   const commitAll = useStore((s) => s.commitAllRepo);
   const retry = useStore((s) => s.retryCheckoutRepo);
+  const adopt = useStore((s) => s.adoptWorktreeBranch);
   const pushToast = useStore((s) => s.pushToast);
   const refreshWs = useStore((s) => s.refreshWorkspaceStatus);
 
@@ -2825,6 +2826,35 @@ function CheckoutOutcomeRow({
       }
       setShowCommit(false);
       setMessage('');
+      await retry(outcome.repoId);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onAdopt = async () => {
+    if (outcome.result !== 'worktree-conflict' || !outcome.worktreePath) return;
+    setBusy(true);
+    try {
+      const res = await adopt(
+        outcome.repoId,
+        outcome.worktreePath,
+        outcome.branch,
+        false,
+        undefined,
+      );
+      if (!res.ok) {
+        pushToast({
+          kind: 'error',
+          message:
+            res.step === 'precheck'
+              ? res.error
+              : `Adopt failed (${res.step}): ${res.error}`,
+        });
+        return;
+      }
+      // Adopt already ran `git switch` in the main repo. Retry to refresh
+      // the row and let the rest of the workspace status catch up.
       await retry(outcome.repoId);
     } finally {
       setBusy(false);
@@ -2908,6 +2938,18 @@ function CheckoutOutcomeRow({
             Create from default
           </button>
         )}
+        {createdResult.kind === 'idle' &&
+          outcome.result === 'worktree-conflict' &&
+          outcome.worktreePath && (
+            <button
+              disabled={busy}
+              onClick={onAdopt}
+              title={`Remove the worktree at ${outcome.worktreePath} and check out ${outcome.branch} here.`}
+              className="px-2 py-0.5 rounded border border-card hover:bg-card disabled:opacity-50"
+            >
+              {busy ? 'Adopting…' : 'Adopt & retry'}
+            </button>
+          )}
       </div>
       {outcome.result === 'dirty' && showCommit && (
         <div className="flex gap-1 ml-40 pl-2">
@@ -3326,6 +3368,7 @@ function CheckoutBadge({ outcome }: { outcome: CheckoutOutcome }): JSX.Element {
     'already-on-branch': 'text-ink-muted',
     'missing-branch': 'text-amber-400',
     dirty: 'text-amber-400',
+    'worktree-conflict': 'text-amber-400',
     error: 'text-red-400',
   };
   return <span className={`font-mono ${styles[outcome.result]}`}>{outcome.result}</span>;

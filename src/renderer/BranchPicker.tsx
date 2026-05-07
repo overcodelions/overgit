@@ -123,6 +123,13 @@ export function BranchPicker({ repoId, anchorRef, initialMode, onClose }: Props)
           kind: 'warn',
           message: `Branch ${target} doesn't exist locally or on origin.`,
         });
+      } else if (outcome.result === 'worktree-conflict') {
+        pushToast({
+          kind: 'warn',
+          message: outcome.worktreePath
+            ? `${target} is checked out at ${outcome.worktreePath}. Adopt or remove that worktree first (Worktrees panel).`
+            : `${target} is checked out in a linked worktree.`,
+        });
       }
       onClose();
     } finally {

@@ -1487,6 +1487,7 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
   const createWorkspace = useStore((s) => s.createWorkspace);
   const updateWorkspace = useStore((s) => s.updateWorkspace);
   const checkoutWorkspaceBranch = useStore((s) => s.checkoutWorkspaceBranch);
+  const adoptWorktreeBranch = useStore((s) => s.adoptWorktreeBranch);
   const pushToast = useStore((s) => s.pushToast);
   const editingId = workspaceId ?? null;
   const existingStatuses = useStore((s) =>
@@ -1532,11 +1533,25 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
   // bound branch is being checked out / created across N repos. After
   // the operation finishes, partial failures are shown as a per-repo
   // outcome list so the user can act before closing the sheet.
+  type Row = {
+    repoId: UUID;
+    ok: boolean;
+    label: string;
+    message?: string;
+    /// Only set when the underlying CheckoutOutcome was 'worktree-conflict'.
+    /// Carries the path of the linked worktree that owns the branch so the
+    /// row can offer a one-click "Adopt & retry".
+    branch?: string;
+    worktreePath?: string;
+  };
   type Phase =
     | { kind: 'form' }
     | { kind: 'busy'; message: string }
-    | { kind: 'outcomes'; rows: { repoId: UUID; ok: boolean; label: string; message?: string }[] };
+    | { kind: 'outcomes'; rows: Row[] };
   const [phase, setPhase] = useState<Phase>({ kind: 'form' });
+  // Per-row "adopt" busy id, so the right row's button shows the spinner
+  // without freezing the others.
+  const [adoptingId, setAdoptingId] = useState<UUID | null>(null);
 
   // Slug suggestion derived from the workset name. Shown as the Branch
   // input's placeholder when the user hasn't typed one yet — accepting
@@ -1635,7 +1650,7 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
 
       const repoCount = picked.size;
       const repoWord = repoCount === 1 ? 'repo' : 'repos';
-      const rows: { repoId: UUID; ok: boolean; label: string; message?: string }[] = [];
+      const rows: Row[] = [];
 
       if (baseMode === 'origin' || baseMode === 'current') {
         const syncDefault = baseMode === 'origin';
@@ -1680,6 +1695,8 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
             ok,
             label: o.result,
             message: o.message,
+            branch: o.branch,
+            worktreePath: o.worktreePath,
           });
         }
       }
@@ -1699,6 +1716,48 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
       }
     } finally {
       setBusy(false);
+    }
+  };
+
+  const onAdoptRow = async (row: Row) => {
+    if (!row.worktreePath || !row.branch) return;
+    setAdoptingId(row.repoId);
+    try {
+      const res = await adoptWorktreeBranch(
+        row.repoId,
+        row.worktreePath,
+        row.branch,
+        false,
+        undefined,
+      );
+      if (!res.ok) {
+        pushToast({
+          kind: 'error',
+          message:
+            res.step === 'precheck'
+              ? res.error
+              : `Adopt failed (${res.step}): ${res.error}`,
+        });
+        return;
+      }
+      // adoptWorktreeBranch already ran `git switch` in the main repo —
+      // mark the row as switched so the user sees the green outcome.
+      setPhase((p) =>
+        p.kind === 'outcomes'
+          ? {
+              ...p,
+              rows: p.rows.map((r) =>
+                r.repoId === row.repoId
+                  ? { ...r, ok: true, label: 'switched', message: undefined, worktreePath: undefined }
+                  : r,
+              ),
+            }
+          : p,
+      );
+      const wsId = useStore.getState().selectedWorkspaceId;
+      if (wsId) await refreshWorkspaceStatus(wsId);
+    } finally {
+      setAdoptingId(null);
     }
   };
 
@@ -1782,6 +1841,16 @@ function WorkspaceSheet({ workspaceId }: { workspaceId?: UUID } = {}): JSX.Eleme
                       {row.label}
                       {row.message ? ` — ${row.message}` : ''}
                     </span>
+                    {!row.ok && row.worktreePath && row.branch && (
+                      <button
+                        disabled={adoptingId !== null}
+                        onClick={() => void onAdoptRow(row)}
+                        title={`Remove the worktree at ${row.worktreePath} and check out ${row.branch} here.`}
+                        className="text-[11px] px-2 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
+                      >
+                        {adoptingId === row.repoId ? 'Adopting…' : 'Adopt & retry'}
+                      </button>
+                    )}
                   </li>
                 );
               })}
