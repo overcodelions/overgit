@@ -108,6 +108,13 @@ export interface RepoStatus {
   /// has commits to ship via `git push -u`, even though `ahead` can't
   /// be measured.
   hasUpstream: boolean;
+  /// True when the branch had an upstream configured but the remote
+  /// ref no longer resolves (typically: branch was merged and the
+  /// remote-tracking ref was pruned). Always false when hasUpstream is
+  /// true. Distinguishes a merged-and-gone branch from one that was
+  /// never pushed — the renderer skips "needs push" prompts in this
+  /// state because pushing would resurrect a branch the team deleted.
+  upstreamGone: boolean;
   /// Commits ahead/behind the repo's default branch — `origin/<default>`
   /// when available, else the local default. The renderer surfaces
   /// this as a pill so the user knows whether their feature branch is
@@ -140,10 +147,21 @@ export type InProgressOp = 'merge' | 'rebase' | 'cherry-pick';
 export interface CheckoutOutcome {
   repoId: UUID;
   /// What happened: switched cleanly, branch didn't exist, dirty tree
-  /// blocked the switch, or git returned an unexpected error.
-  result: 'switched' | 'already-on-branch' | 'missing-branch' | 'dirty' | 'error';
+  /// blocked the switch, the branch is already checked out in a linked
+  /// worktree (so git refused), or git returned an unexpected error.
+  result:
+    | 'switched'
+    | 'already-on-branch'
+    | 'missing-branch'
+    | 'dirty'
+    | 'worktree-conflict'
+    | 'error';
   branch: string;
   message?: string;
+  /// Set on `worktree-conflict`: the path git reported the branch is
+  /// already checked out at. The renderer offers a one-click "adopt"
+  /// (remove the worktree, switch in main) using this path.
+  worktreePath?: string;
 }
 
 /// One linked working tree from `git worktree list --porcelain`. Overgit

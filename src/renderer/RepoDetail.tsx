@@ -235,18 +235,13 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
 
   const branchLabel = status?.branch ?? '(detached)';
 
-  /// "1 unpushed commit on main" — same wording the in-view banner used
-  /// before this moved into the top bar. Hidden during merge/rebase
-  /// in-progress (push isn't safe then) and when nothing is ahead.
-  const unpushedHint =
-    status &&
-    status.branch !== null &&
-    !status.inProgress &&
-    ((status.ahead ?? 0) > 0 || !status.hasUpstream)
-      ? !status.hasUpstream
-        ? `Branch ${status.branch} has no upstream`
-        : `${status.ahead} unpushed commit${status.ahead === 1 ? '' : 's'} on ${status.branch}`
-      : null;
+  /// True only when the branch is genuinely waiting on a first push —
+  /// i.e. no upstream configured at all. A branch whose upstream was
+  /// pruned after merge (`upstreamGone`) reads as "no upstream" to git
+  /// but should not pulse the Push button: re-pushing would resurrect a
+  /// branch the team intentionally deleted.
+  const needsFirstPush =
+    !!status?.branch && !status.hasUpstream && !status.upstreamGone;
 
   return (
     <header className="px-6 py-3 border-b border-card flex items-center gap-4 relative">
@@ -286,15 +281,6 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
           </button>
         </Explain>
 
-        {unpushedHint && (
-          <span
-            className="inline-flex items-center gap-1.5 text-[12px] px-2.5 py-1 rounded-md bg-card text-accent"
-            title="Push (⌘P) to send these to the remote"
-          >
-            <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
-            <span className="truncate max-w-[280px]">{unpushedHint}</span>
-          </span>
-        )}
         {status && <WorktreeDeltaPill status={status} />}
         {status && <TrunkDistancePill status={status} />}
 
@@ -351,7 +337,7 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
           </button>
         </Explain>
         <Explain
-          command={`git push${status?.branch ? ` origin ${status.branch}` : ''}${status && !status.hasUpstream ? ' -u' : ''}`}
+          command={`git push${status?.branch ? ` origin ${status.branch}` : ''}${needsFirstPush ? ' -u' : ''}`}
           plain="Send your local commits up to the remote."
         >
           <button
@@ -360,12 +346,14 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
             title={
               status?.ahead
                 ? `${status.ahead} commit${status.ahead === 1 ? '' : 's'} to push (⌘P)`
-                : status?.branch && !status.hasUpstream
-                  ? `Branch has no upstream — first push will set origin/${status.branch} (⌘P)`
-                  : 'Push (⌘P)'
+                : needsFirstPush
+                  ? `Branch has no upstream — first push will set origin/${status?.branch} (⌘P)`
+                  : status?.upstreamGone
+                    ? `Upstream origin/${status.branch} was deleted (likely merged) — branch can be removed`
+                    : 'Push (⌘P)'
             }
             className={
-              (status?.ahead ?? 0) > 0 || (status?.branch && !status.hasUpstream)
+              (status?.ahead ?? 0) > 0 || needsFirstPush
                 ? 'text-xs px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50 flex items-center gap-1.5 animate-push-pulse'
                 : 'text-xs px-2.5 py-1 rounded bg-accent/30 text-ink-muted hover:bg-accent/50 hover:text-ink disabled:opacity-50 flex items-center gap-1.5'
             }
@@ -380,7 +368,7 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
                 <span>
                   Push
                   {status?.ahead ? ` ↑${status.ahead}` : ''}
-                  {status?.branch && !status.hasUpstream && !status?.ahead ? ' ↑*' : ''}
+                  {needsFirstPush && !status?.ahead ? ' ↑*' : ''}
                 </span>
                 <kbd className="text-[11px] text-white/85 font-mono">⌘P</kbd>
               </>
