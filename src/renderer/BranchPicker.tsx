@@ -292,7 +292,7 @@ export function BranchPicker({ repoId, anchorRef, initialMode, onClose }: Props)
 
   // Anchored under the trigger; clamp to the right edge of the window so
   // the picker doesn't slip off-screen on narrow layouts.
-  const popWidth = 380;
+  const popWidth = 460;
   const popLeft = Math.min(
     Math.max(8, anchorRect.left),
     window.innerWidth - popWidth - 8,
@@ -501,7 +501,7 @@ function BranchRow({
   return (
     <div
       onMouseEnter={onHover}
-      className={`group flex items-center gap-2 px-3 py-2 text-xs ${
+      className={`group relative flex items-center gap-2 px-3 py-2 text-xs ${
         active ? 'bg-accent/15' : ''
       }`}
     >
@@ -536,11 +536,16 @@ function BranchRow({
           {branch.kind === 'remote' && (
             <span className="text-[9px] uppercase font-mono text-sky-300/80">remote</span>
           )}
-          {branch.upstream && branch.kind === 'local' && (
-            <span className="text-[10px] text-ink-faint truncate" title={`tracks ${branch.upstream}`}>
-              ↔ {branch.upstream}
-            </span>
-          )}
+          {branch.upstream &&
+            branch.kind === 'local' &&
+            branch.upstream !== `origin/${branch.shortName}` && (
+              <span
+                className="text-[10px] text-ink-faint truncate shrink-0"
+                title={`tracks ${branch.upstream}`}
+              >
+                ↔ {branch.upstream}
+              </span>
+            )}
         </div>
         <div className="flex items-center gap-2 text-[10px] text-ink-faint min-w-0">
           <span className="font-mono">{branch.shortSha}</span>
@@ -550,8 +555,8 @@ function BranchRow({
       </button>
       </Explain>
       <div
-        className={`flex gap-1 transition-opacity ${
-          active ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+        className={`absolute right-2 top-1/2 -translate-y-1/2 flex gap-1 rounded-md bg-surface-elevated/95 backdrop-blur-sm shadow-md p-0.5 transition-opacity ${
+          active ? 'opacity-100' : 'opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto'
         }`}
       >
         {showMergeRebase && (
@@ -970,10 +975,22 @@ function groupBranches(
     b.shortName.toLowerCase().includes(q) ||
     b.subject.toLowerCase().includes(q);
 
+  // Sort newest-first by tip commit date so the rows the user is most
+  // likely to want are at the top. `for-each-ref` already returns them
+  // in committerdate-desc order, but we re-sort here to guarantee the
+  // contract regardless of where `branches` came from.
+  const byDateDesc = (a: BranchSummary, b: BranchSummary) => {
+    const ad = a.date ?? '';
+    const bd = b.date ?? '';
+    if (ad === bd) return 0;
+    return bd.localeCompare(ad);
+  };
   const filtered = branches.filter(matches);
   const current = filtered.filter((b) => b.isCurrent);
-  const locals = filtered.filter((b) => b.kind === 'local' && !b.isCurrent);
-  const remotes = filtered.filter((b) => b.kind === 'remote');
+  const locals = filtered
+    .filter((b) => b.kind === 'local' && !b.isCurrent)
+    .sort(byDateDesc);
+  const remotes = filtered.filter((b) => b.kind === 'remote').sort(byDateDesc);
 
   const groups: BranchGroup[] = [];
   if (current.length) groups.push({ label: 'Current', items: current });
