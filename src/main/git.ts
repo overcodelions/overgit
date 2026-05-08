@@ -667,9 +667,14 @@ export async function checkoutBranch(
   // want. We use `switch` over `checkout` so the dirty-tree case is
   // unambiguous: switch never silently merges, while plain `checkout`
   // sometimes does.
+  //
+  // When the local branch is missing, the start-point must be a real ref —
+  // `--track <branch>` looks up `<branch>` as a ref, and a bare branch
+  // name only resolves to the remote-tracking ref via DWIM. Be explicit
+  // with `origin/<branch>` so git doesn't bail with "invalid reference".
   const switchRes = localExists.ok
     ? await run(repoPath, ['switch', branch])
-    : await run(repoPath, ['switch', '--track', branch, '-c', branch]);
+    : await run(repoPath, ['switch', '-c', branch, '--track', `origin/${branch}`]);
   if (switchRes.ok) return { repoId, result: 'switched', branch };
   return classifyFailure(repoId, branch, switchRes);
 }
