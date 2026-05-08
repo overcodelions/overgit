@@ -83,6 +83,10 @@ export interface Workspace {
   /// set is done — committed and pushed across all repos — put it away
   /// without losing it."
   archived?: boolean;
+  /// ISO timestamp captured at creation. Used to order the archived
+  /// section newest-first. Optional because workspaces created before
+  /// this field existed won't have one — those sort as oldest.
+  createdAt?: string;
 }
 
 export interface RepoStatus {
