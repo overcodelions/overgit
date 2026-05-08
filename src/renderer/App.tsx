@@ -604,8 +604,18 @@ function Sidebar(): JSX.Element {
     () => visibleWorkspaces.filter((w) => !w.archived),
     [visibleWorkspaces],
   );
+  // Archived list is shown newest-first by creation date. Workspaces
+  // archived before `createdAt` was tracked have no date — those sort
+  // as oldest, with stable sort preserving their relative order so the
+  // section doesn't reshuffle on each render.
   const archivedWorkspaces = useMemo(
-    () => visibleWorkspaces.filter((w) => w.archived),
+    () =>
+      [...visibleWorkspaces.filter((w) => w.archived)].sort((a, b) => {
+        const ad = a.createdAt ?? '';
+        const bd = b.createdAt ?? '';
+        if (ad === bd) return 0;
+        return bd.localeCompare(ad);
+      }),
     [visibleWorkspaces],
   );
   // Auto-expand the Archived section when a search query has narrowed the

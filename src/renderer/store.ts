@@ -501,7 +501,7 @@ export const useStore = create<UiState>((set, get) => ({
   },
 
   createWorkspace: async (name, repoIds, preferredBranch) => {
-    const ws: Workspace = { id: uuid(), name, repoIds };
+    const ws: Workspace = { id: uuid(), name, repoIds, createdAt: new Date().toISOString() };
     if (preferredBranch && preferredBranch.trim()) {
       ws.preferredBranch = preferredBranch.trim();
     }
