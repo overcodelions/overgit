@@ -4,17 +4,17 @@
   "description": "A workspace-based git client. Coordinates branches, status, and reviews across many repos at once.",
   "license": "Apache-2.0",
   "author": "Lionel Farr <lionelfarr@gmail.com>",
-  "homepage": "https://github.com/lionelfarr/overgit",
+  "homepage": "https://github.com/overcodelions/overgit",
   "repository": {
     "type": "git",
-    "url": "https://github.com/lionelfarr/overgit.git"
+    "url": "https://github.com/overcodelions/overgit.git"
   },
   "bugs": {
-    "url": "https://github.com/lionelfarr/overgit/issues"
+    "url": "https://github.com/overcodelions/overgit/issues"
   },
   "main": "dist/main/index.js",
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "scripts": {
     "dev": "concurrently -k -n vite,tsc,electron -c cyan,yellow,magenta \"npm:dev:renderer\" \"npm:dev:tsc\" \"npm:dev:electron\"",

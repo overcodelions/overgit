@@ -2,7 +2,7 @@
 
 A workspace-overlay git client. Coordinate many repos at once without owning their state.
 
-Sibling project of [overcli](https://github.com/lionelfarr/overcli).
+Sibling project of [overcli](https://github.com/overcodelions/overcli).
 
 ## Why overgit
 
