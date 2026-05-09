@@ -1,0 +1,40 @@
+name: Feature request
+description: Suggest a new capability or an improvement.
+title: "[feature] "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        overgit is opinionated — the bar for new behavior is "does it make coordinated multi-repo work cleaner?".
+        That doesn't mean we won't do other things, but framing your idea against that helps it land.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's the problem?
+      description: What are you trying to do today that's awkward or impossible?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would the UX or behavior look like? Sketch the user flow.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other tools you've used for this, or approaches you ruled out.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues and discussions for the same idea.
+          required: true
