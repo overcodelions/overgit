@@ -1377,7 +1377,7 @@ function AboutSheet(): JSX.Element {
         </span>
         <div className="flex-1" />
         <a
-          href="https://github.com/lionelfarr/overgit"
+          href="https://github.com/overcodelions/overgit"
           target="_blank"
           rel="noreferrer"
           className="rounded px-2 py-1 text-ink-muted hover:bg-card hover:text-ink"
