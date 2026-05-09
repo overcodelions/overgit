@@ -1,0 +1,82 @@
+name: Bug report
+description: Something is broken or behaves unexpectedly.
+title: "[bug] "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. The more specific you can be the faster it gets fixed.
+        For suspected security issues, please use the private security advisory flow instead.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of what went wrong, and what you expected instead.
+      placeholder: When I clicked Pull on a workspace, …
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps. Include the relevant repo / workspace shape if it matters (e.g. "workspace with 3 members, one dirty").
+      placeholder: |
+        1. Open workspace X
+        2. Click …
+        3. …
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: overgit version
+      description: From the title bar, or `package.json` if you're running from source.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - macOS
+        - Windows
+        - Linux
+    validations:
+      required: true
+
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version
+      placeholder: "macOS 14.5 / Windows 11 23H2 / Ubuntu 24.04"
+
+  - type: input
+    id: git-version
+    attributes:
+      label: git version
+      description: Output of `git --version`.
+      placeholder: "git version 2.45.0"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / screenshots
+      description: |
+        DevTools console output (Cmd+Opt+I in dev, or via View → Toggle DevTools), or a screenshot / GIF.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues before filing.
+          required: true
+        - label: This is not a security vulnerability (those go through the private advisory flow).
+          required: true
