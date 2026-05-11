@@ -48,6 +48,11 @@ export function BranchPicker({ repoId, anchorRef, initialMode, onClose }: Props)
     initialMode === 'create' ? { kind: 'create' } : { kind: 'list' },
   );
   const [busy, setBusy] = useState(false);
+  /// Branch name the user just clicked to switch into. Drives the
+  /// "Switching to <branch>…" overlay so the picker doesn't look frozen
+  /// while git churns through the checkout (can take a beat on big
+  /// repos). Cleared once the IPC resolves.
+  const [switchingTo, setSwitchingTo] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const anchorRect = useAnchorRect(anchorRef);
@@ -107,9 +112,10 @@ export function BranchPicker({ repoId, anchorRef, initialMode, onClose }: Props)
       onClose();
       return;
     }
+    const target = b.kind === 'remote' ? b.shortName : b.name;
     setBusy(true);
+    setSwitchingTo(b.shortName);
     try {
-      const target = b.kind === 'remote' ? b.shortName : b.name;
       const outcome = await checkout(repoId, target, false);
       if (outcome.result === 'error') {
         pushToast({ kind: 'error', message: outcome.message ?? 'Checkout failed' });
@@ -134,6 +140,7 @@ export function BranchPicker({ repoId, anchorRef, initialMode, onClose }: Props)
       onClose();
     } finally {
       setBusy(false);
+      setSwitchingTo(null);
     }
   };
 
@@ -355,6 +362,19 @@ export function BranchPicker({ repoId, anchorRef, initialMode, onClose }: Props)
             if (ok) setMode({ kind: 'list' });
           }}
         />
+      )}
+      {switchingTo && (
+        <div className="absolute inset-0 bg-surface-elevated/85 backdrop-blur-sm flex items-center justify-center text-xs text-ink z-10">
+          <div className="flex items-center gap-2">
+            <span
+              className="inline-block w-3 h-3 rounded-full border-2 border-accent border-t-transparent animate-spin"
+              aria-hidden
+            />
+            <span>
+              Switching to <span className="font-mono">{switchingTo}</span>…
+            </span>
+          </div>
+        </div>
       )}
     </div>
   );
