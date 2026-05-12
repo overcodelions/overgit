@@ -41,6 +41,10 @@ If your change touches any of these, call it out in the PR description:
 
 For suspected vulnerabilities, please follow [SECURITY.md](./SECURITY.md) instead of opening a public issue.
 
+## Conduct
+
+Please read the [Code of Conduct](./CODE_OF_CONDUCT.md) before participating.
+
 ## License
 
 By submitting a contribution you agree it is licensed under the project's [Apache-2.0 license](./LICENSE).

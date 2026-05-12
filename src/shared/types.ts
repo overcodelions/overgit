@@ -1,8 +1,8 @@
 // Shared types for the overgit IPC contract and on-disk store.
 //
-// Overgit is workspace-overlay: each `Repo` is a real, standalone git
-// repository on disk that overgit does NOT own. A `Workspace` is just a
-// named collection of repo IDs — opening a workspace doesn't move files
+// Overgit is workset-overlay: each `Repo` is a real, standalone git
+// repository on disk that overgit does NOT own. A `Workset` is just a
+// named collection of repo IDs — opening a workset doesn't move files
 // or rewrite metadata; it only tells the UI which repos to show together.
 // Anything overgit does (checkout, fetch, status) it does by shelling out
 // to `git` in each repo's existing directory.
@@ -68,23 +68,49 @@ export interface ResolvedIdentity {
   email: string;
 }
 
+/// Durable grouping of repos — the user's "initiative" / "org" /
+/// "client" bucket. Orthogonal to Workset: a Workspace is permanent
+/// and identity-bearing ("these repos are Platform"), while a Workset
+/// is a transient unit of in-flight work ("ship auth migration across
+/// these repos this week"). The sidebar groups repos by Workspace
+/// (collapsible sections) and treats each Workspace as a target for
+/// bulk actions: Reset all to default, Fetch all, etc. A repo can
+/// belong to many workspaces — small repos that span clients are the
+/// common case.
 export interface Workspace {
   id: UUID;
   name: string;
-  /// Ordered list of repo IDs. A repo can belong to many workspaces.
+  /// Repo IDs that belong to this workspace. Order is preserved for
+  /// the sidebar render; the renderer doesn't re-sort. A repo can
+  /// appear in multiple workspaces (multi-tag style).
   repoIds: UUID[];
-  /// Optional: the branch the user wants the workspace pinned to. Used
+  /// Sidebar persistence: when true, the workspace's repo list is
+  /// hidden behind its header. Stored so collapse state survives
+  /// relaunch — the user's mental model is "these are folded away,"
+  /// not "these are gone until I click again."
+  collapsed?: boolean;
+  /// ISO timestamp captured at creation. Used to break ties on the
+  /// sidebar order ("newest workspace first" when no explicit order).
+  createdAt?: string;
+}
+
+export interface Workset {
+  id: UUID;
+  name: string;
+  /// Ordered list of repo IDs. A repo can belong to many worksets.
+  repoIds: UUID[];
+  /// Optional: the branch the user wants the workset pinned to. Used
   /// by the "checkout everywhere" action as a default.
   preferredBranch?: string;
-  /// When set, the workspace is hidden from the active sidebar list and
+  /// When set, the workset is hidden from the active sidebar list and
   /// tucked under the collapsed "Archived" section. Reversible — the
-  /// workspace and its member repos are unchanged on disk; reactivate
-  /// clears this and re-selects the workspace. Mental model: a "working
+  /// workset and its member repos are unchanged on disk; reactivate
+  /// clears this and re-selects the workset. Mental model: a "working
   /// set is done — committed and pushed across all repos — put it away
   /// without losing it."
   archived?: boolean;
   /// ISO timestamp captured at creation. Used to order the archived
-  /// section newest-first. Optional because workspaces created before
+  /// section newest-first. Optional because worksets created before
   /// this field existed won't have one — those sort as oldest.
   createdAt?: string;
 }
@@ -145,7 +171,7 @@ export interface RepoStatus {
 
 export type InProgressOp = 'merge' | 'rebase' | 'cherry-pick';
 
-/// Result of a workspace-wide branch checkout. We attempt every repo and
+/// Result of a workset-wide branch checkout. We attempt every repo and
 /// report each outcome rather than aborting on the first failure — the
 /// user wants to know which ones landed and which need attention.
 export interface CheckoutOutcome {
@@ -192,7 +218,32 @@ export interface Worktree {
   prunable: boolean;
 }
 
-/// Per-repo result of the workspace-wide commit-all action. Mirrors
+/// Snapshot of what the Abandon-local-commits flow would discard:
+/// the upstream we'd snap to, the unpushed commits (newest first),
+/// dirty/untracked file paths, and a `git diff HEAD --stat` blob so
+/// the renderer can show the user exactly what's at stake before they
+/// confirm the destructive reset.
+export interface AbandonLocalPreview {
+  /// Tracked upstream of the current branch, e.g. "origin/master".
+  /// null when no upstream is configured — in that case the renderer
+  /// surfaces a different flow (Abandon needs an upstream to snap to).
+  upstream: string | null;
+  unpushed: {
+    sha: string;
+    shortSha: string;
+    subject: string;
+    author: string;
+  }[];
+  /// One entry per `git status --porcelain` row, X/Y untouched so the
+  /// renderer can render status badges the same way the Changes pane does.
+  dirtyFiles: { path: string; indexStatus: string; worktreeStatus: string }[];
+  /// Raw `git diff HEAD --stat` text. Surfaced as-is in a monospace
+  /// block — gives the user a quick "how much code would I lose"
+  /// without an extra round-trip.
+  diffStat: string;
+}
+
+/// Per-repo result of the workset-wide commit-all action. Mirrors
 /// SyncAndBranchOutcome's shape so the renderer can reuse the same
 /// per-repo result row.
 export interface CommitAllOutcome {
@@ -201,13 +252,13 @@ export interface CommitAllOutcome {
   message?: string;
 }
 
-/// Per-repo result of the workspace-wide push-all action. `up-to-date`
+/// Per-repo result of the workset-wide push-all action. `up-to-date`
 /// is the no-op case (already in sync with upstream) — kept distinct
 /// from `pushed` so the result list isn't all green when nothing
 /// actually moved. `no-upstream-set` means the push had to set the
 /// upstream on first push (we ran `git push -u origin HEAD`); we report
 /// it as a separate result so the user knows tracking was just wired.
-export interface WorkspacePushOutcome {
+export interface WorksetPushOutcome {
   repoId: UUID;
   result: 'pushed' | 'pushed-new-upstream' | 'up-to-date' | 'detached' | 'push-failed';
   /// Number of commits the local branch was ahead of its upstream when
@@ -218,11 +269,11 @@ export interface WorkspacePushOutcome {
   message?: string;
 }
 
-/// Per-repo result of the workspace-wide "open PRs" action. We keep the
+/// Per-repo result of the workset-wide "open PRs" action. We keep the
 /// failure modes named distinctly (`unpushed` vs `no-remote` vs
 /// `no-gh`) so the renderer can render an appropriate fix-it action per
 /// row instead of a generic error.
-export interface WorkspaceOpenPROutcome {
+export interface WorksetOpenPROutcome {
   repoId: UUID;
   result:
     | 'created'
@@ -271,7 +322,7 @@ export interface SyncAndBranchOutcome {
 /// step: fetch → switch each repo to its detected default branch → pull.
 /// Surfaced so a partial failure (one repo dirty, one repo with no
 /// detected default) is readable in the post-archive toast / sheet.
-export interface WorkspaceResetOutcome {
+export interface WorksetResetOutcome {
   repoId: UUID;
   /// Default branch we tried to reset to. Null when the repo has no
   /// detected default and no override.
@@ -282,8 +333,36 @@ export interface WorkspaceResetOutcome {
     | 'dirty'
     | 'fetch-failed'
     | 'switch-failed'
-    | 'pull-failed';
+    | 'pull-failed'
+    /// `origin/<default>` doesn't exist after a fetch + auto-refresh
+    /// of origin/HEAD. Either the remote has no default the helper
+    /// could resolve, or the configured default really has been
+    /// deleted with nothing to fall back to. Surfaced with the
+    /// ref name we tried, so the user can pick a new default
+    /// manually.
+    | 'upstream-gone'
+    /// Local default branch has commits not present on
+    /// `origin/<default>`. The hard-reset would erase them, so we
+    /// stop and ask. Renderer offers "Force reset (lose N commits)"
+    /// as an explicit destructive action.
+    | 'unpushed-commits';
   message?: string;
+  /// When `result === 'upstream-gone'`, the ref name that we tried
+  /// to find on origin and couldn't. Surfaced in the row's expanded
+  /// panel so the user knows what's missing.
+  staleRef?: string;
+  /// When `result === 'unpushed-commits'`, the count of local
+  /// commits on the default branch that aren't on
+  /// `origin/<default>`. Drives the "Force reset (lose N)" button
+  /// label.
+  unpushedCount?: number;
+  /// Repo-relative paths surfaced when `result === 'dirty'`. Either
+  /// the pre-flight `git status` found modifications, or `git pull`
+  /// reported "Your local changes ... would be overwritten by merge"
+  /// — both produce the same shape so the renderer can show one list
+  /// of paths and the same "Stash & retry / Open repo / Skip"
+  /// actions in either case.
+  dirtyPaths?: string[];
   /// True when the workset's bound branch was safely deleted from this
   /// repo as part of the archive (it had no commits beyond default,
   /// or every commit was already merged). Branches with unpushed work
@@ -489,11 +568,11 @@ export interface AppSettings {
   /// usually wider than the app sidebar (it carries the lane rail +
   /// ref badges + subject + meta on one row).
   historyAsideWidth: number;
-  /// Per-workspace "last seen" timestamps (ISO 8601). Used by the
+  /// Per-workset "last seen" timestamps (ISO 8601). Used by the
   /// activity feed to mark commits / PRs that arrived since the user
-  /// last opened the workspace pane. Wiped when a workspace is
-  /// removed; never written for repos (workspace-scoped only).
-  workspaceLastSeen?: Record<UUID, string>;
+  /// last opened the workset pane. Wiped when a workset is
+  /// removed; never written for repos (workset-scoped only).
+  worksetLastSeen?: Record<UUID, string>;
   /// Global default identity overgit will use for commits when a repo
   /// has neither a per-repo override nor a local git config. Lets users
   /// who keep one canonical "this is me" identity skip per-repo setup
@@ -517,7 +596,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   sidebarVisible: true,
   sidebarWidth: 288,
   historyAsideWidth: 480,
-  workspaceLastSeen: {},
+  worksetLastSeen: {},
   stagingMode: 'simple',
   explainMode: true,
 };
@@ -533,6 +612,7 @@ export const HISTORY_ASIDE_MAX_WIDTH = 900;
 export interface IPCInvokeMap {
   'store:load': () => StoreSnapshot;
   'store:saveRepos': (repos: Repo[]) => void;
+  'store:saveWorksets': (worksets: Workset[]) => void;
   'store:saveWorkspaces': (workspaces: Workspace[]) => void;
   'store:saveSettings': (settings: AppSettings) => void;
 
@@ -589,6 +669,34 @@ export interface IPCInvokeMap {
   'repo:undoLastCommit': (args: { repoId: UUID }) => { ok: boolean; error?: string };
   'repo:push': (repoId: UUID) => { ok: boolean; error?: string };
   'repo:fetch': (repoId: UUID) => { ok: boolean; error?: string };
+  /// What the user is about to discard when they Abandon local commits:
+  /// upstream we'd snap to, unpushed commits, and dirty files. Drives the
+  /// confirmation sheet so the user sees what's at stake.
+  'repo:abandonLocalPreview': (repoId: UUID) => AbandonLocalPreview;
+  /// "Throw away local work and reset to upstream." Optional
+  /// backupBranch is created off HEAD *before* the reset so the
+  /// abandoned commits stay reachable as a normal branch (no relying on
+  /// reflog). Optional cleanUntracked runs `git clean -fd` afterward.
+  'repo:resetToUpstream': (args: {
+    repoId: UUID;
+    upstreamRef: string;
+    backupBranch?: string;
+    cleanUntracked?: boolean;
+  }) => {
+    ok: boolean;
+    step?: 'backup' | 'fetch' | 'reset' | 'clean';
+    error?: string;
+    backupBranch?: string;
+  };
+  /// Ask an LLM CLI to propose a backup-branch name + one-line summary
+  /// from the about-to-be-abandoned work. Best-effort: failure surfaces
+  /// as `ok: false` so the renderer can keep the date-only fallback.
+  'repo:suggestBackupBranchName': (args: {
+    repoId: UUID;
+    tool: LlmTool;
+  }) =>
+    | { ok: true; name: string; summary: string; tool: LlmTool }
+    | { ok: false; error: string; tool: LlmTool };
   'repo:createBranch': (args: {
     repoId: UUID;
     name: string;
@@ -725,6 +833,14 @@ export interface IPCInvokeMap {
     strategy: 'stash' | 'discard';
   }) => { ok: boolean; error?: string; stashed?: boolean };
   'repo:detectDefaultBranch': (repoId: UUID) => string | null;
+  /// Refresh `origin/HEAD` via `git remote set-head origin --auto`
+  /// and persist the new default into the repo's stored
+  /// `defaultBranch`. Returns the new default (or null if no remote /
+  /// detection failed). Used by the "Re-detect default & retry"
+  /// action on `upstream-gone` rows in the reset progress sheet.
+  'repo:refreshDefaultBranch': (
+    repoId: UUID,
+  ) => { ok: true; defaultBranch: string | null } | { ok: false; error: string };
   /// History of one file (`git log --follow`). `path` is repo-relative.
   /// Used by the in-app history sheet — the diff for any commit is
   /// available via the existing `repo:diff` call.
@@ -786,46 +902,46 @@ export interface IPCInvokeMap {
     content: string;
   }) => { ok: boolean; error?: string };
 
-  'workspace:status': (workspaceId: UUID) => RepoStatus[];
-  'workspace:checkoutBranch': (args: {
-    workspaceId: UUID;
+  'workset:status': (worksetId: UUID) => RepoStatus[];
+  'workset:checkoutBranch': (args: {
+    worksetId: UUID;
     branch: string;
     createIfMissing: boolean;
   }) => CheckoutOutcome[];
-  'workspace:fetchAll': (workspaceId: UUID) => { repoId: UUID; ok: boolean; error?: string }[];
+  'workset:fetchAll': (worksetId: UUID) => { repoId: UUID; ok: boolean; error?: string }[];
   /// Branch names that exist in any member repo (local + remote-tracking
   /// refs, with the remote prefix stripped), each annotated with the
-  /// number of member repos that carry it. Drives the workspace branch
+  /// number of member repos that carry it. Drives the workset branch
   /// typeahead.
-  'workspace:branchSuggestions': (
-    workspaceId: UUID,
+  'workset:branchSuggestions': (
+    worksetId: UUID,
   ) => { branch: string; repoCount: number; total: number }[];
-  'workspace:listPRs': (workspaceId: UUID) => RepoPRs[];
-  'workspace:syncAndBranch': (args: {
-    workspaceId: UUID;
+  'workset:listPRs': (worksetId: UUID) => RepoPRs[];
+  'workset:syncAndBranch': (args: {
+    worksetId: UUID;
     branch: string;
     syncDefault: boolean;
     pullBeforeBranch: boolean;
   }) => SyncAndBranchOutcome[];
-  /// Bring a single repo into a workspace's shared branch: fetch, sync
+  /// Bring a single repo into a workset's shared branch: fetch, sync
   /// default, pull, then create-or-checkout `branch`. Used to catch up a
-  /// project that was just added to a workspace whose other members are
+  /// project that was just added to a workset whose other members are
   /// already on a common feature branch.
-  'workspace:syncMemberToBranch': (args: {
+  'workset:syncMemberToBranch': (args: {
     repoId: UUID;
     branch: string;
   }) => SyncAndBranchOutcome | { result: 'unknown-repo' };
-  /// Stage and commit every dirty repo in the workspace with a shared
+  /// Stage and commit every dirty repo in the workset with a shared
   /// message. Repos in detached-HEAD state are skipped (returned as
   /// `detached`) — committing onto a detached HEAD orphans the commit.
   /// Clean repos come back as `clean` so the result table is symmetric.
-  'workspace:commitAll': (args: {
-    workspaceId: UUID;
+  'workset:commitAll': (args: {
+    worksetId: UUID;
     message: string;
   }) => CommitAllOutcome[];
-  /// Aggregate `git worktree list` across the workspace's repos so the
+  /// Aggregate `git worktree list` across the workset's repos so the
   /// renderer can show siblings per repo without N round-trips.
-  'workspace:worktrees': (workspaceId: UUID) => { repoId: UUID; worktrees: Worktree[] }[];
+  'workset:worktrees': (worksetId: UUID) => { repoId: UUID; worktrees: Worktree[] }[];
   'repo:listTags': (repoId: UUID) => Tag[];
   /// Create a tag. `message` makes it annotated; omitting (or empty
   /// string) makes it lightweight. `ref` defaults to HEAD when null.
@@ -865,43 +981,43 @@ export interface IPCInvokeMap {
   'repo:listSubmodules': (repoId: UUID) => Submodule[];
   'repo:lfsStatus': (repoId: UUID) => LfsStatus;
 
-  /// Aggregated "what happened recently" across the workspace. Walks
+  /// Aggregated "what happened recently" across the workset. Walks
   /// `git log` on the current branch of each repo (capped per-repo and
   /// in total) and merges in the gh PR list. Returned items are sorted
   /// newest-first; the renderer marks any newer than `lastSeen` as new.
-  'workspace:activity': (args: {
-    workspaceId: UUID;
-    /// Per-repo log limit (default 25). Total across the workspace is
+  'workset:activity': (args: {
+    worksetId: UUID;
+    /// Per-repo log limit (default 25). Total across the workset is
     /// implicitly capped at members × this.
     perRepo?: number;
-  }) => WorkspaceActivity[];
+  }) => WorksetActivity[];
 
-  /// `git push` every workspace repo whose branch is ahead of its
+  /// `git push` every workset repo whose branch is ahead of its
   /// upstream. Repos in detached HEAD are skipped. Repos with no
   /// upstream get `git push -u origin HEAD` so the first push wires up
   /// tracking — same as the single-repo Push button.
-  'workspace:pushAll': (workspaceId: UUID) => WorkspacePushOutcome[];
-  /// Open a GitHub PR on every workspace repo that's on a non-default
+  'workset:pushAll': (worksetId: UUID) => WorksetPushOutcome[];
+  /// Open a GitHub PR on every workset repo that's on a non-default
   /// branch with commits pushed to its upstream. `gh pr create` runs in
   /// each repo with the shared `title`/`body`/`draft`. Each repo's PR
   /// targets that repo's `defaultBranch` (per-repo override is not yet
   /// surfaced — keep it simple). Repos that already have an open PR for
   /// the current branch are returned as `already-open` so re-running
   /// the flow is idempotent.
-  'workspace:openPRs': (args: {
-    workspaceId: UUID;
+  'workset:openPRs': (args: {
+    worksetId: UUID;
     title: string;
     body: string;
     draft: boolean;
-  }) => WorkspaceOpenPROutcome[];
+  }) => WorksetOpenPROutcome[];
   /// Reset every member of a workset to its default branch with a fresh
   /// pull. Used by the Archive flow so worksets close out with each repo
   /// in a clean "ready for next work" state on its trunk, not parked on
   /// a now-merged feature branch. Sequential per-repo so outcomes
   /// narrate cleanly.
-  'workspace:resetToDefault': (
+  'workset:resetToDefault': (
     args: {
-      workspaceId: UUID;
+      worksetId: UUID;
       /// Optional: a branch to safely delete from each repo after it
       /// switches back to default. Used by the Archive flow to sweep
       /// up the workset's now-finished feature branch. We use git's
@@ -909,11 +1025,48 @@ export interface IPCInvokeMap {
       /// commits — so passing this can never lose work.
       cleanupBranch?: string;
     },
-  ) => WorkspaceResetOutcome[];
+  ) => WorksetResetOutcome[];
   /// Global "reset all repos to default" — fan out fetch → switch →
   /// pull across every repo in the sidebar (or the optional explicit
   /// subset, used when the renderer wants to skip known-dirty repos).
-  'repos:resetAllToDefault': (repoIds?: UUID[]) => WorkspaceResetOutcome[];
+  'repos:resetAllToDefault': (repoIds?: UUID[]) => WorksetResetOutcome[];
+
+  /// Reset every repo in a Workspace (durable grouping) to its default
+  /// branch — same per-repo fetch → switch → pull as
+  /// `repos:resetAllToDefault`, but scoped to one workspace's
+  /// membership instead of the whole library.
+  'workspace:resetToDefault': (
+    args: { workspaceId: UUID },
+  ) => WorksetResetOutcome[];
+  /// Fan out `git fetch` over every repo in a Workspace. Best-effort
+  /// per repo; per-row ok/error in the result table.
+  'workspace:fetchAll': (
+    workspaceId: UUID,
+  ) => { repoId: UUID; ok: boolean; error?: string }[];
+
+  /// Single-repo reset: put the local default branch at the tip of
+  /// `origin/<default>`. The renderer drives a concurrent loop over
+  /// a workspace's members to animate per-row progress in a sheet;
+  /// the batch IPCs above are unchanged for callers that don't need
+  /// per-repo updates. `force` skips the unpushed-commits guard —
+  /// only sent when the user has explicitly confirmed they're okay
+  /// losing those commits.
+  'repo:resetToDefault': (
+    args: { repoId: UUID; force?: boolean },
+  ) => WorksetResetOutcome;
+
+  /// Fast-forward the current branch to its upstream. Used by the
+  /// workspace detail page's "Sync N behind" flow — safe sync that
+  /// never creates merge commits and never rewrites history;
+  /// non-fast-forward cases come back with `diverged: true`.
+  'repo:fastForward': (
+    args: { repoId: UUID },
+  ) => {
+    ok: boolean;
+    error?: string;
+    alreadyUpToDate?: boolean;
+    diverged?: boolean;
+  };
 
   'cli:detect': () => CliPresence;
   'cli:reviewChanges': (args: {
@@ -932,50 +1085,64 @@ export interface IPCInvokeMap {
     paths?: string[];
   }) => { ok: true; message: string; tool: LlmTool } | { ok: false; error: string; tool: LlmTool };
 
+  /// Ask an LLM CLI to resolve a single conflict file end-to-end.
+  /// Returns the *proposed* resolved file content — the renderer must
+  /// preview the diff and require explicit Accept before writing.
+  'cli:resolveConflict': (args: {
+    repoId: UUID;
+    path: string;
+    tool: LlmTool;
+  }) => {
+    ok: boolean;
+    content: string;
+    error?: string;
+    tool: LlmTool;
+  };
+
   /// Run an LLM CLI review across every dirty on-branch repo in the
-  /// workspace. Diffs are concatenated under `=== <repo name> ===`
+  /// workset. Diffs are concatenated under `=== <repo name> ===`
   /// headers and capped at a byte budget; repos that overflow are
   /// replaced with their `git diff --stat HEAD` summary and listed in
   /// `truncated` so the renderer can warn the user.
-  'workspace:reviewChanges': (args: {
-    workspaceId: UUID;
+  'workset:reviewChanges': (args: {
+    worksetId: UUID;
     tool: LlmTool;
-  }) => ReviewResult & { truncated: WorkspaceDiffTruncation[] };
-  /// Same shape as `workspace:reviewChanges` but drafts a single shared
+  }) => ReviewResult & { truncated: WorksetDiffTruncation[] };
+  /// Same shape as `workset:reviewChanges` but drafts a single shared
   /// commit message from the aggregated diff.
-  'workspace:suggestCommitMessage': (args: {
-    workspaceId: UUID;
+  'workset:suggestCommitMessage': (args: {
+    worksetId: UUID;
     tool: LlmTool;
   }) =>
     | {
         ok: true;
         message: string;
         tool: LlmTool;
-        truncated: WorkspaceDiffTruncation[];
+        truncated: WorksetDiffTruncation[];
       }
     | {
         ok: false;
         error: string;
         tool: LlmTool;
-        truncated: WorkspaceDiffTruncation[];
+        truncated: WorksetDiffTruncation[];
       };
 }
 
-/// One repo whose working-tree diff exceeded the workspace-aggregate
+/// One repo whose working-tree diff exceeded the workset-aggregate
 /// byte cap and was replaced with a shortstat summary in the prompt
 /// sent to the LLM.
-export interface WorkspaceDiffTruncation {
+export interface WorksetDiffTruncation {
   repoId: UUID;
   repoName: string;
   /// Original diff size in bytes before substitution.
   originalBytes: number;
 }
 
-/// One row in the workspace activity feed. We model commits and PR
+/// One row in the workset activity feed. We model commits and PR
 /// events under one type so the renderer can sort them together by
 /// `at` descending — the user thinks of "what happened recently" as
 /// a single timeline, not two separate lists.
-export type WorkspaceActivity =
+export type WorksetActivity =
   | {
       kind: 'commit';
       repoId: UUID;
@@ -1095,12 +1262,13 @@ export interface BlameLine {
 
 export interface StoreSnapshot {
   repos: Repo[];
+  worksets: Workset[];
   workspaces: Workspace[];
   settings: AppSettings;
 }
 
 /// Push channel from main → renderer. Reserved for future streaming
-/// status updates (e.g. progress during a workspace fetch).
+/// status updates (e.g. progress during a workset fetch).
 export type MainToRendererEvent =
   | { kind: 'repo:statusUpdated'; status: RepoStatus }
-  | { kind: 'workspace:checkoutProgress'; workspaceId: UUID; outcome: CheckoutOutcome };
+  | { kind: 'workset:checkoutProgress'; worksetId: UUID; outcome: CheckoutOutcome };
