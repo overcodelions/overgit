@@ -1,8 +1,8 @@
 // Renderer store. Mirrors what's persisted in main, plus ephemeral UI
-// state (selected workspace + repo, latest status / log / diff / PR
+// state (selected workset + repo, latest status / log / diff / PR
 // snapshots). The "selected" repo is used by the detail pane; the
-// "selected" workspace by the workspace pane. They're independent — a
-// repo can be open while no workspace is selected, and vice versa.
+// "selected" workset by the workset pane. They're independent — a
+// repo can be open while no workset is selected, and vice versa.
 
 import { create } from 'zustand';
 import type {
@@ -23,33 +23,40 @@ import type {
   Stash,
   StoreSnapshot,
   UUID,
+  Workset,
+  WorksetActivity,
+  WorksetOpenPROutcome,
+  WorksetPushOutcome,
+  WorksetResetOutcome,
   Workspace,
-  WorkspaceActivity,
-  WorkspaceOpenPROutcome,
-  WorkspacePushOutcome,
-  WorkspaceResetOutcome,
   Worktree,
 } from '@shared/types';
 
 /// Sheet (modal) the user has currently open. `null` means no sheet.
 /// Centralized so the title bar's Settings button and the sidebar's
-/// "+ New workspace" button can both drive the same single overlay
+/// "+ New workset" button can both drive the same single overlay
 /// instead of each component owning a useState.
 export type Sheet =
   | { kind: 'settings' }
   | { kind: 'about' }
+  | { kind: 'newWorkset' }
+  | { kind: 'editWorkset'; worksetId: UUID }
+  | { kind: 'reviewChanges'; repoId: UUID; scope: 'staged' | 'working' }
+  | { kind: 'newBranchInWorkset'; worksetId: UUID }
+  | { kind: 'commitAllInWorkset'; worksetId: UUID }
+  | { kind: 'pushAllInWorkset'; worksetId: UUID }
+  | { kind: 'openPRsInWorkset'; worksetId: UUID }
   | { kind: 'newWorkspace' }
   | { kind: 'editWorkspace'; workspaceId: UUID }
-  | { kind: 'reviewChanges'; repoId: UUID; scope: 'staged' | 'working' }
-  | { kind: 'newBranchInWorkspace'; workspaceId: UUID }
-  | { kind: 'commitAllInWorkspace'; workspaceId: UUID }
-  | { kind: 'pushAllInWorkspace'; workspaceId: UUID }
-  | { kind: 'openPRsInWorkspace'; workspaceId: UUID }
+  | { kind: 'resetWorkspaceProgress'; workspaceId: UUID; repoIds: UUID[] }
+  | { kind: 'fetchWorkspaceProgress'; workspaceId: UUID; repoIds: UUID[] }
+  | { kind: 'syncBehindProgress'; workspaceId: UUID; repoIds: UUID[] }
   | { kind: 'fileHistory'; repoId: UUID; path: string; tab: 'history' | 'blame' }
   | { kind: 'manageRepo'; repoId: UUID; tab: 'tags' | 'remotes' | 'submodules' | 'identity' }
   | { kind: 'pullConflict'; repoId: UUID; conflicts: string[]; rawError: string }
   | { kind: 'initRepo'; path: string; reason: string }
-  | { kind: 'resolveConflict'; repoId: UUID; path: string };
+  | { kind: 'resolveConflict'; repoId: UUID; path: string }
+  | { kind: 'abandonLocal'; repoId: UUID };
 
 interface OpenFile {
   repoId: UUID;
@@ -91,22 +98,32 @@ export interface ConfirmRequest {
 interface UiState {
   loaded: boolean;
   repos: Repo[];
+  worksets: Workset[];
+  /// Durable repo groupings. Rendered as collapsible sections in the
+  /// sidebar; bulk actions (Reset all, Fetch all) hang off the header.
+  /// Orthogonal to worksets — a repo can be in many of either.
   workspaces: Workspace[];
   settings: AppSettings;
-  selectedWorkspaceId: UUID | null;
+  selectedWorksetId: UUID | null;
   selectedRepoId: UUID | null;
-  workspaceStatuses: Record<UUID, RepoStatus[]>;
-  workspacePRs: Record<UUID, RepoPRs[]>;
-  /// Activity-feed cache per workspace. Each refresh replaces the full
+  /// Workspace currently shown in the main pane. Mutually exclusive
+  /// with `selectedRepoId` / `selectedWorksetId` — the main pane
+  /// shows one of the three at a time. Selecting a workspace doesn't
+  /// affect sidebar collapse state; collapse is a separate prop on
+  /// the Workspace itself.
+  selectedWorkspaceId: UUID | null;
+  worksetStatuses: Record<UUID, RepoStatus[]>;
+  worksetPRs: Record<UUID, RepoPRs[]>;
+  /// Activity-feed cache per workset. Each refresh replaces the full
   /// list; we don't paginate or merge historical fetches because the
   /// "what's new since I last looked" model only needs the most recent
   /// snapshot.
-  workspaceActivity: Record<UUID, WorkspaceActivity[]>;
+  worksetActivity: Record<UUID, WorksetActivity[]>;
   /// Cached `git worktree list` output per repo. Keyed by repoId, not
-  /// workspaceId, because worktrees belong to repos and the same repo
-  /// can appear in multiple workspaces — caching by workspace would
+  /// worksetId, because worktrees belong to repos and the same repo
+  /// can appear in multiple worksets — caching by workset would
   /// duplicate the data and risk drift between views.
-  workspaceWorktrees: Record<UUID, Worktree[]>;
+  worksetWorktrees: Record<UUID, Worktree[]>;
   repoLog: Record<UUID, Commit[]>;
   repoDiff: Record<UUID, { key: string; files: FileDiff[] }>;
   repoChanges: Record<UUID, RepoChanges>;
@@ -145,10 +162,10 @@ interface UiState {
   /// this and renders the modal. Single-slot — only one confirm at a
   /// time, which matches what `window.confirm` allowed.
   pendingConfirm: ConfirmRequest | null;
-  /// The most recent workspace-checkout result, kept around so the UI
+  /// The most recent workset-checkout result, kept around so the UI
   /// can show per-repo outcomes and offer Stash/Commit affordances on
   /// repos that came back dirty.
-  lastCheckout: { workspaceId: UUID; branch: string; outcomes: CheckoutOutcome[] } | null;
+  lastCheckout: { worksetId: UUID; branch: string; outcomes: CheckoutOutcome[] } | null;
   /// Current contents of the bottom learning bar. Set by `<Explain>` on
   /// hover. `null` puts the bar in its idle prompt. Single slot — only
   /// the most recently hovered element is shown.
@@ -163,17 +180,18 @@ interface UiState {
     path: string,
     initialBranch: string,
   ) => Promise<{ ok: boolean; error?: string }>;
-  createWorkspace: (name: string, repoIds: UUID[], preferredBranch?: string) => Promise<void>;
-  selectWorkspace: (id: UUID | null) => void;
+  createWorkset: (name: string, repoIds: UUID[], preferredBranch?: string) => Promise<void>;
+  selectWorkset: (id: UUID | null) => void;
   selectRepo: (id: UUID | null) => void;
-  refreshWorkspaceStatus: (id: UUID) => Promise<void>;
-  refreshWorkspacePRs: (id: UUID) => Promise<void>;
-  refreshWorkspaceWorktrees: (id: UUID) => Promise<void>;
-  refreshWorkspaceActivity: (id: UUID) => Promise<void>;
-  /// Stamp the workspace's `lastSeen` to "now". Called when the user
-  /// opens the workspace pane so the activity feed's "new since" pip
+  selectWorkspace: (id: UUID | null) => void;
+  refreshWorksetStatus: (id: UUID) => Promise<void>;
+  refreshWorksetPRs: (id: UUID) => Promise<void>;
+  refreshWorksetWorktrees: (id: UUID) => Promise<void>;
+  refreshWorksetActivity: (id: UUID) => Promise<void>;
+  /// Stamp the workset's `lastSeen` to "now". Called when the user
+  /// opens the workset pane so the activity feed's "new since" pip
   /// shifts forward — and on explicit "Mark all read" too.
-  markWorkspaceSeen: (id: UUID) => Promise<void>;
+  markWorksetSeen: (id: UUID) => Promise<void>;
   refreshRepoWorktrees: (id: UUID) => Promise<void>;
   adoptWorktreeBranch: (
     id: UUID,
@@ -191,14 +209,21 @@ interface UiState {
     force: boolean,
   ) => Promise<{ ok: boolean; error?: string }>;
   pruneWorktrees: (id: UUID) => Promise<{ ok: boolean; error?: string; output?: string }>;
-  commitAllWorkspace: (id: UUID, message: string) => Promise<CommitAllOutcome[]>;
-  pushAllWorkspace: (id: UUID) => Promise<WorkspacePushOutcome[]>;
-  openPRsWorkspace: (
+  commitAllWorkset: (id: UUID, message: string) => Promise<CommitAllOutcome[]>;
+  pushAllWorkset: (id: UUID) => Promise<WorksetPushOutcome[]>;
+  openPRsWorkset: (
     id: UUID,
     args: { title: string; body: string; draft: boolean },
-  ) => Promise<WorkspaceOpenPROutcome[]>;
-  checkoutWorkspaceBranch: (id: UUID, branch: string, createIfMissing: boolean) => Promise<void>;
-  fetchWorkspace: (id: UUID) => Promise<void>;
+  ) => Promise<WorksetOpenPROutcome[]>;
+  checkoutWorksetBranch: (id: UUID, branch: string, createIfMissing: boolean) => Promise<void>;
+  /// "Pick up where you left off." If the workset's bound branch exists in
+  /// at least one member repo, this is a plain checkout (missing-branch
+  /// rows surface inline). If the branch exists nowhere, fall back to
+  /// syncAndBranch so the click that says "resume" can actually create
+  /// the branch in every repo that needs it. Outcomes are normalized to
+  /// CheckoutOutcome shape so the existing "Last switch" table renders.
+  resumeWorksetBranch: (id: UUID, branch: string) => Promise<void>;
+  fetchWorkset: (id: UUID) => Promise<void>;
   refreshRepoLog: (id: UUID) => Promise<void>;
   refreshRepoDiff: (id: UUID, sha?: string) => Promise<void>;
   stashRepo: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
@@ -215,13 +240,61 @@ interface UiState {
   /// Fan out fetch → switch to default → pull across every repo in
   /// the sidebar. Returns per-repo outcomes so the caller can surface
   /// dirty/failed reasons.
-  resetAllReposToDefault: () => Promise<WorkspaceResetOutcome[]>;
+  resetAllReposToDefault: () => Promise<WorksetResetOutcome[]>;
   /// User-facing wrapper around `resetAllReposToDefault` — handles
   /// the dirty-repo pre-flight confirm, the in-flight progress toast,
   /// and the per-outcome result toast. Used by both the Sidebar
   /// header button and the command palette so the UX stays in one
   /// place.
   runResetAllReposFlow: () => Promise<void>;
+  /// Workspace CRUD. `createWorkspace` returns the new id so callers
+  /// (the New Workspace sheet) can route the user to its edit form
+  /// or select it. `toggleWorkspaceCollapsed` persists the sidebar
+  /// fold state through to disk.
+  createWorkspace: (name: string, repoIds: UUID[]) => Promise<UUID>;
+  updateWorkspace: (
+    id: UUID,
+    patch: Partial<Pick<Workspace, 'name' | 'repoIds'>>,
+  ) => Promise<void>;
+  removeWorkspace: (id: UUID) => Promise<void>;
+  toggleWorkspaceCollapsed: (id: UUID) => Promise<void>;
+  /// Reset every repo in one workspace to its default branch (fetch
+  /// → switch → pull). Returns per-repo outcomes; the user-facing
+  /// flow wrapper handles confirms + toasts.
+  resetWorkspaceToDefault: (id: UUID) => Promise<WorksetResetOutcome[]>;
+  /// Single-repo reset: hard-set local default to origin's tip.
+  /// Used by the workspace reset progress sheet to drive the loop
+  /// in the renderer, animating each row as it completes. `force`
+  /// skips the unpushed-commits guard — only pass when the user has
+  /// explicitly confirmed in the row's expanded panel.
+  resetRepoToDefault: (id: UUID, force?: boolean) => Promise<WorksetResetOutcome>;
+  /// Single-repo fast-forward — runs `git pull --ff-only` against
+  /// the configured upstream. Diverged branches come back with
+  /// `diverged: true` so the sync flow can label them distinctly.
+  fastForwardRepo: (id: UUID) => Promise<{
+    ok: boolean;
+    error?: string;
+    alreadyUpToDate?: boolean;
+    diverged?: boolean;
+  }>;
+  /// Refresh `origin/HEAD` for a repo and persist the new default
+  /// branch into the store. Returns the new default branch (or an
+  /// error). Used by the "Re-detect default & retry" action on
+  /// upstream-gone rows in the reset progress sheet.
+  refreshRepoDefaultBranch: (
+    id: UUID,
+  ) => Promise<
+    | { ok: true; defaultBranch: string | null }
+    | { ok: false; error: string }
+  >;
+  /// User-facing wrapper: confirm, then open the live progress sheet
+  /// that drives the per-repo loop. Falls back to the toast-only
+  /// flow when there's nothing to track (zero/one members).
+  runResetWorkspaceFlow: (id: UUID) => Promise<void>;
+  /// Fan out `git fetch` for every repo in one workspace, then
+  /// refresh statuses so the sidebar's ahead/behind dots track the
+  /// fresh remote refs.
+  fetchAllInWorkspace: (id: UUID) => Promise<void>;
   /// Fan out `git fetch` for every known repo so the sidebar's
   /// ahead/behind dots reflect the remote, not just the stale local
   /// tracking refs. Errors are swallowed — a flaky remote or auth
@@ -318,15 +391,15 @@ interface UiState {
   togglePalette: (open?: boolean) => void;
 
   removeRepo: (id: UUID) => Promise<void>;
-  removeWorkspace: (id: UUID) => Promise<void>;
-  updateWorkspace: (id: UUID, patch: Partial<Pick<Workspace, 'name' | 'repoIds' | 'preferredBranch'>>) => Promise<void>;
-  /// Hide the workspace from the active sidebar list. Member repos are
+  removeWorkset: (id: UUID) => Promise<void>;
+  updateWorkset: (id: UUID, patch: Partial<Pick<Workset, 'name' | 'repoIds' | 'preferredBranch'>>) => Promise<void>;
+  /// Hide the workset from the active sidebar list. Member repos are
   /// untouched on disk; the working set just disappears from view until
-  /// reactivated. Deselects if it was the current workspace.
-  archiveWorkspace: (id: UUID) => Promise<void>;
-  /// Restore an archived workspace and select it (the "reopen" half of
+  /// reactivated. Deselects if it was the current workset.
+  archiveWorkset: (id: UUID) => Promise<void>;
+  /// Restore an archived workset and select it (the "reopen" half of
   /// the lifecycle).
-  unarchiveWorkspace: (id: UUID) => Promise<void>;
+  unarchiveWorkset: (id: UUID) => Promise<void>;
 
   setLearningHint: (hint: { command: string; plain: string } | null) => void;
 
@@ -356,6 +429,7 @@ function diffKey(sha: string | undefined): string {
 export const useStore = create<UiState>((set, get) => ({
   loaded: false,
   repos: [],
+  worksets: [],
   workspaces: [],
   settings: {
     theme: 'system',
@@ -365,12 +439,13 @@ export const useStore = create<UiState>((set, get) => ({
     stagingMode: 'simple',
     explainMode: true,
   },
-  selectedWorkspaceId: null,
+  selectedWorksetId: null,
   selectedRepoId: null,
-  workspaceStatuses: {},
-  workspacePRs: {},
-  workspaceActivity: {},
-  workspaceWorktrees: {},
+  selectedWorkspaceId: null,
+  worksetStatuses: {},
+  worksetPRs: {},
+  worksetActivity: {},
+  worksetWorktrees: {},
   repoLog: {},
   repoDiff: {},
   repoChanges: {},
@@ -397,27 +472,35 @@ export const useStore = create<UiState>((set, get) => ({
   hydrate: async () => {
     const snap: StoreSnapshot = await window.overgit.invoke('store:load');
     const cli = await window.overgit.invoke('cli:detect');
-    // Auto-select the first repo (or workspace, if there are no repos)
-    // on launch when nothing is selected. Without this, a fresh-install
-    // user lands on the empty "Pick a repo or a workspace" pane even
-    // though their library has entries.
+    // Auto-select something on launch so a fresh user doesn't land on
+    // the empty "Pick a …" pane when there's clearly content. Order:
+    //   1. keep the user's last selection if it still exists,
+    //   2. first workspace (the durable overview is the better
+    //      landing page than a single repo when one exists),
+    //   3. first repo,
+    //   4. first active workset.
     const cur = get();
+    const workspaces = snap.workspaces ?? [];
     const haveSelection =
       (cur.selectedRepoId && snap.repos.some((r) => r.id === cur.selectedRepoId)) ||
-      (cur.selectedWorkspaceId && snap.workspaces.some((w) => w.id === cur.selectedWorkspaceId));
+      (cur.selectedWorksetId && snap.worksets.some((w) => w.id === cur.selectedWorksetId)) ||
+      (cur.selectedWorkspaceId && workspaces.some((w) => w.id === cur.selectedWorkspaceId));
     set({
       loaded: true,
       repos: snap.repos,
-      workspaces: snap.workspaces,
+      worksets: snap.worksets,
+      workspaces,
       settings: snap.settings,
       cliPresence: cli,
     });
     if (!haveSelection) {
-      if (snap.repos.length > 0) {
+      if (workspaces.length > 0) {
+        get().selectWorkspace(workspaces[0].id);
+      } else if (snap.repos.length > 0) {
         get().selectRepo(snap.repos[0].id);
       } else {
-        const firstActive = snap.workspaces.find((w) => !w.archived);
-        if (firstActive) get().selectWorkspace(firstActive.id);
+        const firstActive = snap.worksets.find((w) => !w.archived);
+        if (firstActive) get().selectWorkset(firstActive.id);
       }
     }
     // Background-refresh statuses for every repo so the sidebar can
@@ -500,26 +583,34 @@ export const useStore = create<UiState>((set, get) => ({
     return { ok: true };
   },
 
-  createWorkspace: async (name, repoIds, preferredBranch) => {
-    const ws: Workspace = { id: uuid(), name, repoIds, createdAt: new Date().toISOString() };
+  createWorkset: async (name, repoIds, preferredBranch) => {
+    const ws: Workset = { id: uuid(), name, repoIds, createdAt: new Date().toISOString() };
     if (preferredBranch && preferredBranch.trim()) {
       ws.preferredBranch = preferredBranch.trim();
     }
-    const workspaces = [...get().workspaces, ws];
-    set({ workspaces, selectedWorkspaceId: ws.id, selectedRepoId: null });
-    await window.overgit.invoke('store:saveWorkspaces', workspaces);
+    const worksets = [...get().worksets, ws];
+    set({ worksets, selectedWorksetId: ws.id, selectedRepoId: null });
+    await window.overgit.invoke('store:saveWorksets', worksets);
   },
 
-  selectWorkspace: (id) => {
-    set({ selectedWorkspaceId: id, selectedRepoId: null });
+  selectWorkset: (id) => {
+    set({ selectedWorksetId: id, selectedRepoId: null, selectedWorkspaceId: null });
     if (id) {
-      get().refreshWorkspaceStatus(id);
-      get().refreshWorkspacePRs(id);
+      get().refreshWorksetStatus(id);
+      get().refreshWorksetPRs(id);
     }
   },
 
+  selectWorkspace: (id) => {
+    set({
+      selectedWorkspaceId: id,
+      selectedWorksetId: null,
+      selectedRepoId: null,
+    });
+  },
+
   selectRepo: (id) => {
-    set({ selectedRepoId: id });
+    set({ selectedRepoId: id, selectedWorkspaceId: null });
     if (id) {
       get().refreshRepoLog(id);
       get().refreshRepoChanges(id);
@@ -528,36 +619,36 @@ export const useStore = create<UiState>((set, get) => ({
     }
   },
 
-  refreshWorkspaceStatus: async (id) => {
-    const statuses = await window.overgit.invoke('workspace:status', id);
-    set({ workspaceStatuses: { ...get().workspaceStatuses, [id]: statuses } });
+  refreshWorksetStatus: async (id) => {
+    const statuses = await window.overgit.invoke('workset:status', id);
+    set({ worksetStatuses: { ...get().worksetStatuses, [id]: statuses } });
   },
 
-  refreshWorkspacePRs: async (id) => {
-    const prs = await window.overgit.invoke('workspace:listPRs', id);
-    set({ workspacePRs: { ...get().workspacePRs, [id]: prs } });
+  refreshWorksetPRs: async (id) => {
+    const prs = await window.overgit.invoke('workset:listPRs', id);
+    set({ worksetPRs: { ...get().worksetPRs, [id]: prs } });
   },
 
-  refreshWorkspaceWorktrees: async (id) => {
-    const rows = await window.overgit.invoke('workspace:worktrees', id);
-    const next = { ...get().workspaceWorktrees };
+  refreshWorksetWorktrees: async (id) => {
+    const rows = await window.overgit.invoke('workset:worktrees', id);
+    const next = { ...get().worksetWorktrees };
     for (const row of rows) next[row.repoId] = row.worktrees;
-    set({ workspaceWorktrees: next });
+    set({ worksetWorktrees: next });
   },
 
-  refreshWorkspaceActivity: async (id) => {
-    const items = await window.overgit.invoke('workspace:activity', {
-      workspaceId: id,
+  refreshWorksetActivity: async (id) => {
+    const items = await window.overgit.invoke('workset:activity', {
+      worksetId: id,
     });
-    set({ workspaceActivity: { ...get().workspaceActivity, [id]: items } });
+    set({ worksetActivity: { ...get().worksetActivity, [id]: items } });
   },
 
-  markWorkspaceSeen: async (id) => {
+  markWorksetSeen: async (id) => {
     const settings = get().settings;
     const next: AppSettings = {
       ...settings,
-      workspaceLastSeen: {
-        ...(settings.workspaceLastSeen ?? {}),
+      worksetLastSeen: {
+        ...(settings.worksetLastSeen ?? {}),
         [id]: new Date().toISOString(),
       },
     };
@@ -567,7 +658,7 @@ export const useStore = create<UiState>((set, get) => ({
 
   refreshRepoWorktrees: async (id) => {
     const wts = await window.overgit.invoke('repo:worktrees', id);
-    set({ workspaceWorktrees: { ...get().workspaceWorktrees, [id]: wts } });
+    set({ worksetWorktrees: { ...get().worksetWorktrees, [id]: wts } });
   },
 
   removeWorktree: async (id, worktreePath, force) => {
@@ -608,23 +699,23 @@ export const useStore = create<UiState>((set, get) => ({
     return res;
   },
 
-  commitAllWorkspace: async (id, message) => {
-    const outcomes = await window.overgit.invoke('workspace:commitAll', {
-      workspaceId: id,
+  commitAllWorkset: async (id, message) => {
+    const outcomes = await window.overgit.invoke('workset:commitAll', {
+      worksetId: id,
       message,
     });
     // Refresh status so the dirty count drops on each row that committed.
-    await get().refreshWorkspaceStatus(id);
+    await get().refreshWorksetStatus(id);
     return outcomes;
   },
 
-  pushAllWorkspace: async (id) => {
-    const outcomes = await window.overgit.invoke('workspace:pushAll', id);
+  pushAllWorkset: async (id) => {
+    const outcomes = await window.overgit.invoke('workset:pushAll', id);
     // After a push, ahead counters drop and upstream may have just been
-    // set — refresh status so the workspace overview is accurate. If
+    // set — refresh status so the workset overview is accurate. If
     // a single repo is also open, refresh its log + graph too so the
     // History tab's ref labels track the new upstream.
-    await get().refreshWorkspaceStatus(id);
+    await get().refreshWorksetStatus(id);
     const selectedRepoId = get().selectedRepoId;
     if (selectedRepoId) {
       await Promise.all([
@@ -636,33 +727,82 @@ export const useStore = create<UiState>((set, get) => ({
     return outcomes;
   },
 
-  openPRsWorkspace: async (id, { title, body, draft }) => {
-    const outcomes = await window.overgit.invoke('workspace:openPRs', {
-      workspaceId: id,
+  openPRsWorkset: async (id, { title, body, draft }) => {
+    const outcomes = await window.overgit.invoke('workset:openPRs', {
+      worksetId: id,
       title,
       body,
       draft,
     });
-    // Newly created PRs should show up in the workspace PR list
+    // Newly created PRs should show up in the workset PR list
     // immediately. Refresh after the call so the user sees their work
     // reflected without a manual refresh click.
-    await get().refreshWorkspacePRs(id);
+    await get().refreshWorksetPRs(id);
     return outcomes;
   },
 
-  checkoutWorkspaceBranch: async (id, branch, createIfMissing) => {
-    const outcomes = await window.overgit.invoke('workspace:checkoutBranch', {
-      workspaceId: id,
+  checkoutWorksetBranch: async (id, branch, createIfMissing) => {
+    const outcomes = await window.overgit.invoke('workset:checkoutBranch', {
+      worksetId: id,
       branch,
       createIfMissing,
     });
-    set({ lastCheckout: { workspaceId: id, branch, outcomes } });
-    await get().refreshWorkspaceStatus(id);
+    set({ lastCheckout: { worksetId: id, branch, outcomes } });
+    await get().refreshWorksetStatus(id);
   },
 
-  fetchWorkspace: async (id) => {
-    await window.overgit.invoke('workspace:fetchAll', id);
-    await Promise.all([get().refreshWorkspaceStatus(id), get().refreshWorkspacePRs(id)]);
+  resumeWorksetBranch: async (id, branch) => {
+    // Probe whether the branch exists in any member repo. If it does
+    // anywhere, plain checkout is the right move (cheaper, and per-row
+    // "Create from default" handles the holdouts). If it exists in zero
+    // repos, the workset was never actually branched — fall back to
+    // syncAndBranch so a single click creates it everywhere.
+    const suggestions = await window.overgit.invoke(
+      'workset:branchSuggestions',
+      id,
+    );
+    const existsSomewhere = suggestions.some(
+      (s) => s.branch === branch && s.repoCount > 0,
+    );
+    if (existsSomewhere) {
+      await get().checkoutWorksetBranch(id, branch, false);
+      return;
+    }
+    const syncOutcomes = await window.overgit.invoke(
+      'workset:syncAndBranch',
+      { worksetId: id, branch, syncDefault: true, pullBeforeBranch: true },
+    );
+    // Convert SyncAndBranchOutcome → CheckoutOutcome so the existing
+    // "Last switch" table renders without a parallel UI. `created` is
+    // the success case (we just branched and are now on it), `dirty`
+    // preserves the inline Stash & retry affordance, everything else
+    // collapses to `error` with the original step in the message.
+    const outcomes: CheckoutOutcome[] = syncOutcomes.map((o) => {
+      if (o.result === 'created') {
+        return { repoId: o.repoId, result: 'switched', branch };
+      }
+      if (o.result === 'dirty') {
+        return {
+          repoId: o.repoId,
+          result: 'dirty',
+          branch,
+          message: o.message,
+        };
+      }
+      return {
+        repoId: o.repoId,
+        result: 'error',
+        branch,
+        message: o.message ?? o.result,
+      };
+    });
+    set({ lastCheckout: { worksetId: id, branch, outcomes } });
+    await get().refreshWorksetStatus(id);
+  },
+
+  fetchWorkset: async (id) => {
+    await window.overgit.invoke('workset:fetchAll', id);
+    await Promise.all([get().refreshWorksetStatus(id), get().refreshWorksetPRs(id)]);
   },
 
   refreshRepoLog: async (id) => {
@@ -687,7 +827,7 @@ export const useStore = create<UiState>((set, get) => ({
 
   /// After a stash/commit succeeds we want to retry the checkout for
   /// just that repo — but only if there's a `lastCheckout` to retry
-  /// against. Replaces the matching outcome in place so the workspace
+  /// against. Replaces the matching outcome in place so the workset
   /// outcome list shows the new result instead of the stale dirty one.
   retryCheckoutRepo: async (id) => {
     const last = get().lastCheckout;
@@ -702,7 +842,7 @@ export const useStore = create<UiState>((set, get) => ({
     // Branch-summary cache must follow a successful retry too — same
     // staleness story as `checkoutRepo`.
     await Promise.all([
-      get().refreshWorkspaceStatus(last.workspaceId),
+      get().refreshWorksetStatus(last.worksetId),
       get().refreshRepoStatus(id),
       get().refreshRepoBranchSummaries(id),
     ]);
@@ -789,10 +929,143 @@ export const useStore = create<UiState>((set, get) => ({
     }
   },
 
+  createWorkspace: async (name, repoIds) => {
+    const ws: Workspace = {
+      id: uuid(),
+      name,
+      repoIds,
+      createdAt: new Date().toISOString(),
+    };
+    const workspaces = [...get().workspaces, ws];
+    set({ workspaces });
+    await window.overgit.invoke('store:saveWorkspaces', workspaces);
+    return ws.id;
+  },
+
+  updateWorkspace: async (id, patch) => {
+    const workspaces = get().workspaces.map((w) =>
+      w.id === id ? { ...w, ...patch } : w,
+    );
+    set({ workspaces });
+    await window.overgit.invoke('store:saveWorkspaces', workspaces);
+  },
+
+  removeWorkspace: async (id) => {
+    const workspaces = get().workspaces.filter((w) => w.id !== id);
+    const patch: Partial<UiState> = { workspaces };
+    if (get().selectedWorkspaceId === id) patch.selectedWorkspaceId = null;
+    set(patch);
+    await window.overgit.invoke('store:saveWorkspaces', workspaces);
+  },
+
+  toggleWorkspaceCollapsed: async (id) => {
+    const workspaces = get().workspaces.map((w) =>
+      w.id === id ? { ...w, collapsed: !w.collapsed } : w,
+    );
+    set({ workspaces });
+    await window.overgit.invoke('store:saveWorkspaces', workspaces);
+  },
+
+  resetWorkspaceToDefault: async (id) => {
+    return window.overgit.invoke('workspace:resetToDefault', { workspaceId: id });
+  },
+
+  resetRepoToDefault: async (id, force) => {
+    return window.overgit.invoke('repo:resetToDefault', {
+      repoId: id,
+      force,
+    });
+  },
+
+  /// Single-repo fast-forward. Used by the workspace detail page's
+  /// "Sync N behind" flow — drives the progress sheet's per-row loop.
+  fastForwardRepo: async (id) => {
+    return window.overgit.invoke('repo:fastForward', { repoId: id });
+  },
+
+  /// Re-detect a repo's default branch via `git remote set-head
+  /// origin --auto` and sync the new value into the in-memory repo
+  /// list (main persists it on its side). Used by the workspace
+  /// reset's upstream-gone heal path.
+  refreshRepoDefaultBranch: async (id) => {
+    const res = await window.overgit.invoke('repo:refreshDefaultBranch', id);
+    if (res.ok) {
+      const repos = get().repos.map((r) =>
+        r.id === id ? { ...r, defaultBranch: res.defaultBranch ?? undefined } : r,
+      );
+      set({ repos });
+    }
+    return res;
+  },
+
+  runResetWorkspaceFlow: async (id) => {
+    const state = get();
+    const ws = state.workspaces.find((w) => w.id === id);
+    if (!ws) return;
+    const members = state.repos.filter((r) => ws.repoIds.includes(r.id));
+    if (members.length === 0) {
+      state.pushToast({
+        kind: 'warn',
+        message: `${ws.name} has no repos to reset.`,
+      });
+      return;
+    }
+    const dirty = members.filter(
+      (r) => (state.repoStatus[r.id]?.dirtyCount ?? 0) > 0,
+    );
+    const dirtyList = dirty
+      .slice(0, 12)
+      .map((r) => `  • ${r.name}`)
+      .join('\n');
+    const dirtyMore = dirty.length - 12;
+    const body =
+      `Fetch, switch to default branch, and pull on every repo in ${ws.name} (${members.length}). ` +
+      `Repos with uncommitted changes will be skipped.` +
+      (dirty.length > 0
+        ? `\n\nWill skip ${dirty.length} dirty ${dirty.length === 1 ? 'repo' : 'repos'}:\n${dirtyList}` +
+          (dirtyMore > 0 ? `\n  …and ${dirtyMore} more` : '')
+        : '');
+    const ok = await state.requestConfirm({
+      title: `Reset ${ws.name} to default?`,
+      body,
+      confirmLabel: 'Reset all',
+    });
+    if (!ok) return;
+    // Hand off to the live progress sheet. It runs the per-repo
+    // loop itself and pushes a final summary toast when done so
+    // this wrapper doesn't have to wait or duplicate result UI.
+    get().setSheet({
+      kind: 'resetWorkspaceProgress',
+      workspaceId: id,
+      repoIds: members.map((r) => r.id),
+    });
+  },
+
+  fetchAllInWorkspace: async (id) => {
+    const state = get();
+    const ws = state.workspaces.find((w) => w.id === id);
+    if (!ws) return;
+    if (ws.repoIds.length === 0) {
+      state.pushToast({
+        kind: 'warn',
+        message: `${ws.name} has no repos to fetch.`,
+      });
+      return;
+    }
+    // Hand off to the live progress sheet — the renderer drives the
+    // loop with one `repo:fetch` per row so the user sees which repo
+    // is currently being fetched instead of a single aggregate toast.
+    get().setSheet({
+      kind: 'fetchWorkspaceProgress',
+      workspaceId: id,
+      repoIds: [...ws.repoIds],
+    });
+  },
+
   refreshAllRepoStatuses: async () => {
     const ids = get().repos.map((r) => r.id);
     if (ids.length === 0) return;
-    // Bound the fan-out so a 24-repo workspace doesn't fire 24
+    // Bound the fan-out so a 24-repo workset doesn't fire 24
     // simultaneous `repo:status` IPCs (each of which spawns several
     // git processes). Without this cap the periodic 60s tick + a
     // running squash scan was painting Activity Monitor with
@@ -1375,13 +1648,16 @@ export const useStore = create<UiState>((set, get) => ({
 
   removeRepo: async (id) => {
     const repos = get().repos.filter((r) => r.id !== id);
-    // Drop the repo from any workspace that referenced it. We don't
-    // delete workspaces that empty out — empty workspaces are valid; the
-    // user can re-populate or delete them explicitly.
+    // Drop the repo from any workset / workspace that referenced it.
+    // Empty groupings are valid — the user can re-populate or delete
+    // them explicitly.
+    const worksets = get().worksets.map((w) =>
+      w.repoIds.includes(id) ? { ...w, repoIds: w.repoIds.filter((r) => r !== id) } : w,
+    );
     const workspaces = get().workspaces.map((w) =>
       w.repoIds.includes(id) ? { ...w, repoIds: w.repoIds.filter((r) => r !== id) } : w,
     );
-    const patch: Partial<UiState> = { repos, workspaces };
+    const patch: Partial<UiState> = { repos, worksets, workspaces };
     if (get().selectedRepoId === id) patch.selectedRepoId = null;
     if (get().openFile?.repoId === id) {
       patch.openFile = null;
@@ -1391,43 +1667,44 @@ export const useStore = create<UiState>((set, get) => ({
     set(patch);
     await Promise.all([
       window.overgit.invoke('store:saveRepos', repos),
+      window.overgit.invoke('store:saveWorksets', worksets),
       window.overgit.invoke('store:saveWorkspaces', workspaces),
     ]);
   },
 
-  removeWorkspace: async (id) => {
-    const workspaces = get().workspaces.filter((w) => w.id !== id);
-    const patch: Partial<UiState> = { workspaces };
-    if (get().selectedWorkspaceId === id) patch.selectedWorkspaceId = null;
+  removeWorkset: async (id) => {
+    const worksets = get().worksets.filter((w) => w.id !== id);
+    const patch: Partial<UiState> = { worksets };
+    if (get().selectedWorksetId === id) patch.selectedWorksetId = null;
     set(patch);
-    await window.overgit.invoke('store:saveWorkspaces', workspaces);
+    await window.overgit.invoke('store:saveWorksets', worksets);
   },
 
-  updateWorkspace: async (id, patch) => {
-    const workspaces = get().workspaces.map((w) =>
+  updateWorkset: async (id, patch) => {
+    const worksets = get().worksets.map((w) =>
       w.id === id ? { ...w, ...patch } : w,
     );
-    set({ workspaces });
-    await window.overgit.invoke('store:saveWorkspaces', workspaces);
+    set({ worksets });
+    await window.overgit.invoke('store:saveWorksets', worksets);
   },
 
-  archiveWorkspace: async (id) => {
-    const workspaces = get().workspaces.map((w) =>
+  archiveWorkset: async (id) => {
+    const worksets = get().worksets.map((w) =>
       w.id === id ? { ...w, archived: true } : w,
     );
-    const patch: Partial<UiState> = { workspaces };
-    if (get().selectedWorkspaceId === id) patch.selectedWorkspaceId = null;
+    const patch: Partial<UiState> = { worksets };
+    if (get().selectedWorksetId === id) patch.selectedWorksetId = null;
     set(patch);
-    await window.overgit.invoke('store:saveWorkspaces', workspaces);
+    await window.overgit.invoke('store:saveWorksets', worksets);
   },
 
-  unarchiveWorkspace: async (id) => {
-    const workspaces = get().workspaces.map((w) =>
+  unarchiveWorkset: async (id) => {
+    const worksets = get().worksets.map((w) =>
       w.id === id ? { ...w, archived: false } : w,
     );
-    set({ workspaces });
-    await window.overgit.invoke('store:saveWorkspaces', workspaces);
-    get().selectWorkspace(id);
+    set({ worksets });
+    await window.overgit.invoke('store:saveWorksets', worksets);
+    get().selectWorkset(id);
   },
 
   setLearningHint: (hint) => set({ learningHint: hint }),

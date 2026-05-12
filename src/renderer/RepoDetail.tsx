@@ -376,6 +376,28 @@ function RepoHeader({ repoId }: { repoId: UUID }): JSX.Element {
           </button>
         </Explain>
         <RepoExtrasBadges repoId={repoId} />
+        {status &&
+          status.hasUpstream &&
+          ((status.ahead ?? 0) > 0 || status.dirtyCount > 0) && (
+            <Explain
+              command={`git branch backup/${status.branch}-<date> && git reset --hard @{upstream}`}
+              plain="Abandon local commits and/or dirty work — save them on a backup branch first, then snap this branch back to its upstream. AI can help name the backup."
+            >
+              <button
+                onClick={() => setSheet({ kind: 'abandonLocal', repoId })}
+                title={
+                  (status.ahead ?? 0) > 0 && status.dirtyCount > 0
+                    ? `Abandon ${status.ahead} unpushed commit${status.ahead === 1 ? '' : 's'} and ${status.dirtyCount} dirty file${status.dirtyCount === 1 ? '' : 's'} — back them up on a branch, then reset to upstream.`
+                    : (status.ahead ?? 0) > 0
+                      ? `Abandon ${status.ahead} unpushed commit${status.ahead === 1 ? '' : 's'} — back them up on a branch, then reset to upstream.`
+                      : `Abandon ${status.dirtyCount} dirty file${status.dirtyCount === 1 ? '' : 's'} — back them up on a branch, then reset to upstream.`
+                }
+                className="text-xs px-2 py-1 rounded border border-red-500/30 text-red-300 hover:bg-red-500/10"
+              >
+                Abandon…
+              </button>
+            </Explain>
+          )}
         <button
           onClick={() => setSheet({ kind: 'manageRepo', repoId, tab: 'tags' })}
           className="text-xs px-2 py-1 rounded text-ink-muted hover:text-ink hover:bg-card"
@@ -1339,9 +1361,9 @@ function IdentityIndicator({ repoId }: { repoId: UUID }): JSX.Element | null {
   // outright red — commits will fail.
   const tone =
     resolved.source === 'unset'
-      ? 'border-red-500/40 bg-red-500/10 text-red-200'
+      ? 'border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-200'
       : resolved.source === 'system'
-        ? 'border-amber-500/40 bg-amber-500/10 text-amber-100'
+        ? 'border-amber-500/40 bg-amber-500/10 text-amber-800 dark:text-amber-100'
         : 'border-card bg-card/40 text-ink-muted';
 
   const sourceLabel: Record<ResolvedIdentity['source'], string> = {
@@ -2572,7 +2594,7 @@ function StashTab({ repoId }: { repoId: UUID }): JSX.Element {
 ///      The main repo itself is omitted because it's the directory the
 ///      user is already looking at; rendering it here just adds noise.
 function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
-  const wts = useStore((s) => s.workspaceWorktrees[repoId]);
+  const wts = useStore((s) => s.worksetWorktrees[repoId]);
   const repoPath = useStore((s) => s.repos.find((r) => r.id === repoId)?.path);
   const branches = useStore((s) => s.repoBranchSummaries[repoId]);
   const status = useStore((s) => s.repoStatus[repoId]);
@@ -3441,13 +3463,19 @@ function BranchSwitchRow({
           {isCurrent ? (
             <span className="text-[11px] text-ink-faint">on this checkout</span>
           ) : (
-            <button
-              onClick={onSwitch}
-              disabled={disabled}
-              className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-surface-elevated disabled:opacity-50"
+            <Explain
+              command={`git switch ${name}`}
+              plain={`Switch the working tree to ${name}. Local changes that don't conflict are carried across.`}
             >
-              {pending ? 'Switching…' : 'Switch'}
-            </button>
+              <button
+                onClick={onSwitch}
+                disabled={disabled}
+                className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-surface-elevated disabled:opacity-50"
+                title={`Switch to ${name}`}
+              >
+                {pending ? 'Switching…' : 'Switch'}
+              </button>
+            </Explain>
           )}
         </div>
       )}
@@ -3815,6 +3843,11 @@ const RAIL_BASE_WIDTH = 56;
 
 function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
   const commits = useStore((s) => s.repoGraph[repoId] ?? EMPTY_GRAPH);
+  // Distinguish "graph hasn't loaded yet" from "graph loaded and is
+  // empty." Without this the History tab flashes "No commits yet."
+  // for the full ~5–10s it takes git log + lane layout to finish on
+  // a big repo, which reads as "broken" instead of "loading."
+  const graphLoaded = useStore((s) => s.repoGraph[repoId] !== undefined);
   const squashLinks = useStore((s) => s.repoSquashLinks[repoId] ?? EMPTY_SQUASH_LINKS);
   const refreshGraph = useStore((s) => s.refreshRepoGraph);
   const refreshSquashLinks = useStore((s) => s.refreshRepoSquashLinks);
@@ -4085,7 +4118,42 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
               </div>
             )}
             {commits.length === 0 && (
-              <div className="px-3 py-3 text-[11px] text-ink-faint">No commits yet.</div>
+              <div
+                className="px-3 py-3 flex items-center gap-2 text-[11px] text-ink-faint absolute"
+                style={{ top: ROW_HEIGHT, left: railWidth }}
+              >
+                {graphLoaded ? (
+                  <span>No commits yet.</span>
+                ) : (
+                  <>
+                    <svg
+                      width="10"
+                      height="10"
+                      viewBox="0 0 16 16"
+                      className="animate-spin"
+                      aria-hidden="true"
+                    >
+                      <circle
+                        cx="8"
+                        cy="8"
+                        r="6"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        fill="none"
+                        opacity="0.25"
+                      />
+                      <path
+                        d="M14 8a6 6 0 0 0-6-6"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        fill="none"
+                      />
+                    </svg>
+                    <span>Loading history…</span>
+                  </>
+                )}
+              </div>
             )}
 
             <svg
