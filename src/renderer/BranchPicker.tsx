@@ -256,7 +256,7 @@ export function BranchPicker({ repoId, anchorRef, initialMode, onClose }: Props)
     try {
       // Optional sync to default branch first. We skip silently if no
       // default is configured — the create still runs from current HEAD,
-      // which matches the workspace-wide flow's "no-default-branch"
+      // which matches the workset-wide flow's "no-default-branch"
       // behavior.
       if (opts.syncDefault && repo?.defaultBranch) {
         const switchRes = await checkout(repoId, repo.defaultBranch, false);

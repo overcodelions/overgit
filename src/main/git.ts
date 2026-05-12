@@ -43,7 +43,88 @@ interface RunResult {
 // patch-id stream) and killing the child is the right call.
 const MAX_GIT_OUTPUT_BYTES = 128 * 1024 * 1024;
 
-function run(
+// A crashed or SIGKILL'd git leaves behind `<path>.lock` files
+// (`.git/index.lock`, `.git/HEAD.lock`, `.git/refs/heads/<branch>.lock`)
+// which block every subsequent write with a "File exists" error. If
+// the lock is older than this threshold no live git process can be
+// updating it, so it's safe to clear and retry once.
+const STALE_LOCK_RE = /Unable to create '([^']+\.lock)': File exists/;
+/// How long a `.git/*.lock` file must have sat untouched before we
+/// consider it abandoned and safely delete it. Real git operations
+/// finish in well under 100ms, so anything older than ~2s is almost
+/// certainly leftover from a crashed or killed process. The earlier
+/// 10s threshold was conservative-to-a-fault and caused legitimate
+/// stale locks to surface as "switch failed" rows on Reset all.
+const STALE_LOCK_THRESHOLD_MS = 2_000;
+/// When the lock is *fresh* (created within the stale threshold) we
+/// assume an external process — an IDE, terminal git, gh — is briefly
+/// holding it. Wait this long between retries and give up after
+/// LOCK_RETRY_MAX_ATTEMPTS, so a permanently-stuck external tool
+/// surfaces as an error instead of pinning the call forever.
+const LOCK_RETRY_DELAY_MS = 150;
+const LOCK_RETRY_MAX_ATTEMPTS = 4;
+
+/// Per-repo serialization. Two `run()` calls into the same cwd queue
+/// up instead of racing the index/refs locks. This eliminates the
+/// in-process collision (status poll firing while sync is mid-merge);
+/// external tools racing us are handled by the retry loop below.
+const repoLocks = new Map<string, Promise<unknown>>();
+
+function withRepoLock<T>(cwd: string, fn: () => Promise<T>): Promise<T> {
+  const prev = repoLocks.get(cwd) ?? Promise.resolve();
+  const next = prev.then(fn, fn);
+  repoLocks.set(cwd, next);
+  // Drop the entry once we're the tail so the map doesn't grow
+  // unboundedly across the process lifetime.
+  next.catch(() => {}).finally(() => {
+    if (repoLocks.get(cwd) === next) repoLocks.delete(cwd);
+  });
+  return next;
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+export async function run(
+  cwd: string,
+  args: string[],
+  envOverride?: Record<string, string>,
+  timeoutMs?: number,
+): Promise<RunResult> {
+  return withRepoLock(cwd, async () => {
+    let last: RunResult | null = null;
+    for (let attempt = 0; attempt < LOCK_RETRY_MAX_ATTEMPTS; attempt++) {
+      const res = await runOnce(cwd, args, envOverride, timeoutMs);
+      if (res.ok) return res;
+      const m = STALE_LOCK_RE.exec(res.stderr);
+      if (!m) return res;
+      const lockPath = m[1];
+      let stale = false;
+      let gone = false;
+      try {
+        const stat = fs.statSync(lockPath);
+        stale = Date.now() - stat.mtimeMs >= STALE_LOCK_THRESHOLD_MS;
+      } catch {
+        gone = true;
+      }
+      if (stale) {
+        try {
+          fs.unlinkSync(lockPath);
+        } catch {
+          // Someone else just cleared it — fall through and retry.
+        }
+        continue;
+      }
+      if (gone) continue;
+      last = res;
+      if (attempt < LOCK_RETRY_MAX_ATTEMPTS - 1) {
+        await sleep(LOCK_RETRY_DELAY_MS);
+      }
+    }
+    return last ?? (await runOnce(cwd, args, envOverride, timeoutMs));
+  });
+}
+
+function runOnce(
   cwd: string,
   args: string[],
   envOverride?: Record<string, string>,
@@ -67,8 +148,11 @@ function run(
       resolve(r);
     };
     // Network-bound ops (fetch/pull/push) pass a timeout so a stalled
-    // remote or a credential prompt can't pin the workspace serial loop
-    // forever. Local ops omit it.
+    // remote or a credential prompt can't pin the workset serial loop
+    // forever. Local ops omit it. On timeout we SIGTERM, resolve the
+    // promise immediately so the caller doesn't wait, then SIGKILL
+    // shortly after if the child is still alive (askpass GUIs and
+    // ssh subprocesses ignore SIGTERM in some auth-stuck states).
     const timer = timeoutMs
       ? setTimeout(() => {
           try {
@@ -82,6 +166,13 @@ function run(
             stderr: stderr || `git ${args[0] ?? ''} timed out after ${Math.round(timeoutMs / 1000)}s`,
             code: null,
           });
+          setTimeout(() => {
+            try {
+              if (!child.killed) child.kill('SIGKILL');
+            } catch {
+              /* ignore */
+            }
+          }, 2_000);
         }, timeoutMs)
       : null;
     child.stdout.on('data', (b: Buffer) => {
@@ -136,6 +227,35 @@ function run(
 // that an open-ended wait is fine, but `fetch`/`pull`/`push` can hang on
 // a stalled remote, a slow auth prompt, or a tarpitting host.
 const NETWORK_TIMEOUT_MS = 90_000;
+
+/// Shared env overlay for every git op that talks to a remote.
+/// Disables interactive credential / host-key prompts so the call
+/// fails fast with a readable error instead of hanging on stdin or a
+/// GUI askpass. LogLevel=ERROR silences the post-quantum-KEX warning
+/// macOS 15+ OpenSSH spams on every connect to a non-PQ server.
+///
+/// We deliberately do NOT enable SSH ControlMaster multiplexing here.
+/// It looked attractive (one shared TCP/SSH handshake for N parallel
+/// fetches against the same host), but the auto-master path races
+/// when several workers start at once: they all see "no socket",
+/// they all try to create one, one wins, the rest fail with
+/// `mux_client_request_session: session request failed: Session open
+/// refused by peer`. The fetches themselves are fast enough without
+/// multiplexing; keeping the per-fetch handshake is the safe trade.
+const NETWORK_ENV: Record<string, string> = {
+  GIT_TERMINAL_PROMPT: '0',
+  GIT_ASKPASS: 'true',
+  SSH_ASKPASS: 'true',
+  GIT_SSH_COMMAND:
+    process.env.GIT_SSH_COMMAND
+    ?? [
+      'ssh',
+      '-o BatchMode=yes',
+      '-o ConnectTimeout=10',
+      '-o StrictHostKeyChecking=accept-new',
+      '-o LogLevel=ERROR',
+    ].join(' '),
+};
 
 /// Bounded `Promise.all`. Run `fn` over `items` with at most `limit`
 /// invocations in flight. Used by the squash-merge detector so a repo
@@ -637,7 +757,7 @@ export async function checkoutBranch(
 
   // Cache miss: ask the actual remote whether it has this branch. A
   // freshly-added repo has no remote-tracking refs until something is
-  // fetched, so without this probe a workspace checkout would falsely
+  // fetched, so without this probe a workset checkout would falsely
   // report `missing-branch` for a branch that exists on origin.
   if (!localExists.ok && !remoteExists.ok) {
     const ls = await run(repoPath, ['ls-remote', '--heads', 'origin', branch], undefined, NETWORK_TIMEOUT_MS);
@@ -921,7 +1041,15 @@ export function parseLocalChangesBlocked(stderr: string): string[] {
 
 export async function fetch(repoPath: string): Promise<{ ok: boolean; error?: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
-  const res = await run(repoPath, ['fetch', '--all', '--prune'], undefined, NETWORK_TIMEOUT_MS);
+  // 45s is plenty for a normal fetch; a stalled connection should
+  // surface fast so the workspace flow can move on to the next repo.
+  const FETCH_TIMEOUT_MS = 45_000;
+  const res = await run(
+    repoPath,
+    ['fetch', '--all', '--prune'],
+    NETWORK_ENV,
+    FETCH_TIMEOUT_MS,
+  );
   if (res.ok) return { ok: true };
   return { ok: false, error: res.stderr.trim() || `git exited ${res.code}` };
 }
@@ -1198,7 +1326,7 @@ export async function stash(
 ): Promise<{ ok: boolean; error?: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
   // `--include-untracked` so untracked files (a common source of "dirty"
-  // blocks during a workspace checkout) are stashed instead of being
+  // blocks during a workset checkout) are stashed instead of being
   // left behind to fail the next switch.
   const args = ['stash', 'push', '--include-untracked'];
   if (message?.trim()) args.push('-m', message.trim());
@@ -1607,6 +1735,27 @@ export async function abortMerge(
   return { ok: false, error: res.stderr.trim() || `git merge --abort exited ${res.code}` };
 }
 
+/// Short commit summaries from each side of an in-progress merge. Used
+/// to give an LLM the intent of recent work when asking it to resolve
+/// a conflict — the diff alone often isn't enough to choose a side.
+/// Returns `null` for either side if MERGE_HEAD isn't present or git
+/// errors out; callers should treat that as "no extra context available"
+/// rather than fatal.
+export async function mergeSideLogs(
+  repoPath: string,
+  limit = 10,
+): Promise<{ ours: string[] | null; theirs: string[] | null }> {
+  if (!looksLikeRepo(repoPath)) return { ours: null, theirs: null };
+  const fmt = '%h %s';
+  const [oursRes, theirsRes] = await Promise.all([
+    run(repoPath, ['log', `-n${limit}`, `--pretty=format:${fmt}`, 'MERGE_HEAD..HEAD']),
+    run(repoPath, ['log', `-n${limit}`, `--pretty=format:${fmt}`, 'HEAD..MERGE_HEAD']),
+  ]);
+  const lines = (r: RunResult) =>
+    r.ok ? r.stdout.split('\n').map((l) => l.trim()).filter(Boolean) : null;
+  return { ours: lines(oursRes), theirs: lines(theirsRes) };
+}
+
 export async function rebaseOnto(
   repoPath: string,
   onto: string,
@@ -1908,7 +2057,7 @@ export async function hasUpstream(repoPath: string): Promise<boolean> {
 }
 
 /// Push the current branch. The success result reports whether we had
-/// to set the upstream on this push — workspace push-all surfaces that
+/// to set the upstream on this push — workset push-all surfaces that
 /// distinctly so the user knows tracking was just wired ("first push to
 /// origin/feature/x"). Single-repo callers that don't care just ignore
 /// the extra field.
@@ -1917,7 +2066,7 @@ export async function push(
 ): Promise<{ ok: true; setUpstream: boolean } | { ok: false; error: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
   if (await hasUpstream(repoPath)) {
-    const res = await run(repoPath, ['push'], undefined, NETWORK_TIMEOUT_MS);
+    const res = await run(repoPath, ['push'], NETWORK_ENV, NETWORK_TIMEOUT_MS);
     if (res.ok) return { ok: true, setUpstream: false };
     return { ok: false, error: res.stderr.trim() || `git push exited ${res.code}` };
   }
@@ -1925,9 +2074,100 @@ export async function push(
   // work without ceremony. We push to `origin` because that's the
   // overwhelming default; users with a different remote setup can run
   // `git push -u <remote> HEAD` themselves once.
-  const res = await run(repoPath, ['push', '-u', 'origin', 'HEAD'], undefined, NETWORK_TIMEOUT_MS);
+  const res = await run(repoPath, ['push', '-u', 'origin', 'HEAD'], NETWORK_ENV, NETWORK_TIMEOUT_MS);
   if (res.ok) return { ok: true, setUpstream: true };
   return { ok: false, error: res.stderr.trim() || `git push exited ${res.code}` };
+}
+
+/// Safe sync: fast-forward the current branch to `origin/<branch>`
+/// using a targeted `git merge --ff-only refs/remotes/origin/<branch>`.
+/// Deliberately avoids `git pull` — pull reads FETCH_HEAD and gets
+/// confused on this user's setup ("Cannot fast-forward to multiple
+/// branches" / "not something we can merge"); targeting one ref
+/// directly is deterministic. Divergence is detected ahead of the
+/// merge via rev-list so we can return a clean `diverged: true`
+/// instead of a generic FF-refused stderr.
+export async function pullFastForward(
+  repoPath: string,
+): Promise<{
+  ok: boolean;
+  error?: string;
+  alreadyUpToDate?: boolean;
+  diverged?: boolean;
+}> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  // 1. Current branch (refuse on detached HEAD).
+  const head = await run(repoPath, [
+    'symbolic-ref',
+    '--short',
+    '--quiet',
+    'HEAD',
+  ]);
+  if (!head.ok || !head.stdout.trim()) {
+    return { ok: false, error: 'Detached HEAD — no upstream to sync.' };
+  }
+  const branch = head.stdout.trim();
+  // 2. Refresh origin's view of this branch. Targeted fetch — no
+  // --all — so FETCH_HEAD ends up with at most one entry and the
+  // remote-tracking ref we're about to merge against is fresh.
+  const fetchRes = await run(
+    repoPath,
+    ['fetch', 'origin', branch],
+    NETWORK_ENV,
+    NETWORK_TIMEOUT_MS,
+  );
+  if (!fetchRes.ok) {
+    return {
+      ok: false,
+      error: fetchRes.stderr.trim() || `git fetch exited ${fetchRes.code}`,
+    };
+  }
+  // 3. Verify the remote-tracking ref now exists.
+  const remoteRef = `refs/remotes/origin/${branch}`;
+  const remoteCheck = await run(repoPath, [
+    'rev-parse',
+    '--verify',
+    '--quiet',
+    remoteRef,
+  ]);
+  if (!remoteCheck.ok) {
+    return {
+      ok: false,
+      error: `origin/${branch} not found after fetch — branch may have been deleted upstream.`,
+    };
+  }
+  // 4. Diverged? Local has commits not on origin.
+  const ahead = await run(repoPath, [
+    'rev-list',
+    '--count',
+    `${remoteRef}..refs/heads/${branch}`,
+  ]);
+  const aheadN = ahead.ok ? parseInt(ahead.stdout.trim(), 10) || 0 : 0;
+  if (aheadN > 0) {
+    return {
+      ok: false,
+      diverged: true,
+      error: `Local has ${aheadN} ${aheadN === 1 ? 'commit' : 'commits'} not on origin/${branch} — fast-forward refused.`,
+    };
+  }
+  // 5. Already up to date? No-op so the renderer can label it.
+  const behind = await run(repoPath, [
+    'rev-list',
+    '--count',
+    `refs/heads/${branch}..${remoteRef}`,
+  ]);
+  const behindN = behind.ok ? parseInt(behind.stdout.trim(), 10) || 0 : 0;
+  if (behindN === 0) return { ok: true, alreadyUpToDate: true };
+  // 6. Merge --ff-only against the specific remote-tracking ref. No
+  // FETCH_HEAD involved.
+  const merge = await run(repoPath, ['merge', '--ff-only', remoteRef]);
+  if (!merge.ok) {
+    return {
+      ok: false,
+      error: merge.stderr.trim() || `git merge --ff-only exited ${merge.code}`,
+    };
+  }
+  return { ok: true };
 }
 
 export async function pull(
@@ -1969,7 +2209,7 @@ export async function pull(
     }
   }
 
-  const res = await run(repoPath, ['pull', '--no-rebase'], undefined, NETWORK_TIMEOUT_MS);
+  const res = await run(repoPath, ['pull', '--no-rebase'], NETWORK_ENV, NETWORK_TIMEOUT_MS);
   if (res.ok) return { ok: true };
   // Detect "would be overwritten" so the renderer can offer recovery
   // (stash & retry / discard & retry) instead of just dumping git's
@@ -2032,7 +2272,7 @@ export async function pullForce(
     }
   }
 
-  const pullRes = await run(repoPath, ['pull', '--no-rebase'], undefined, NETWORK_TIMEOUT_MS);
+  const pullRes = await run(repoPath, ['pull', '--no-rebase'], NETWORK_ENV, NETWORK_TIMEOUT_MS);
   if (pullRes.ok) {
     return { ok: true, stashed: strategy === 'stash' };
   }
@@ -2083,12 +2323,178 @@ export async function createBranch(
   return { ok: false, error: res.stderr.trim() || `git exited ${res.code}` };
 }
 
+/// "Throw away local commits + dirty tree and snap to upstream." Used by
+/// the Abandon-local-commits flow when the user accidentally committed
+/// to a protected branch (or otherwise wants a hard reset). When
+/// `backupBranch` is set we create it first so the discarded commits
+/// stay reachable via `git branch backup/…` instead of relying on the
+/// reflog. Steps run in this order so a failure leaves the user in a
+/// state they can reason about:
+///   1. (optional) create the backup branch off HEAD
+///   2. fetch the remote (default origin) so upstream tracks current tip
+///   3. hard-reset to the upstream ref
+///   4. (optional) `git clean -fd` to drop untracked files
+/// `upstreamRef` is the symbolic upstream we should snap to (e.g.
+/// `origin/master`). The renderer resolves it from `@{upstream}` before
+/// the call so the user can see exactly what they're resetting to in
+/// the confirmation UI.
+export async function resetToUpstream(
+  repoPath: string,
+  args: {
+    upstreamRef: string;
+    backupBranch?: string;
+    cleanUntracked?: boolean;
+  },
+): Promise<{
+  ok: boolean;
+  step?: 'backup' | 'fetch' | 'reset' | 'clean';
+  error?: string;
+  backupBranch?: string;
+}> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  const { upstreamRef, backupBranch, cleanUntracked } = args;
+  if (!upstreamRef.trim()) {
+    return { ok: false, error: 'Missing upstream ref.' };
+  }
+
+  if (backupBranch && backupBranch.trim()) {
+    const created = await createBranch(repoPath, backupBranch.trim(), false);
+    if (!created.ok) {
+      return { ok: false, step: 'backup', error: created.error };
+    }
+  }
+
+  const fetched = await run(
+    repoPath,
+    ['fetch', '--prune'],
+    undefined,
+    NETWORK_TIMEOUT_MS,
+  );
+  if (!fetched.ok) {
+    return {
+      ok: false,
+      step: 'fetch',
+      error: fetched.stderr.trim() || `git fetch exited ${fetched.code}`,
+    };
+  }
+
+  const reset = await run(repoPath, ['reset', '--hard', upstreamRef]);
+  if (!reset.ok) {
+    return {
+      ok: false,
+      step: 'reset',
+      error: reset.stderr.trim() || `git reset exited ${reset.code}`,
+    };
+  }
+
+  if (cleanUntracked) {
+    const cleaned = await run(repoPath, ['clean', '-fd']);
+    if (!cleaned.ok) {
+      return {
+        ok: false,
+        step: 'clean',
+        error: cleaned.stderr.trim() || `git clean exited ${cleaned.code}`,
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    backupBranch: backupBranch?.trim() || undefined,
+  };
+}
+
+/// What the user is about to throw away when they abandon local commits:
+/// the upstream we'd snap to, the unpushed commits, and a summary of any
+/// dirty tree changes. Used to populate the Abandon-local-commits sheet
+/// so the user sees exactly what's at stake before they click Reset.
+export async function abandonLocalPreview(
+  repoPath: string,
+): Promise<{
+  upstream: string | null;
+  unpushed: { sha: string; shortSha: string; subject: string; author: string }[];
+  dirtyFiles: { path: string; indexStatus: string; worktreeStatus: string }[];
+  diffStat: string;
+}> {
+  if (!looksLikeRepo(repoPath)) {
+    return { upstream: null, unpushed: [], dirtyFiles: [], diffStat: '' };
+  }
+  const upRes = await run(repoPath, ['rev-parse', '--abbrev-ref', '@{upstream}']);
+  const upstream = upRes.ok ? upRes.stdout.trim() || null : null;
+
+  const unpushed: {
+    sha: string;
+    shortSha: string;
+    subject: string;
+    author: string;
+  }[] = [];
+  if (upstream) {
+    const logRes = await run(repoPath, [
+      'log',
+      '@{upstream}..HEAD',
+      '--pretty=format:%H%x1f%h%x1f%s%x1f%an',
+    ]);
+    if (logRes.ok) {
+      for (const line of logRes.stdout.split('\n')) {
+        if (!line.trim()) continue;
+        const [sha, shortSha, subject, author] = line.split('\x1f');
+        unpushed.push({ sha, shortSha, subject, author });
+      }
+    }
+  }
+
+  const statRes = await run(repoPath, ['status', '--porcelain=v1']);
+  const dirtyFiles: { path: string; indexStatus: string; worktreeStatus: string }[] = [];
+  if (statRes.ok) {
+    for (const line of statRes.stdout.split('\n')) {
+      if (line.length < 3) continue;
+      const indexStatus = line[0];
+      const worktreeStatus = line[1];
+      const rest = line.slice(3).trim();
+      const arrow = rest.indexOf(' -> ');
+      const path = arrow >= 0 ? rest.slice(arrow + 4) : rest;
+      if (path) dirtyFiles.push({ path, indexStatus, worktreeStatus });
+    }
+  }
+
+  const diffRes = await run(repoPath, ['diff', 'HEAD', '--stat']);
+  const diffStat = diffRes.ok ? diffRes.stdout : '';
+
+  return { upstream, unpushed, dirtyFiles, diffStat };
+}
+
 /// Detect the repo's default branch — the line `origin/main` is on, the
 /// branch overgit treats as the "trunk" for compare/PR-base actions.
 /// Falls back through three sources: the symbolic HEAD ref of origin
 /// (the canonical answer), then a heuristic over `main`/`master`/`develop`.
 /// Returns null only when the repo has none of those — at which point
 /// the user can pick one in settings.
+/// Force-refresh `origin/HEAD` by asking the remote what its current
+/// default branch is, then re-resolve it. Used by the workspace
+/// reset's "upstream-gone" heal path: if the previously stored
+/// default branch no longer exists on the remote, this is what
+/// surfaces the new one. Returns null when there's no `origin`
+/// remote or the remote refuses (auth/offline) — the caller treats
+/// that the same as "couldn't detect."
+export async function refreshOriginHead(
+  repoPath: string,
+): Promise<{ ok: true; defaultBranch: string | null } | { ok: false; error: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  const res = await run(
+    repoPath,
+    ['remote', 'set-head', 'origin', '--auto'],
+    NETWORK_ENV,
+    NETWORK_TIMEOUT_MS,
+  );
+  if (!res.ok) {
+    return {
+      ok: false,
+      error: res.stderr.trim() || `git remote set-head exited ${res.code}`,
+    };
+  }
+  return { ok: true, defaultBranch: await detectDefaultBranch(repoPath) };
+}
+
 export async function detectDefaultBranch(repoPath: string): Promise<string | null> {
   if (!looksLikeRepo(repoPath)) return null;
   // 1. `origin/HEAD` — set during `clone`, refreshed by
