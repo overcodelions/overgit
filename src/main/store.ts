@@ -1,5 +1,5 @@
 // Disk-backed app store. Persists overgit's view of which repos and
-// workspaces the user has registered — but NOT any git state itself.
+// worksets the user has registered — but NOT any git state itself.
 // A single overgit.json under Electron's userData; small, atomic writes.
 
 import fs from 'node:fs';
@@ -10,6 +10,7 @@ import {
   DEFAULT_SETTINGS,
   Repo,
   StoreSnapshot,
+  Workset,
   Workspace,
 } from '../shared/types';
 
@@ -20,6 +21,7 @@ function storePath(): string {
 function emptyState(): StoreSnapshot {
   return {
     repos: [],
+    worksets: [],
     workspaces: [],
     settings: { ...DEFAULT_SETTINGS },
   };
@@ -30,10 +32,24 @@ function loadFromDisk(): StoreSnapshot {
   if (!fs.existsSync(p)) return emptyState();
   try {
     const parsed = JSON.parse(fs.readFileSync(p, 'utf-8'));
+    // Migrate pre-rename persisted shape (Workspace was the in-flight
+    // unit before the workset/workspace split). Old field `workspaces`
+    // → new `worksets`; old setting `workspaceLastSeen` → new
+    // `worksetLastSeen`. Done in-place so a single save afterwards
+    // bakes the new shape in.
+    if (parsed && Array.isArray(parsed.workspaces) && !Array.isArray(parsed.worksets)) {
+      parsed.worksets = parsed.workspaces;
+      delete parsed.workspaces;
+    }
+    const parsedSettings = parsed?.settings ?? {};
+    if (parsedSettings.workspaceLastSeen && !parsedSettings.worksetLastSeen) {
+      parsedSettings.worksetLastSeen = parsedSettings.workspaceLastSeen;
+      delete parsedSettings.workspaceLastSeen;
+    }
     return {
       ...emptyState(),
       ...parsed,
-      settings: { ...DEFAULT_SETTINGS, ...(parsed.settings ?? {}) },
+      settings: { ...DEFAULT_SETTINGS, ...parsedSettings },
     };
   } catch (err) {
     console.error('Failed to load overgit.json, starting fresh:', err);
@@ -65,6 +81,10 @@ export const Store = {
   },
   saveRepos(repos: Repo[]): void {
     current().repos = repos;
+    save();
+  },
+  saveWorksets(worksets: Workset[]): void {
+    current().worksets = worksets;
     save();
   },
   saveWorkspaces(workspaces: Workspace[]): void {

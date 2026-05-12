@@ -75,6 +75,21 @@ Missing CLIs hide the relevant UI; nothing else changes.
 
 See [SECURITY.md](./SECURITY.md) for how to report a vulnerability and what overgit does/doesn't send over the network.
 
+## A father–son project
+
+overgit is a collaboration between **[Lionel Farr](https://github.com/lionelfarr)** and his son **[Owen Farr](https://github.com/owenlfarr)**, sibling to [overcli](https://github.com/overcodelions/overcli). Same setup: an excuse to build something real together — Owen learning how a desktop app holds together end to end (IPC, state, subprocess plumbing, packaging), Lionel getting to teach by doing instead of explaining in the abstract.
+
+## Contributing
+
+Issues, bug reports, and PRs welcome — please open an issue first for anything non-trivial so we can talk about the shape of it.
+
+- [Open an issue](https://github.com/overcodelions/overgit/issues/new) — or email **assistant@codelionsllc.com**
+- Read [`CONTRIBUTING.md`](./CONTRIBUTING.md) for dev setup and PR expectations
+- See [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md) before participating
+- Found a security bug? Don't file a public issue — see [`SECURITY.md`](./SECURITY.md)
+
 ## License
 
-Apache-2.0. Built by Lionel Farr.
+Licensed under the [Apache License, Version 2.0](LICENSE).
+
+Copyright © 2026 Lionel Farr and Owen Farr.

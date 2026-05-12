@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useStore } from './store';
 import { RepoDetail, FileDiffBlock } from './RepoDetail';
 import { TitleBar } from './TitleBar';
@@ -18,9 +18,10 @@ import type {
   ReviewResult,
   SyncAndBranchOutcome,
   UUID,
+  Workset,
+  WorksetActivity,
+  WorksetDiffTruncation,
   Workspace,
-  WorkspaceActivity,
-  WorkspaceDiffTruncation,
   Worktree,
 } from '@shared/types';
 import { SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH } from '@shared/types';
@@ -34,7 +35,7 @@ import { SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH } from '@shared/types';
 const EMPTY_STATUSES: RepoStatus[] = [];
 const EMPTY_PRS: RepoPRs[] = [];
 const EMPTY_WORKTREES: Worktree[] = [];
-const EMPTY_ACTIVITY: WorkspaceActivity[] = [];
+const EMPTY_ACTIVITY: WorksetActivity[] = [];
 
 export function App(): JSX.Element {
   const { loaded, hydrate } = useStore();
@@ -286,14 +287,14 @@ function SidebarWithResize(): JSX.Element {
 /// harmlessly toward the same merged state.
 ///
 /// `refreshAllRepoStatuses` populates only the per-repo cache. The
-/// workset commit view reads `workspaceStatuses[id]`, which is a
-/// separate cache populated by `refreshWorkspaceStatus`. Without
+/// workset commit view reads `worksetStatuses[id]`, which is a
+/// separate cache populated by `refreshWorksetStatus`. Without
 /// re-running that here, a user sitting on the workset's Commit tab
 /// would see "all clean" forever after editing files in a terminal,
-/// because `selectWorkspace` only fires on a fresh re-selection.
+/// because `selectWorkset` only fires on a fresh re-selection.
 function useSidebarStatusRefresh(): void {
   const refreshAll = useStore((s) => s.refreshAllRepoStatuses);
-  const refreshWsStatus = useStore((s) => s.refreshWorkspaceStatus);
+  const refreshWsStatus = useStore((s) => s.refreshWorksetStatus);
   const refreshRepoLog = useStore((s) => s.refreshRepoLog);
   const refreshRepoChanges = useStore((s) => s.refreshRepoChanges);
   const refreshRepoStatus = useStore((s) => s.refreshRepoStatus);
@@ -313,7 +314,7 @@ function useSidebarStatusRefresh(): void {
       if (now - lastRun < COALESCE_MS) return;
       lastRun = now;
       void refreshAll();
-      const { selectedWorkspaceId: wsId, selectedRepoId: repoId } = useStore.getState();
+      const { selectedWorksetId: wsId, selectedRepoId: repoId } = useStore.getState();
       if (wsId) void refreshWsStatus(wsId);
       /// Re-run the same per-repo refresh fan-out `selectRepo` uses
       /// (log / changes / status / branches) for the already-open repo
@@ -424,11 +425,11 @@ function useGlobalShortcuts(): void {
   const toggleSidebar = useStore((s) => s.toggleSidebar);
   const togglePalette = useStore((s) => s.togglePalette);
   const selectedRepoId = useStore((s) => s.selectedRepoId);
-  const selectedWsId = useStore((s) => s.selectedWorkspaceId);
+  const selectedWsId = useStore((s) => s.selectedWorksetId);
   const refreshRepoStatus = useStore((s) => s.refreshRepoStatus);
   const refreshRepoChanges = useStore((s) => s.refreshRepoChanges);
-  const refreshWsStatus = useStore((s) => s.refreshWorkspaceStatus);
-  const refreshWsPRs = useStore((s) => s.refreshWorkspacePRs);
+  const refreshWsStatus = useStore((s) => s.refreshWorksetStatus);
+  const refreshWsPRs = useStore((s) => s.refreshWorksetPRs);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -487,7 +488,7 @@ function useGlobalShortcuts(): void {
         toggleSidebar();
         return;
       }
-      // Cmd+R → refresh whatever's in focus (repo or workspace pane).
+      // Cmd+R → refresh whatever's in focus (repo or workset pane).
       // Don't steal in fields — the user might be wanting to undo etc.
       if ((e.key === 'r' || e.key === 'R') && !e.shiftKey && !inField) {
         e.preventDefault();
@@ -501,9 +502,9 @@ function useGlobalShortcuts(): void {
         return;
       }
       // Cmd+N → New branch. Prefer the focused repo when one is open —
-      // even if a workspace is also selected in the sidebar, the user
+      // even if a workset is also selected in the sidebar, the user
       // is looking at the repo detail pane and expects the shortcut to
-      // act on what they see. Falls back to the workspace-wide sheet
+      // act on what they see. Falls back to the workset-wide sheet
       // only when no repo is selected.
       if ((e.key === 'n' || e.key === 'N') && !e.shiftKey && !inField) {
         if (selectedRepoId) {
@@ -513,7 +514,7 @@ function useGlobalShortcuts(): void {
         }
         if (selectedWsId) {
           e.preventDefault();
-          setSheet({ kind: 'newBranchInWorkspace', workspaceId: selectedWsId });
+          setSheet({ kind: 'newBranchInWorkset', worksetId: selectedWsId });
           return;
         }
       }
@@ -553,20 +554,35 @@ function useGlobalShortcuts(): void {
 
 function Sidebar(): JSX.Element {
   const repos = useStore((s) => s.repos);
+  const worksets = useStore((s) => s.worksets);
   const workspaces = useStore((s) => s.workspaces);
-  const selectedWs = useStore((s) => s.selectedWorkspaceId);
+  const selectedWs = useStore((s) => s.selectedWorksetId);
   const selectedRepo = useStore((s) => s.selectedRepoId);
-  const selectWs = useStore((s) => s.selectWorkspace);
+  const selectedWorkspace = useStore((s) => s.selectedWorkspaceId);
+  const selectWs = useStore((s) => s.selectWorkset);
   const selectRepo = useStore((s) => s.selectRepo);
+  const selectWorkspace = useStore((s) => s.selectWorkspace);
   const pickAndAddRepo = useStore((s) => s.pickAndAddRepo);
   const setSheet = useStore((s) => s.setSheet);
   const removeRepo = useStore((s) => s.removeRepo);
+  const removeWorkset = useStore((s) => s.removeWorkset);
+  const archiveWorkset = useStore((s) => s.archiveWorkset);
+  const unarchiveWorkset = useStore((s) => s.unarchiveWorkset);
   const removeWorkspace = useStore((s) => s.removeWorkspace);
-  const archiveWorkspace = useStore((s) => s.archiveWorkspace);
-  const unarchiveWorkspace = useStore((s) => s.unarchiveWorkspace);
+  const toggleWorkspaceCollapsed = useStore((s) => s.toggleWorkspaceCollapsed);
+  const runResetWorkspaceFlow = useStore((s) => s.runResetWorkspaceFlow);
+  const fetchAllInWorkspace = useStore((s) => s.fetchAllInWorkspace);
   const requestConfirm = useStore((s) => s.requestConfirm);
   const runResetAllReposFlow = useStore((s) => s.runResetAllReposFlow);
   const [resetting, setResetting] = useState(false);
+  /// In-flight per-workspace bulk actions. Key is the workspace id;
+  /// value is the human-readable verb ("Resetting…", "Fetching…")
+  /// shown inline on the row. Used to disable the row's buttons while
+  /// a bulk action is running so the user can't kick off a second one
+  /// and create a partial pile-up.
+  const [busyWorkspaceVerb, setBusyWorkspaceVerb] = useState<
+    Record<UUID, string>
+  >({});
 
   const [search, setSearch] = useState('');
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set());
@@ -592,6 +608,19 @@ function Sidebar(): JSX.Element {
     );
   }, [repos, query]);
 
+  // Lookup table so workspace rows can render their member repos
+  // without re-filtering the full repo list per row.
+  const repoById = useMemo(() => {
+    const m = new Map<UUID, Repo>();
+    for (const r of repos) m.set(r.id, r);
+    return m;
+  }, [repos]);
+
+  // Workspaces are filtered by search by name. When the query matches
+  // a workspace, we keep its member list intact (so the user sees what
+  // the workspace contains); if the query only matches a repo, the
+  // workspace is filtered out but the repo can still surface in
+  // "Repos" below.
   const visibleWorkspaces = useMemo(
     () =>
       query
@@ -600,27 +629,56 @@ function Sidebar(): JSX.Element {
     [workspaces, query],
   );
 
-  const activeWorkspaces = useMemo(
-    () => visibleWorkspaces.filter((w) => !w.archived),
-    [visibleWorkspaces],
+  // IDs of every repo that lives in at least one *visible* workspace.
+  // Used to pull those out of the flat "Repos" section so the sidebar
+  // doesn't double-render them under both a group and the bare list.
+  // Tracking visibility (not membership-in-any-workspace) so that when
+  // a search query hides a workspace, its repos can still surface in
+  // "Other repos" by name match. When the user has no workspaces this
+  // stays empty and the sidebar behaves exactly as before.
+  const groupedRepoIds = useMemo(() => {
+    const s = new Set<UUID>();
+    for (const w of visibleWorkspaces) for (const id of w.repoIds) s.add(id);
+    return s;
+  }, [visibleWorkspaces]);
+
+  const ungroupedRepos = useMemo(
+    () =>
+      groupedRepoIds.size === 0
+        ? visibleRepos
+        : visibleRepos.filter((r) => !groupedRepoIds.has(r.id)),
+    [visibleRepos, groupedRepoIds],
   );
-  // Archived list is shown newest-first by creation date. Workspaces
+
+  const visibleWorksets = useMemo(
+    () =>
+      query
+        ? worksets.filter((w) => w.name.toLowerCase().includes(query))
+        : worksets,
+    [worksets, query],
+  );
+
+  const activeWorksets = useMemo(
+    () => visibleWorksets.filter((w) => !w.archived),
+    [visibleWorksets],
+  );
+  // Archived list is shown newest-first by creation date. Worksets
   // archived before `createdAt` was tracked have no date — those sort
   // as oldest, with stable sort preserving their relative order so the
   // section doesn't reshuffle on each render.
-  const archivedWorkspaces = useMemo(
+  const archivedWorksets = useMemo(
     () =>
-      [...visibleWorkspaces.filter((w) => w.archived)].sort((a, b) => {
+      [...visibleWorksets.filter((w) => w.archived)].sort((a, b) => {
         const ad = a.createdAt ?? '';
         const bd = b.createdAt ?? '';
         if (ad === bd) return 0;
         return bd.localeCompare(ad);
       }),
-    [visibleWorkspaces],
+    [visibleWorksets],
   );
   // Auto-expand the Archived section when a search query has narrowed the
   // sidebar to archived matches — otherwise the user typed a name they
-  // recognize and would just see "no workspaces match" while it's there.
+  // recognize and would just see "no worksets match" while it's there.
   const showArchivedRows = archivedExpanded || query.length > 0;
 
   // Implicit folder grouping. When the user has a non-trivial number
@@ -629,8 +687,8 @@ function Sidebar(): JSX.Element {
   // avoids design-debt of true folders. Filtering disables grouping
   // (the user already narrowed the list).
   const repoGroups = useMemo(
-    () => groupReposByParentDir(visibleRepos, query.length > 0),
-    [visibleRepos, query],
+    () => groupReposByParentDir(ungroupedRepos, query.length > 0),
+    [ungroupedRepos, query],
   );
 
   // Flat list of focusable rows in render order. Used by keyboard nav
@@ -641,7 +699,16 @@ function Sidebar(): JSX.Element {
     const rows: Array<
       | { kind: 'repo'; id: UUID }
       | { kind: 'workspace'; id: UUID }
+      | { kind: 'workset'; id: UUID }
     > = [];
+    for (const w of visibleWorkspaces) {
+      rows.push({ kind: 'workspace', id: w.id });
+      if (!w.collapsed) {
+        for (const repoId of w.repoIds) {
+          if (repoById.has(repoId)) rows.push({ kind: 'repo', id: repoId });
+        }
+      }
+    }
     for (const g of repoGroups) {
       if (g.kind === 'flat') {
         for (const r of g.repos) rows.push({ kind: 'repo', id: r.id });
@@ -649,12 +716,12 @@ function Sidebar(): JSX.Element {
         for (const r of g.repos) rows.push({ kind: 'repo', id: r.id });
       }
     }
-    for (const w of activeWorkspaces) rows.push({ kind: 'workspace', id: w.id });
+    for (const w of activeWorksets) rows.push({ kind: 'workset', id: w.id });
     if (showArchivedRows) {
-      for (const w of archivedWorkspaces) rows.push({ kind: 'workspace', id: w.id });
+      for (const w of archivedWorksets) rows.push({ kind: 'workset', id: w.id });
     }
     return rows;
-  }, [repoGroups, activeWorkspaces, archivedWorkspaces, showArchivedRows, collapsedFolders]);
+  }, [visibleWorkspaces, repoById, repoGroups, activeWorksets, archivedWorksets, showArchivedRows, collapsedFolders]);
 
   useEffect(() => {
     if (activeIdx >= flatRows.length) setActiveIdx(flatRows.length - 1);
@@ -676,6 +743,7 @@ function Sidebar(): JSX.Element {
       if (!row) return;
       e.preventDefault();
       if (row.kind === 'repo') selectRepo(row.id);
+      else if (row.kind === 'workspace') selectWorkspace(row.id);
       else selectWs(row.id);
     } else if (e.key === '/' && document.activeElement !== inputRef.current) {
       e.preventDefault();
@@ -732,10 +800,94 @@ function Sidebar(): JSX.Element {
       </div>
 
       <nav ref={navRef} className="flex-1 min-h-0 overflow-y-auto px-1 pb-2">
+        {visibleWorkspaces.length > 0 && (
+          <>
+            <SectionHeader label="Workspaces" count={visibleWorkspaces.length} />
+            {visibleWorkspaces.map((w) => {
+              const idx = rowIndex.get(`workspace:${w.id}`) ?? -1;
+              const busyVerb = busyWorkspaceVerb[w.id];
+              const busy = Boolean(busyVerb);
+              const markBusy = (verb: string) =>
+                setBusyWorkspaceVerb((s) => ({ ...s, [w.id]: verb }));
+              const clearBusy = () =>
+                setBusyWorkspaceVerb((s) => {
+                  const n = { ...s };
+                  delete n[w.id];
+                  return n;
+                });
+              return (
+                <WorkspaceSection
+                  key={w.id}
+                  workspace={w}
+                  selected={selectedWorkspace === w.id}
+                  keyboardActive={idx === activeIdx}
+                  busy={busy}
+                  busyLabel={busyVerb}
+                  onToggleCollapsed={() => void toggleWorkspaceCollapsed(w.id)}
+                  onSelect={() => selectWorkspace(w.id)}
+                  onEdit={() => setSheet({ kind: 'editWorkspace', workspaceId: w.id })}
+                  onReset={async () => {
+                    if (busy) return;
+                    markBusy('Resetting…');
+                    try {
+                      await runResetWorkspaceFlow(w.id);
+                    } finally {
+                      clearBusy();
+                    }
+                  }}
+                  onFetch={async () => {
+                    if (busy) return;
+                    markBusy('Fetching…');
+                    try {
+                      await fetchAllInWorkspace(w.id);
+                    } finally {
+                      clearBusy();
+                    }
+                  }}
+                  onRemove={async () => {
+                    const ok = await requestConfirm({
+                      title: `Remove workspace?`,
+                      body: `Remove workspace "${w.name}"? The repos themselves are left alone.`,
+                      confirmLabel: 'Remove',
+                    });
+                    if (ok) void removeWorkspace(w.id);
+                  }}
+                >
+                  {!w.collapsed &&
+                    w.repoIds
+                      .map((id) => repoById.get(id))
+                      .filter((r): r is Repo => Boolean(r))
+                      .map((r) => {
+                        const ridx = rowIndex.get(`repo:${r.id}`) ?? -1;
+                        return (
+                          <RepoRow
+                            key={`${w.id}:${r.id}`}
+                            repo={r}
+                            selected={selectedRepo === r.id}
+                            keyboardActive={ridx === activeIdx}
+                            indent
+                            onSelect={() => selectRepo(r.id)}
+                            onRemove={async () => {
+                              const ok = await requestConfirm({
+                                title: `Remove ${r.name}?`,
+                                body: `Remove "${r.name}" from overgit? The repo on disk is left alone.`,
+                                confirmLabel: 'Remove',
+                              });
+                              if (ok) void removeRepo(r.id);
+                            }}
+                          />
+                        );
+                      })}
+                </WorkspaceSection>
+              );
+            })}
+          </>
+        )}
+
         {/* Repos on top — that's where users start. */}
         <SectionHeader
-          label="Repos"
-          count={visibleRepos.length}
+          label={workspaces.length > 0 ? 'Other repos' : 'Repos'}
+          count={ungroupedRepos.length}
           action={
             repos.length > 0 ? (
               <button
@@ -749,9 +901,15 @@ function Sidebar(): JSX.Element {
             ) : null
           }
         />
-        {visibleRepos.length === 0 ? (
+        {ungroupedRepos.length === 0 ? (
           <EmptyHint
-            text={query ? 'No repos match.' : 'Add a local git repo to start.'}
+            text={
+              query
+                ? 'No repos match.'
+                : workspaces.length > 0
+                  ? 'Every repo belongs to a workspace.'
+                  : 'Add a local git repo to start.'
+            }
           />
         ) : (
           repoGroups.map((g) => {
@@ -816,8 +974,8 @@ function Sidebar(): JSX.Element {
           })
         )}
 
-        <SectionHeader label="Worksets" count={activeWorkspaces.length} />
-        {activeWorkspaces.length === 0 ? (
+        <SectionHeader label="Worksets" count={activeWorksets.length} />
+        {activeWorksets.length === 0 ? (
           <EmptyHint
             text={
               query
@@ -826,31 +984,31 @@ function Sidebar(): JSX.Element {
             }
           />
         ) : (
-          activeWorkspaces.map((w) => {
-            const idx = rowIndex.get(`workspace:${w.id}`) ?? -1;
+          activeWorksets.map((w) => {
+            const idx = rowIndex.get(`workset:${w.id}`) ?? -1;
             return (
-              <WorkspaceRow
+              <WorksetRow
                 key={w.id}
-                workspace={w}
+                workset={w}
                 selected={selectedWs === w.id && !selectedRepo}
                 keyboardActive={idx === activeIdx}
                 onSelect={() => selectWs(w.id)}
-                onEdit={() => setSheet({ kind: 'editWorkspace', workspaceId: w.id })}
-                onArchive={() => void archiveWorkspace(w.id)}
+                onEdit={() => setSheet({ kind: 'editWorkset', worksetId: w.id })}
+                onArchive={() => void archiveWorkset(w.id)}
                 onRemove={async () => {
                   const ok = await requestConfirm({
-                    title: `Remove workspace?`,
-                    body: `Remove workspace "${w.name}"?`,
+                    title: `Remove workset?`,
+                    body: `Remove workset "${w.name}"?`,
                     confirmLabel: 'Remove',
                   });
-                  if (ok) void removeWorkspace(w.id);
+                  if (ok) void removeWorkset(w.id);
                 }}
               />
             );
           })
         )}
 
-        {archivedWorkspaces.length > 0 && (
+        {archivedWorksets.length > 0 && (
           <>
             <button
               onClick={() => setArchivedExpanded((v) => !v)}
@@ -859,27 +1017,27 @@ function Sidebar(): JSX.Element {
             >
               <span className="font-mono">{showArchivedRows ? '▾' : '▸'}</span>
               <span>Archived</span>
-              <span className="ml-auto">{archivedWorkspaces.length}</span>
+              <span className="ml-auto">{archivedWorksets.length}</span>
             </button>
             {showArchivedRows &&
-              archivedWorkspaces.map((w) => {
-                const idx = rowIndex.get(`workspace:${w.id}`) ?? -1;
+              archivedWorksets.map((w) => {
+                const idx = rowIndex.get(`workset:${w.id}`) ?? -1;
                 return (
-                  <WorkspaceRow
+                  <WorksetRow
                     key={w.id}
-                    workspace={w}
+                    workset={w}
                     archived
                     selected={selectedWs === w.id && !selectedRepo}
                     keyboardActive={idx === activeIdx}
                     onSelect={() => selectWs(w.id)}
-                    onReactivate={() => void unarchiveWorkspace(w.id)}
+                    onReactivate={() => void unarchiveWorkset(w.id)}
                     onRemove={async () => {
                       const ok = await requestConfirm({
-                        title: `Remove workspace?`,
-                        body: `Remove workspace "${w.name}"?`,
+                        title: `Remove workset?`,
+                        body: `Remove workset "${w.name}"?`,
                         confirmLabel: 'Remove',
                       });
-                      if (ok) void removeWorkspace(w.id);
+                      if (ok) void removeWorkset(w.id);
                     }}
                   />
                 );
@@ -897,6 +1055,13 @@ function Sidebar(): JSX.Element {
         </button>
         <button
           onClick={() => setSheet({ kind: 'newWorkspace' })}
+          disabled={repos.length === 0}
+          className="text-xs text-ink-muted hover:text-ink py-1 px-2 rounded hover:bg-card text-left disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-ink-muted"
+        >
+          + New workspace
+        </button>
+        <button
+          onClick={() => setSheet({ kind: 'newWorkset' })}
           disabled={repos.length === 0}
           className="text-xs text-ink-muted hover:text-ink py-1 px-2 rounded hover:bg-card text-left disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-ink-muted"
         >
@@ -1084,8 +1249,8 @@ function RepoStatusBadge({ status }: { status?: RepoStatus }): JSX.Element | nul
   );
 }
 
-function WorkspaceRow({
-  workspace,
+function WorksetRow({
+  workset,
   selected,
   keyboardActive = false,
   archived = false,
@@ -1095,7 +1260,7 @@ function WorkspaceRow({
   onReactivate,
   onRemove,
 }: {
-  workspace: Workspace;
+  workset: Workset;
   selected: boolean;
   keyboardActive?: boolean;
   /// Render in muted "archived" treatment with a Reactivate button instead
@@ -1129,22 +1294,22 @@ function WorkspaceRow({
         onClick={onSelect}
         className="flex items-center gap-2 flex-1 min-w-0 text-left px-2 py-1.5"
         title={
-          workspace.preferredBranch
-            ? `${workspace.name} · ${workspace.preferredBranch}`
-            : workspace.name
+          workset.preferredBranch
+            ? `${workset.name} · ${workset.preferredBranch}`
+            : workset.name
         }
       >
-        <WorkspaceIcon />
+        <WorksetIcon />
         <div className="flex-1 min-w-0 flex flex-col leading-tight">
-          <span className="truncate font-medium">{workspace.name}</span>
-          {workspace.preferredBranch && (
+          <span className="truncate font-medium">{workset.name}</span>
+          {workset.preferredBranch && (
             <span className="truncate font-mono text-[10px] text-ink-faint mt-0.5">
-              {workspace.preferredBranch}
+              {workset.preferredBranch}
             </span>
           )}
         </div>
         <span className="shrink-0 text-[10px] tabular-nums text-ink-faint">
-          {workspace.repoIds.length}
+          {workset.repoIds.length}
         </span>
       </button>
       {archived ? (
@@ -1187,6 +1352,197 @@ function WorkspaceRow({
         <span className="text-[11px]">×</span>
       </button>
     </div>
+  );
+}
+
+/// One Workspace block in the sidebar — a collapsible header
+/// followed by its member RepoRow children (passed as `children` so
+/// the parent keeps repo lookup + selection logic in one place). The
+/// chevron toggles collapse; clicking the name selects the workspace
+/// (opens its detail page in the main pane). Hover-only action
+/// buttons fan out Reset / Fetch / Edit / Remove for the whole group.
+function WorkspaceSection({
+  workspace,
+  selected,
+  keyboardActive = false,
+  busy = false,
+  busyLabel,
+  onToggleCollapsed,
+  onSelect,
+  onEdit,
+  onReset,
+  onFetch,
+  onRemove,
+  children,
+}: {
+  workspace: Workspace;
+  selected: boolean;
+  keyboardActive?: boolean;
+  busy?: boolean;
+  /// Short verb shown next to the workspace name when a bulk action
+  /// is in flight ("Resetting…", "Fetching…"). Replaces the repo
+  /// count badge so the row is unambiguous about what's happening.
+  busyLabel?: string;
+  onToggleCollapsed: () => void;
+  onSelect: () => void;
+  onEdit: () => void;
+  onReset: () => void;
+  onFetch: () => void;
+  onRemove: () => void;
+  children?: React.ReactNode;
+}): JSX.Element {
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (keyboardActive) ref.current?.scrollIntoView({ block: 'nearest' });
+  }, [keyboardActive]);
+  return (
+    <div className="mt-1 first:mt-0">
+      <div
+        ref={ref}
+        className={`group flex items-center gap-0.5 pr-1 rounded text-xs ${
+          selected
+            ? 'sidebar-row-selected text-ink'
+            : keyboardActive
+              ? 'bg-card text-ink ring-1 ring-accent/40'
+              : 'text-ink-muted hover:bg-card hover:text-ink'
+        }`}
+      >
+        <button
+          onClick={onToggleCollapsed}
+          className="w-5 h-5 flex items-center justify-center shrink-0 rounded text-ink-faint hover:text-ink hover:bg-white/[0.06]"
+          title={
+            workspace.collapsed
+              ? `Expand ${workspace.name}`
+              : `Collapse ${workspace.name}`
+          }
+          aria-label={workspace.collapsed ? 'Expand' : 'Collapse'}
+        >
+          <span className="font-mono text-[10px]">
+            {workspace.collapsed ? '▸' : '▾'}
+          </span>
+        </button>
+        <button
+          onClick={onSelect}
+          className="flex items-center gap-1.5 flex-1 min-w-0 text-left py-1.5"
+          title={`Open ${workspace.name}`}
+        >
+          <span className="truncate font-medium">{workspace.name}</span>
+          {busy && busyLabel ? (
+            <span className="ml-auto shrink-0 flex items-center gap-1 text-[10px] text-accent">
+              <SpinnerDot />
+              <span>{busyLabel}</span>
+            </span>
+          ) : (
+            <span className="shrink-0 text-[10px] tabular-nums text-ink-faint">
+              {workspace.repoIds.length}
+            </span>
+          )}
+        </button>
+        <Explain
+          command={`for repo in <${workspace.name}>: git fetch && git switch <default> && git pull`}
+          plain={`Bring every repo in "${workspace.name}" back to its default branch — fetch, switch, pull. Dirty repos are skipped.`}
+        >
+          <button
+            onClick={onReset}
+            disabled={busy}
+            title="Fetch, switch to default, and pull on every repo in this workspace. Dirty repos are skipped."
+            className="w-5 h-5 flex items-center justify-center rounded text-ink-faint opacity-0 group-hover:opacity-100 hover:text-ink hover:bg-card disabled:opacity-40"
+          >
+            <ResetIcon />
+          </button>
+        </Explain>
+        <Explain
+          command={`for repo in <${workspace.name}>: git fetch`}
+          plain={`Run git fetch in every repo in "${workspace.name}" so ahead/behind dots reflect the remote.`}
+        >
+          <button
+            onClick={onFetch}
+            disabled={busy}
+            title="Fetch every repo in this workspace"
+            className="w-5 h-5 flex items-center justify-center rounded text-ink-faint opacity-0 group-hover:opacity-100 hover:text-ink hover:bg-card disabled:opacity-40"
+          >
+            <FetchIcon />
+          </button>
+        </Explain>
+        <Explain
+          command="(rename or change members)"
+          plain={`Edit the workspace — rename "${workspace.name}" or change which repos belong to it. No git commands run.`}
+        >
+          <button
+            onClick={onEdit}
+            title="Edit workspace"
+            className="w-5 h-5 flex items-center justify-center rounded text-ink-faint opacity-0 group-hover:opacity-100 hover:text-ink hover:bg-card"
+          >
+            <PencilIcon />
+          </button>
+        </Explain>
+        <Explain
+          command="(delete grouping)"
+          plain={`Remove the workspace from overgit. The repos themselves are left alone on disk; only the grouping is dropped.`}
+        >
+          <button
+            onClick={onRemove}
+            title="Remove workspace"
+            className="w-5 h-5 flex items-center justify-center rounded text-ink-faint opacity-0 group-hover:opacity-100 hover:text-red-300 hover:bg-card"
+          >
+            <span className="text-[11px]">×</span>
+          </button>
+        </Explain>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function SpinnerDot(): JSX.Element {
+  return (
+    <svg width="9" height="9" viewBox="0 0 16 16" className="animate-spin" aria-hidden="true">
+      <circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="2" fill="none" opacity="0.25" />
+      <path
+        d="M14 8a6 6 0 0 0-6-6"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        fill="none"
+      />
+    </svg>
+  );
+}
+
+function ResetIcon(): JSX.Element {
+  return (
+    <svg width="11" height="11" viewBox="0 0 16 16" fill="none" className="flex-shrink-0">
+      <path
+        d="M3 8a5 5 0 1 0 1.5-3.5"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+        fill="none"
+      />
+      <path
+        d="M5 5H2V2"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        fill="none"
+      />
+    </svg>
+  );
+}
+
+function FetchIcon(): JSX.Element {
+  return (
+    <svg width="11" height="11" viewBox="0 0 16 16" fill="none" className="flex-shrink-0">
+      <path
+        d="M8 3v7m0 0L5 7m3 3l3-3"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path d="M3 12h10" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+    </svg>
   );
 }
 
@@ -1235,7 +1591,7 @@ function RepoIcon(): JSX.Element {
   );
 }
 
-function WorkspaceIcon(): JSX.Element {
+function WorksetIcon(): JSX.Element {
   return (
     <svg width="13" height="13" viewBox="0 0 16 16" fill="none" className="text-ink-muted flex-shrink-0">
       <path
@@ -1284,53 +1640,367 @@ function PencilIcon(): JSX.Element {
 
 function Main(): JSX.Element {
   const selectedRepo = useStore((s) => s.selectedRepoId);
-  const selectedWs = useStore((s) => s.selectedWorkspaceId);
+  const selectedWs = useStore((s) => s.selectedWorksetId);
+  const selectedWorkspace = useStore((s) => s.selectedWorkspaceId);
+  const worksets = useStore((s) => s.worksets);
   const workspaces = useStore((s) => s.workspaces);
   const ws = useMemo(
-    () => workspaces.find((w) => w.id === selectedWs) ?? null,
-    [workspaces, selectedWs],
+    () => worksets.find((w) => w.id === selectedWs) ?? null,
+    [worksets, selectedWs],
+  );
+  const wsp = useMemo(
+    () => workspaces.find((w) => w.id === selectedWorkspace) ?? null,
+    [workspaces, selectedWorkspace],
   );
 
   if (selectedRepo) return <RepoDetail repoId={selectedRepo} />;
+
+  if (wsp) return <WorkspaceDetail key={wsp.id} workspaceId={wsp.id} />;
 
   if (!ws) {
     return (
       <main className="flex-1 flex items-center justify-center text-ink-muted">
         <div className="text-center max-w-sm">
-          <div className="text-base font-medium mb-1">Pick a repo or a workset</div>
+          <div className="text-base font-medium mb-1">Pick a repo, workspace, or workset</div>
           <p className="text-xs text-ink-faint">
-            Repos give you a single-repo working pane (changes, history, files,
-            graph). A workset is a unit of work across repos — branch, commit,
-            and push together, then archive when the work ships.
+            Workspaces are durable groups (an org / client / initiative) with
+            a health overview and bulk actions. Worksets are units of in-flight
+            work across repos. Repos are the per-repo working pane.
           </p>
         </div>
       </main>
     );
   }
 
-  return <WorkspaceView key={ws.id} workspaceId={ws.id} />;
+  return <WorksetView key={ws.id} worksetId={ws.id} />;
 }
 
-function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
-  const ws = useStore((s) => s.workspaces.find((w) => w.id === workspaceId));
+/// Workspace detail page. A durable-group overview: per-repo status
+/// table (branch, dirty count, ahead/behind) + bulk maintenance
+/// actions in the header (Reset all / Fetch all / Edit / Remove).
+/// Deliberately leaner than WorksetView — workspaces aren't about
+/// a piece of work, they're about a stable inventory, so this pane
+/// surfaces health and shortcuts and not commit/push flows.
+function WorkspaceDetail({ workspaceId }: { workspaceId: UUID }): JSX.Element {
+  const workspace = useStore(
+    (s) => s.workspaces.find((w) => w.id === workspaceId) ?? null,
+  );
   const repos = useStore((s) => s.repos);
-  const statuses = useStore((s) => s.workspaceStatuses[workspaceId] ?? EMPTY_STATUSES);
-  const prs = useStore((s) => s.workspacePRs[workspaceId] ?? EMPTY_PRS);
-  const activity = useStore((s) => s.workspaceActivity[workspaceId] ?? EMPTY_ACTIVITY);
+  const repoStatuses = useStore((s) => s.repoStatus);
+  const refreshAllRepoStatuses = useStore((s) => s.refreshAllRepoStatuses);
+  const runResetWorkspaceFlow = useStore((s) => s.runResetWorkspaceFlow);
+  const fetchAllInWorkspace = useStore((s) => s.fetchAllInWorkspace);
+  const removeWorkspace = useStore((s) => s.removeWorkspace);
+  const requestConfirm = useStore((s) => s.requestConfirm);
+  const setSheet = useStore((s) => s.setSheet);
+  const selectRepo = useStore((s) => s.selectRepo);
+  const [busy, setBusy] = useState<'reset' | 'fetch' | null>(null);
+
+  // Refresh statuses on mount so the table is honest the moment the
+  // pane opens, not whatever was cached from the last sidebar tick.
+  useEffect(() => {
+    void refreshAllRepoStatuses();
+  }, [workspaceId, refreshAllRepoStatuses]);
+
+  const members = useMemo(() => {
+    if (!workspace) return [];
+    const byId = new Map(repos.map((r) => [r.id, r] as const));
+    return workspace.repoIds
+      .map((id) => byId.get(id))
+      .filter((r): r is Repo => Boolean(r));
+  }, [workspace, repos]);
+
+  const aggregate = useMemo(() => {
+    let dirty = 0;
+    let ahead = 0;
+    let behind = 0;
+    let detached = 0;
+    let noUpstream = 0;
+    for (const r of members) {
+      const st = repoStatuses[r.id];
+      if (!st) continue;
+      if (!st.branch) detached++;
+      if (st.dirtyCount > 0) dirty++;
+      if ((st.ahead ?? 0) > 0) ahead++;
+      if ((st.behind ?? 0) > 0) behind++;
+      if (!st.hasUpstream && st.branch) noUpstream++;
+    }
+    return { dirty, ahead, behind, detached, noUpstream, total: members.length };
+  }, [members, repoStatuses]);
+
+  if (!workspace) {
+    return (
+      <main className="flex-1 flex items-center justify-center text-ink-muted text-sm">
+        Workspace not found.
+      </main>
+    );
+  }
+
+  const onReset = async () => {
+    if (busy) return;
+    setBusy('reset');
+    try {
+      await runResetWorkspaceFlow(workspaceId);
+    } finally {
+      setBusy(null);
+    }
+  };
+  const onFetch = async () => {
+    if (busy) return;
+    setBusy('fetch');
+    try {
+      await fetchAllInWorkspace(workspaceId);
+    } finally {
+      setBusy(null);
+    }
+  };
+  const onRemove = async () => {
+    const ok = await requestConfirm({
+      title: 'Remove workspace?',
+      body: `Remove workspace "${workspace.name}"? The repos themselves are left alone on disk; only the grouping is dropped.`,
+      confirmLabel: 'Remove',
+    });
+    if (ok) void removeWorkspace(workspaceId);
+  };
+
+  return (
+    <main className="flex-1 min-w-0 flex flex-col">
+      <header className="px-6 pt-5 pb-4 border-b border-card flex flex-col gap-3">
+        <div className="flex items-start gap-4">
+          <div className="flex-1 min-w-0">
+            <div className="flex items-baseline gap-2">
+              <h1 className="text-xl font-semibold text-ink truncate">
+                {workspace.name}
+              </h1>
+              <span className="text-[11px] uppercase tracking-wider text-ink-faint">
+                Workspace
+              </span>
+            </div>
+            <p className="text-[12px] text-ink-faint mt-1">
+              {members.length} {members.length === 1 ? 'repo' : 'repos'} in this
+              workspace. Aggregate health below; click any row to open the repo.
+            </p>
+          </div>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              onClick={onReset}
+              disabled={busy !== null || members.length === 0}
+              className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+              title="Reset every repo to origin's tip of its default branch."
+            >
+              {busy === 'reset' ? 'Resetting…' : 'Reset all'}
+            </button>
+            <button
+              onClick={onFetch}
+              disabled={busy !== null || members.length === 0}
+              className="text-xs px-3 py-1.5 rounded border border-card text-ink-muted hover:text-ink hover:bg-card disabled:opacity-50"
+              title="Run git fetch on every repo so ahead/behind reflects the remote."
+            >
+              {busy === 'fetch' ? 'Fetching…' : 'Fetch all'}
+            </button>
+            {aggregate.behind > 0 && (
+              <button
+                onClick={() => {
+                  const behindIds = members
+                    .filter((r) => (repoStatuses[r.id]?.behind ?? 0) > 0)
+                    .map((r) => r.id);
+                  if (behindIds.length === 0) return;
+                  setSheet({
+                    kind: 'syncBehindProgress',
+                    workspaceId,
+                    repoIds: behindIds,
+                  });
+                }}
+                disabled={busy !== null}
+                className="text-xs px-3 py-1.5 rounded border border-accent/40 text-accent hover:bg-accent/10 disabled:opacity-50"
+                title="Fast-forward every behind repo to its upstream. Diverged branches are reported, never merged."
+              >
+                Sync {aggregate.behind} behind
+              </button>
+            )}
+            <button
+              onClick={() => setSheet({ kind: 'editWorkspace', workspaceId })}
+              className="text-xs px-3 py-1.5 rounded border border-card text-ink-muted hover:text-ink hover:bg-card"
+              title="Rename or change members."
+            >
+              Edit
+            </button>
+            <button
+              onClick={onRemove}
+              className="text-xs px-3 py-1.5 rounded border border-card text-ink-faint hover:text-red-300 hover:bg-card"
+              title="Remove this workspace from overgit. Repos are unaffected."
+            >
+              Remove
+            </button>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-4 text-[11px] tabular-nums text-ink-faint">
+          <WorkspaceStatPill
+            label="Dirty"
+            count={aggregate.dirty}
+            tone={aggregate.dirty > 0 ? 'amber' : 'neutral'}
+          />
+          <WorkspaceStatPill
+            label="Ahead"
+            count={aggregate.ahead}
+            tone={aggregate.ahead > 0 ? 'accent' : 'neutral'}
+          />
+          <WorkspaceStatPill
+            label="Behind"
+            count={aggregate.behind}
+            tone={aggregate.behind > 0 ? 'accent' : 'neutral'}
+          />
+          {aggregate.detached > 0 && (
+            <WorkspaceStatPill
+              label="Detached"
+              count={aggregate.detached}
+              tone="amber"
+            />
+          )}
+          {aggregate.noUpstream > 0 && (
+            <WorkspaceStatPill
+              label="No upstream"
+              count={aggregate.noUpstream}
+              tone="amber"
+            />
+          )}
+        </div>
+      </header>
+
+      <div className="flex-1 min-h-0 overflow-y-auto px-6 py-4">
+        {members.length === 0 ? (
+          <div className="text-sm text-ink-faint">
+            This workspace has no repos yet. Click <strong>Edit</strong> to
+            add members.
+          </div>
+        ) : (
+          <div className="rounded-md bg-black/10 ring-1 ring-white/[0.04] divide-y divide-white/[0.03]">
+            <div className={`${WORKSPACE_TABLE_COLS} px-3 py-1.5 text-[10px] uppercase tracking-wider text-ink-faint`}>
+              <span>Repo</span>
+              <span className="text-right">Branch</span>
+              <span className="text-right">Dirty</span>
+              <span className="text-right">Ahead</span>
+              <span className="text-right">Behind</span>
+            </div>
+            {members.map((r) => (
+              <WorkspaceMemberRow
+                key={r.id}
+                repo={r}
+                status={repoStatuses[r.id]}
+                onOpen={() => selectRepo(r.id)}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    </main>
+  );
+}
+
+function WorkspaceStatPill({
+  label,
+  count,
+  tone,
+}: {
+  label: string;
+  count: number;
+  tone: 'neutral' | 'accent' | 'amber';
+}): JSX.Element {
+  const color =
+    tone === 'amber'
+      ? 'text-amber-300/90'
+      : tone === 'accent'
+        ? 'text-accent'
+        : 'text-ink-faint';
+  return (
+    <span className={`flex items-center gap-1 ${color}`}>
+      <span className="font-semibold">{count}</span>
+      <span className="uppercase tracking-wider text-[10px]">{label}</span>
+    </span>
+  );
+}
+
+/// Shared column template for the workspace member table. Header
+/// and row buttons both apply this class so the columns line up
+/// across rows — the previous `auto`-sized columns let each row
+/// size its own branch column to whatever string it contained, so
+/// the header label and the data drifted apart.
+const WORKSPACE_TABLE_COLS =
+  'grid grid-cols-[minmax(0,1fr)_minmax(120px,200px)_56px_56px_56px] gap-x-4';
+
+function WorkspaceMemberRow({
+  repo,
+  status,
+  onOpen,
+}: {
+  repo: Repo;
+  status: RepoStatus | undefined;
+  onOpen: () => void;
+}): JSX.Element {
+  const branch = status?.branch ?? null;
+  const dirty = status?.dirtyCount ?? 0;
+  const ahead = status?.ahead ?? null;
+  const behind = status?.behind ?? null;
+  return (
+    <button
+      onClick={onOpen}
+      className={`${WORKSPACE_TABLE_COLS} w-full text-left px-3 py-2 items-baseline hover:bg-white/[0.03] transition-colors`}
+    >
+      <div className="min-w-0">
+        <div className="truncate text-[13px] text-ink">{repo.name}</div>
+        <div className="truncate text-[10px] text-ink-faint/80 font-mono leading-tight mt-0.5">
+          {repo.path}
+        </div>
+      </div>
+      <div className="text-[12px] text-ink-muted font-mono tabular-nums text-right truncate">
+        {branch ?? <span className="text-amber-300/80">detached</span>}
+      </div>
+      <div
+        className={`text-[12px] tabular-nums text-right ${
+          dirty > 0 ? 'text-amber-300/90' : 'text-ink-faint'
+        }`}
+      >
+        {dirty > 0 ? dirty : '·'}
+      </div>
+      <div
+        className={`text-[12px] tabular-nums text-right ${
+          (ahead ?? 0) > 0 ? 'text-accent' : 'text-ink-faint'
+        }`}
+      >
+        {ahead === null ? '·' : ahead > 0 ? `↑${ahead}` : '·'}
+      </div>
+      <div
+        className={`text-[12px] tabular-nums text-right ${
+          (behind ?? 0) > 0 ? 'text-accent' : 'text-ink-faint'
+        }`}
+      >
+        {behind === null ? '·' : behind > 0 ? `↓${behind}` : '·'}
+      </div>
+    </button>
+  );
+}
+
+function WorksetView({ worksetId }: { worksetId: UUID }): JSX.Element {
+  const ws = useStore((s) => s.worksets.find((w) => w.id === worksetId));
+  const repos = useStore((s) => s.repos);
+  const statuses = useStore((s) => s.worksetStatuses[worksetId] ?? EMPTY_STATUSES);
+  const prs = useStore((s) => s.worksetPRs[worksetId] ?? EMPTY_PRS);
+  const activity = useStore((s) => s.worksetActivity[worksetId] ?? EMPTY_ACTIVITY);
   const lastSeen = useStore(
-    (s) => s.settings.workspaceLastSeen?.[workspaceId] ?? null,
+    (s) => s.settings.worksetLastSeen?.[worksetId] ?? null,
   );
   const lastCheckout = useStore((s) => s.lastCheckout);
   const cli = useStore((s) => s.cliPresence);
-  const refresh = useStore((s) => s.refreshWorkspaceStatus);
-  const refreshPRs = useStore((s) => s.refreshWorkspacePRs);
-  const refreshWorktrees = useStore((s) => s.refreshWorkspaceWorktrees);
-  const refreshActivity = useStore((s) => s.refreshWorkspaceActivity);
-  const markSeen = useStore((s) => s.markWorkspaceSeen);
-  const fetchWs = useStore((s) => s.fetchWorkspace);
+  const refresh = useStore((s) => s.refreshWorksetStatus);
+  const refreshPRs = useStore((s) => s.refreshWorksetPRs);
+  const refreshWorktrees = useStore((s) => s.refreshWorksetWorktrees);
+  const refreshActivity = useStore((s) => s.refreshWorksetActivity);
+  const markSeen = useStore((s) => s.markWorksetSeen);
+  const fetchWs = useStore((s) => s.fetchWorkset);
   const selectRepo = useStore((s) => s.selectRepo);
   const setSheet = useStore((s) => s.setSheet);
-  const archiveWs = useStore((s) => s.archiveWorkspace);
+  const archiveWs = useStore((s) => s.archiveWorkset);
   const requestConfirm = useStore((s) => s.requestConfirm);
   const pushToast = useStore((s) => s.pushToast);
   const dismissToast = useStore((s) => s.dismissToast);
@@ -1346,24 +2016,24 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
   const [seenAtOpen] = useState<string | null>(lastSeen);
 
   useEffect(() => {
-    refresh(workspaceId);
-    refreshPRs(workspaceId);
-    refreshWorktrees(workspaceId);
-    refreshActivity(workspaceId);
-  }, [refresh, refreshPRs, refreshWorktrees, refreshActivity, workspaceId]);
+    refresh(worksetId);
+    refreshPRs(worksetId);
+    refreshWorktrees(worksetId);
+    refreshActivity(worksetId);
+  }, [refresh, refreshPRs, refreshWorktrees, refreshActivity, worksetId]);
 
-  // On unmount (or workspace switch), advance lastSeen so the next
+  // On unmount (or workset switch), advance lastSeen so the next
   // visit only highlights things that landed after this one.
   useEffect(() => {
     return () => {
-      void markSeen(workspaceId);
+      void markSeen(worksetId);
     };
-  }, [markSeen, workspaceId]);
+  }, [markSeen, worksetId]);
 
   // Overview tiles, computed BEFORE any early return so React's hook
   // order stays stable. The previous version put this useMemo after
   // `if (!ws) return …` — the crash that left the whole app rendering
-  // blank when a freshly-created workspace momentarily lagged the
+  // blank when a freshly-created workset momentarily lagged the
   // selector. Falls back to zeroes when ws hasn't materialized yet.
   const summary = useMemo(() => {
     const total = ws?.repoIds.length ?? 0;
@@ -1374,7 +2044,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
     // "Needs first push" — branch exists, hasn't been pushed yet
     // (no upstream tracking ref), AND has at least one commit beyond
     // the repo's default branch. `git push -u origin HEAD` would
-    // wire it up; the workspace-level Push handler reports these
+    // wire it up; the workset-level Push handler reports these
     // back as `pushed-new-upstream`, so the button should enable
     // for them even though `ahead` reads as null.
     //
@@ -1398,7 +2068,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
       return !def || s.branch !== def;
     }).length;
     // Repos in the middle of a merge / rebase / cherry-pick. Surfaced
-    // in the overview because a workspace-wide op (rebase the workspace
+    // in the overview because a workset-wide op (rebase the workset
     // onto main) can leave several repos paused on conflicts at once;
     // burying that in the per-row status cell makes it easy to miss.
     const inProgress = statuses.filter((s) => s.inProgress !== null).length;
@@ -1430,8 +2100,8 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
 
   const reposById = new Map(repos.map((r) => [r.id, r]));
 
-  // The workspace's "common branch" — the branch the user is treating
-  // as the workspace's coordinated feature branch. Prefer the explicit
+  // The workset's "common branch" — the branch the user is treating
+  // as the workset's coordinated feature branch. Prefer the explicit
   // preferredBranch if set; else infer from the dominant branch held by
   // a majority of loaded statuses. Returns null when no clear winner
   // exists so we don't mistake "everyone happens to be on main" for an
@@ -1499,11 +2169,11 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
               tells the user to commit / push / archive instead. */}
           {(!ws.preferredBranch || drifters > 0 || summary.loaded === 0) && (
             <Explain
-              command="for repo in workspace; do git checkout default && git pull && git checkout -b <new>; done"
+              command="for repo in workset; do git checkout default && git pull && git checkout -b <new>; done"
               plain="Sync every repo to its default branch, pull, and create a shared new branch in each."
             >
               <button
-                onClick={() => setSheet({ kind: 'newBranchInWorkspace', workspaceId })}
+                onClick={() => setSheet({ kind: 'newBranchInWorkset', worksetId })}
                 disabled={ws.repoIds.length === 0}
                 title="Sync each repo to its default branch, pull, and create a new branch — all in one go"
                 className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
@@ -1522,7 +2192,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
               plain="Stage every change in every dirty repo and commit them all with a shared message."
             >
               <button
-                onClick={() => setSheet({ kind: 'commitAllInWorkspace', workspaceId })}
+                onClick={() => setSheet({ kind: 'commitAllInWorkset', worksetId })}
                 title={`Stage and commit every dirty repo with a shared message (${summary.dirty} dirty)`}
                 className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
               >
@@ -1536,13 +2206,13 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
               plain="Send local commits up to the remote for every repo that's ahead of upstream."
             >
               <button
-                onClick={() => setSheet({ kind: 'pushAllInWorkspace', workspaceId })}
+                onClick={() => setSheet({ kind: 'pushAllInWorkset', worksetId })}
                 title={
                   summary.needsFirstPush > 0 && summary.ahead === 0
                     ? `Push ${summary.needsFirstPush} ${summary.needsFirstPush === 1 ? 'repo' : 'repos'} for the first time (sets upstream)`
                     : `Push every repo whose branch is ahead of upstream (${summary.ahead} ahead${summary.needsFirstPush > 0 ? `, ${summary.needsFirstPush} first-push` : ''})`
                 }
-                className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
+                className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong"
               >
                 Push all
                 {summary.ahead > 0 ? ` ↑${summary.ahead}` : ''}
@@ -1556,7 +2226,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
               plain="Open a pull request for each repo using a shared title and body. GitHub repos run gh; Bitbucket repos open the create-PR form in your browser."
             >
               <button
-                onClick={() => setSheet({ kind: 'openPRsInWorkspace', workspaceId })}
+                onClick={() => setSheet({ kind: 'openPRsInWorkset', worksetId })}
                 title={
                   !cli?.gh
                     ? 'GitHub needs gh installed; Bitbucket opens in the browser'
@@ -1573,14 +2243,14 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
             plain="Add or remove repos in this workset, rename it, or pick a default branch."
           >
             <button
-              onClick={() => setSheet({ kind: 'editWorkspace', workspaceId })}
+              onClick={() => setSheet({ kind: 'editWorkset', worksetId })}
               className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
             >
               Edit
             </button>
           </Explain>
           <Explain
-            command="for repo in workspace; do git fetch; done"
+            command="for repo in workset; do git fetch; done"
             plain="Ask each remote what's new — doesn't change any branch in any repo."
           >
             <button
@@ -1588,7 +2258,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
               onClick={async () => {
                 setBusy(true);
                 try {
-                  await fetchWs(workspaceId);
+                  await fetchWs(worksetId);
                 } finally {
                   setBusy(false);
                 }
@@ -1615,8 +2285,8 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
             <button
               disabled={busy}
               onClick={() => {
-                refresh(workspaceId);
-                refreshPRs(workspaceId);
+                refresh(worksetId);
+                refreshPRs(worksetId);
               }}
               className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
             >
@@ -1627,7 +2297,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
       </header>
 
       <ResumeBanner
-        workspaceId={workspaceId}
+        worksetId={worksetId}
         boundBranch={ws.preferredBranch ?? null}
         statuses={statuses}
       />
@@ -1662,8 +2332,8 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
           let outcomes;
           try {
             outcomes = await window.overgit.invoke(
-              'workspace:resetToDefault',
-              { workspaceId, cleanupBranch: ws.preferredBranch },
+              'workset:resetToDefault',
+              { worksetId, cleanupBranch: ws.preferredBranch },
             );
           } catch (err) {
             dismissToast(progressId);
@@ -1704,7 +2374,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
               } back on default.${cleanupSuffix}`,
             });
           }
-          void archiveWs(workspaceId);
+          void archiveWs(worksetId);
         }}
       />
 
@@ -1734,11 +2404,11 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
       </div>
 
       {view === 'commit' ? (
-        <WorkspaceUnifiedCommit workspaceId={workspaceId} />
+        <WorksetUnifiedCommit worksetId={worksetId} />
       ) : (
         <>
 
-      {/* Overview tiles. Always render so a freshly-created workspace
+      {/* Overview tiles. Always render so a freshly-created workset
           has visible content while statuses load. */}
       <section className="mb-4 grid grid-cols-2 md:grid-cols-4 gap-2">
         <OverviewTile label="Repos" value={summary.total.toString()} hint={
@@ -1791,7 +2461,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
         )}
       </section>
 
-      {lastCheckout && lastCheckout.workspaceId === workspaceId && (() => {
+      {lastCheckout && lastCheckout.worksetId === worksetId && (() => {
         // Drop failure outcomes whose repo has since landed on the
         // target branch — the user resolved the situation via another
         // path (branch picker, "Create from default", external git)
@@ -1813,7 +2483,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
                   key={o.repoId}
                   outcome={o}
                   repoName={reposById.get(o.repoId)?.name ?? o.repoId}
-                  workspaceId={workspaceId}
+                  worksetId={worksetId}
                   branch={lastCheckout.branch}
                 />
               ))}
@@ -1879,7 +2549,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
                   <StatusCell status={st} />
                   <SyncToCommonBranchButton
                     repoId={id}
-                    workspaceId={workspaceId}
+                    worksetId={worksetId}
                     currentBranch={st?.branch ?? null}
                     commonBranch={commonBranch}
                   />
@@ -1908,7 +2578,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
   );
 }
 
-/// Unified commit view across every dirty repo in the workspace.
+/// Unified commit view across every dirty repo in the workset.
 ///
 /// Goal: one pane to stage and commit instead of clicking into each
 /// repo. Each repo gets its own collapsible card with a checklist of
@@ -1917,18 +2587,18 @@ function WorkspaceView({ workspaceId }: { workspaceId: UUID }): JSX.Element {
 /// per-repo override when the change story differs.
 ///
 /// Detached-HEAD repos are skipped — committing onto a detached HEAD
-/// orphans the commit, same rule the existing WorkspaceCommitAllSheet
+/// orphans the commit, same rule the existing WorksetCommitAllSheet
 /// follows. Clean repos are not shown.
-function WorkspaceUnifiedCommit({
-  workspaceId,
+function WorksetUnifiedCommit({
+  worksetId,
 }: {
-  workspaceId: UUID;
+  worksetId: UUID;
 }): JSX.Element {
   const repos = useStore((s) => s.repos);
-  const statuses = useStore((s) => s.workspaceStatuses[workspaceId] ?? EMPTY_STATUSES);
+  const statuses = useStore((s) => s.worksetStatuses[worksetId] ?? EMPTY_STATUSES);
   const repoChanges = useStore((s) => s.repoChanges);
   const refreshRepoChanges = useStore((s) => s.refreshRepoChanges);
-  const refreshWorkspaceStatus = useStore((s) => s.refreshWorkspaceStatus);
+  const refreshWorksetStatus = useStore((s) => s.refreshWorksetStatus);
   const stage = useStore((s) => s.stageFiles);
   const unstage = useStore((s) => s.unstageFiles);
   const commitRepo = useStore((s) => s.commitRepo);
@@ -2042,10 +2712,60 @@ function WorkspaceUnifiedCommit({
   const [outcomes, setOutcomes] = useState<Record<UUID, Outcome>>({});
   const [busy, setBusy] = useState(false);
 
+  /// True while a refresh fan-out (workset status + per-repo changes
+  /// for every dirty member) is in flight. Surfaced in the toolbar so
+  /// the user doesn't think they're staring at stale data — the focus
+  /// handler fires this silently when they re-enter the window.
+  const [refreshing, setRefreshing] = useState(false);
+  const runRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await refreshWorksetStatus(worksetId);
+      /// Re-read after the status fan-out so we fetch changes for the
+      /// *current* dirty set, not whatever the render-time closure of
+      /// `dirtyOnBranch` happened to capture. This is what was missing
+      /// before — a repo that was already dirty but gained new files
+      /// while overgit was backgrounded never had its changes re-pulled
+      /// because the effect below keys on the repo-id list, not contents.
+      const latest = useStore.getState().worksetStatuses[worksetId] ?? [];
+      const dirty = latest.filter((s) => s.dirtyCount > 0 && s.branch !== null);
+      await Promise.all(dirty.map((s) => refreshRepoChanges(s.repoId)));
+    } finally {
+      setRefreshing(false);
+    }
+  }, [worksetId, refreshWorksetStatus, refreshRepoChanges]);
+
+  /// Refresh on tab focus / window visibility — covers "I edited files
+  /// in a terminal while overgit was in the background." A 1.5s coalesce
+  /// absorbs the natural focus + visibilitychange double-fire. Also
+  /// kicks once on mount so switching to the Commit tab re-reads even
+  /// if the global focus handler ran in the last 2s window.
+  useEffect(() => {
+    let last = 0;
+    const COALESCE_MS = 1_500;
+    const tick = () => {
+      const now = Date.now();
+      if (now - last < COALESCE_MS) return;
+      last = now;
+      void runRefresh();
+    };
+    tick();
+    const onFocus = () => tick();
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') tick();
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [runRefresh]);
+
   // LLM affordances. The list of detected tools comes from cliPresence —
   // we hide the whole bar when no tool is installed so the UI doesn't
   // tease features the user can't reach. State machine mirrors the one
-  // in WorkspaceCommitAllSheet so the affordance behaves identically
+  // in WorksetCommitAllSheet so the affordance behaves identically
   // whether the user invokes it inline or from the sheet.
   const availableTools: LlmTool[] = useMemo(() => {
     const out: LlmTool[] = [];
@@ -2066,7 +2786,7 @@ function WorkspaceUnifiedCommit({
     | { kind: 'err'; message: string };
   const [cliStatus, setCliStatus] = useState<CliStatus>({ kind: 'idle' });
   const [review, setReview] = useState<ReviewResult | null>(null);
-  const [truncated, setTruncated] = useState<WorkspaceDiffTruncation[]>([]);
+  const [truncated, setTruncated] = useState<WorksetDiffTruncation[]>([]);
   const cliBusy = cliStatus.kind === 'drafting' || cliStatus.kind === 'reviewing';
   useEffect(() => {
     if (cliStatus.kind !== 'drafted') return;
@@ -2132,9 +2852,9 @@ function WorkspaceUnifiedCommit({
           }));
         }
       }
-      // After running, refresh the workspace + per-repo changes so the
+      // After running, refresh the workset + per-repo changes so the
       // pane reflects what's left (clean repos drop off the list).
-      await refreshWorkspaceStatus(workspaceId);
+      await refreshWorksetStatus(worksetId);
       await Promise.all(
         committable.map((s) => refreshRepoChanges(s.repoId)),
       );
@@ -2147,8 +2867,8 @@ function WorkspaceUnifiedCommit({
     if (!tool || dirtyOnBranch.length === 0) return;
     setCliStatus({ kind: 'drafting', tool });
     try {
-      const res = await window.overgit.invoke('workspace:suggestCommitMessage', {
-        workspaceId,
+      const res = await window.overgit.invoke('workset:suggestCommitMessage', {
+        worksetId,
         tool,
       });
       setTruncated(res.truncated);
@@ -2168,8 +2888,8 @@ function WorkspaceUnifiedCommit({
     setReview(null);
     setCliStatus({ kind: 'reviewing', tool });
     try {
-      const res = await window.overgit.invoke('workspace:reviewChanges', {
-        workspaceId,
+      const res = await window.overgit.invoke('workset:reviewChanges', {
+        worksetId,
         tool,
       });
       setTruncated(res.truncated);
@@ -2250,18 +2970,30 @@ function WorkspaceUnifiedCommit({
             <button
               onClick={() => void onDraftMessage()}
               disabled={cliBusy || busy || !tool || dirtyOnBranch.length === 0}
-              className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-surface-elevated disabled:opacity-50"
+              className={`text-[11px] px-2 py-0.5 rounded border disabled:opacity-50 ${
+                cliStatus.kind === 'drafting'
+                  ? 'border-accent/60 bg-accent/15 text-accent animate-pulse'
+                  : 'border-card hover:bg-surface-elevated'
+              }`}
               title="Draft a shared commit message from the aggregated workset diff"
             >
-              ✨ Draft message
+              {cliStatus.kind === 'drafting'
+                ? `✨ Drafting with ${cliStatus.tool}…`
+                : '✨ Draft message'}
             </button>
             <button
               onClick={() => void onReviewChanges()}
               disabled={cliBusy || busy || !tool || dirtyOnBranch.length === 0}
-              className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-surface-elevated disabled:opacity-50"
+              className={`text-[11px] px-2 py-0.5 rounded border disabled:opacity-50 ${
+                cliStatus.kind === 'reviewing'
+                  ? 'border-accent/60 bg-accent/15 text-accent animate-pulse'
+                  : 'border-card hover:bg-surface-elevated'
+              }`}
               title="Pipe the aggregated workset diff to the CLI for review"
             >
-              Review changes
+              {cliStatus.kind === 'reviewing'
+                ? `Reviewing with ${cliStatus.tool}…`
+                : 'Review changes'}
             </button>
             <span className="ml-auto text-[10px] text-ink-faint">
               Aggregates dirty diffs across {dirtyOnBranch.length}{' '}
@@ -2285,10 +3017,28 @@ function WorkspaceUnifiedCommit({
             {committable.length} of {dirtyOnBranch.length} repos ready to commit
             {committable.length < dirtyOnBranch.length && ' — check files and add a message for the rest'}
           </span>
-          <div className="flex gap-2">
+          <div className="flex gap-2 items-center">
+            {refreshing && (
+              <span
+                className="flex items-center gap-1 text-[11px] text-accent"
+                aria-live="polite"
+              >
+                <svg
+                  width="10"
+                  height="10"
+                  viewBox="0 0 24 24"
+                  className="animate-spin"
+                  aria-hidden
+                >
+                  <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" opacity="0.25" fill="none" />
+                  <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" strokeWidth="3" fill="none" strokeLinecap="round" />
+                </svg>
+                Refreshing…
+              </span>
+            )}
             <button
-              onClick={() => void refreshWorkspaceStatus(workspaceId)}
-              disabled={busy}
+              onClick={() => void runRefresh()}
+              disabled={busy || refreshing}
               className="text-[11px] px-2 py-1 rounded border border-card hover:bg-surface-elevated disabled:opacity-50"
             >
               Refresh
@@ -2570,20 +3320,20 @@ function OverviewTile({
 
 /// "Pick up where you left off" banner. Shows when entering a workset
 /// whose bound branch differs from where its members currently are. One
-/// click runs `workspace:checkoutBranch` across all members; per-repo
+/// click runs `workset:checkoutBranch` across all members; per-repo
 /// outcomes (dirty / missing-branch / etc) surface in the existing
 /// `lastCheckout` table below the overview, where the user can stash &
 /// retry, commit & retry, or skip.
 function ResumeBanner({
-  workspaceId,
+  worksetId,
   boundBranch,
   statuses,
 }: {
-  workspaceId: UUID;
+  worksetId: UUID;
   boundBranch: string | null;
   statuses: RepoStatus[];
 }): JSX.Element | null {
-  const checkout = useStore((s) => s.checkoutWorkspaceBranch);
+  const resume = useStore((s) => s.resumeWorksetBranch);
   const [busy, setBusy] = useState(false);
   if (!boundBranch || statuses.length === 0) return null;
   const drifters = statuses.filter((s) => s.branch !== boundBranch);
@@ -2616,7 +3366,7 @@ function ResumeBanner({
         onClick={async () => {
           setBusy(true);
           try {
-            await checkout(workspaceId, boundBranch, false);
+            await resume(worksetId, boundBranch);
           } finally {
             setBusy(false);
           }
@@ -2781,7 +3531,7 @@ function StepConnector({ met }: { met: boolean }): JSX.Element {
 function CheckoutOutcomeRow({
   outcome,
   repoName,
-  workspaceId,
+  worksetId,
   branch,
 }: {
   outcome: CheckoutOutcome;
@@ -2789,7 +3539,7 @@ function CheckoutOutcomeRow({
   /// Optional context: when present, a `missing-branch` row gets a
   /// "Create from default" action that runs the sync-and-branch flow
   /// (fetch → switch default → pull → create branch) for just this repo.
-  workspaceId?: UUID;
+  worksetId?: UUID;
   branch?: string;
 }): JSX.Element {
   const stash = useStore((s) => s.stashRepo);
@@ -2797,7 +3547,7 @@ function CheckoutOutcomeRow({
   const retry = useStore((s) => s.retryCheckoutRepo);
   const adopt = useStore((s) => s.adoptWorktreeBranch);
   const pushToast = useStore((s) => s.pushToast);
-  const refreshWs = useStore((s) => s.refreshWorkspaceStatus);
+  const refreshWs = useStore((s) => s.refreshWorksetStatus);
 
   const [showCommit, setShowCommit] = useState(false);
   const [message, setMessage] = useState('');
@@ -2864,7 +3614,7 @@ function CheckoutOutcomeRow({
         return;
       }
       // Adopt already ran `git switch` in the main repo. Retry to refresh
-      // the row and let the rest of the workspace status catch up.
+      // the row and let the rest of the workset status catch up.
       await retry(outcome.repoId);
     } finally {
       setBusy(false);
@@ -2874,7 +3624,7 @@ function CheckoutOutcomeRow({
   const onCreate = async () => {
     if (!branch) return;
     setCreatedResult({ kind: 'creating' });
-    const res = await window.overgit.invoke('workspace:syncMemberToBranch', {
+    const res = await window.overgit.invoke('workset:syncMemberToBranch', {
       repoId: outcome.repoId,
       branch,
     });
@@ -2885,7 +3635,7 @@ function CheckoutOutcomeRow({
         label: 'created',
         message: 'message' in res ? res.message : undefined,
       });
-      if (workspaceId) await refreshWs(workspaceId);
+      if (worksetId) await refreshWs(worksetId);
     } else {
       setCreatedResult({
         kind: 'done',
@@ -3018,7 +3768,7 @@ function PRSection({
       </h2>
       {!cli?.gh ? (
         <div className="text-[11px] text-ink-faint p-3 rounded border border-card bg-card">
-          Install <span className="font-mono">gh</span> to surface PRs across the workspace.
+          Install <span className="font-mono">gh</span> to surface PRs across the workset.
         </div>
       ) : flat.length === 0 ? (
         <div className="text-[11px] text-ink-faint p-3 rounded border border-card bg-card">
@@ -3063,11 +3813,11 @@ function PRSection({
   );
 }
 
-/// "Recent" feed across the workspace. Merges commits and PR events
-/// into one timeline (see WorkspaceActivity in shared/types.ts) and
+/// "Recent" feed across the workset. Merges commits and PR events
+/// into one timeline (see WorksetActivity in shared/types.ts) and
 /// flags rows newer than the user's last visit with a small dot. We
 /// don't paginate — the backend caps the per-repo log length, which
-/// already keeps the list short for the workspace sizes overgit
+/// already keeps the list short for the workset sizes overgit
 /// targets.
 function ActivitySection({
   items,
@@ -3075,14 +3825,14 @@ function ActivitySection({
   seenAtOpen,
   onSelectRepo,
 }: {
-  items: WorkspaceActivity[];
+  items: WorksetActivity[];
   reposById: Map<UUID, Repo>;
   seenAtOpen: string | null;
   onSelectRepo: (id: UUID) => void;
 }): JSX.Element | null {
   if (items.length === 0) return null;
   // Cap rendered rows. The backend can return up to N×perRepo commits
-  // plus PRs, which is a lot of DOM if a workspace has 20 repos.
+  // plus PRs, which is a lot of DOM if a workset has 20 repos.
   // Recent is a glance — scoped to a small window so it doesn't crowd
   // the Status section above it.
   const MAX = 20;
@@ -3101,7 +3851,7 @@ function ActivitySection({
             title={
               seenAtOpen
                 ? `Since you last looked (${formatDateRelative(seenAtOpen)})`
-                : 'Since first opening this workspace'
+                : 'Since first opening this workset'
             }
           >
             {newSinceLast} new
@@ -3217,7 +3967,7 @@ function WorktreeList({
   commonBranch: string | null;
   showAll: boolean;
 }): JSX.Element | null {
-  const wts = useStore((s) => s.workspaceWorktrees[repoId] ?? EMPTY_WORKTREES);
+  const wts = useStore((s) => s.worksetWorktrees[repoId] ?? EMPTY_WORKTREES);
   const siblings = useMemo(() => wts.filter((w) => !w.isMain), [wts]);
   const visible = useMemo(() => {
     if (showAll || !commonBranch) return siblings;
@@ -3271,21 +4021,21 @@ function WorktreeList({
 }
 
 /// Compact "Sync to <branch>" action shown next to a repo whose
-/// current branch differs from the workspace's common branch. Runs the
+/// current branch differs from the workset's common branch. Runs the
 /// fetch → switch default → pull → create/checkout flow for that one
 /// repo and refreshes status when done.
 function SyncToCommonBranchButton({
   repoId,
-  workspaceId,
+  worksetId,
   currentBranch,
   commonBranch,
 }: {
   repoId: UUID;
-  workspaceId: UUID;
+  worksetId: UUID;
   currentBranch: string | null;
   commonBranch: string | null;
 }): JSX.Element | null {
-  const refresh = useStore((s) => s.refreshWorkspaceStatus);
+  const refresh = useStore((s) => s.refreshWorksetStatus);
   const [busy, setBusy] = useState(false);
   const [outcome, setOutcome] = useState<SyncAndBranchOutcome | null>(null);
   if (!commonBranch) return null;
@@ -3302,12 +4052,12 @@ function SyncToCommonBranchButton({
             setBusy(true);
             setOutcome(null);
             try {
-              const res = await window.overgit.invoke('workspace:syncMemberToBranch', {
+              const res = await window.overgit.invoke('workset:syncMemberToBranch', {
                 repoId,
                 branch: commonBranch,
               });
               if ('repoId' in res) setOutcome(res);
-              await refresh(workspaceId);
+              await refresh(worksetId);
             } finally {
               setBusy(false);
             }

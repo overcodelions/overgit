@@ -11,8 +11,8 @@
   --c-ink-faint: #9a9aa6;
   --c-accent: #6b56ff;
   --c-accent-strong: #5640f0;
-  --c-card-bg: rgba(0, 0, 0, 0.03);
-  --c-card-border: rgba(0, 0, 0, 0.08);
+  --c-card-bg: rgba(0, 0, 0, 0.09);
+  --c-card-border: rgba(0, 0, 0, 0.16);
 }
 
 :root.dark,
@@ -46,7 +46,7 @@ body,
 }
 
 /* Reusable text input style — theme-aware fill and border. Used by the
- * sidebar search, the workspace sheet, and the editor file filter. */
+ * sidebar search, the workset sheet, and the editor file filter. */
 .field {
   background: var(--c-card-bg);
   border: 1px solid var(--c-card-border);

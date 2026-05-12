@@ -5,7 +5,7 @@
 If you find a security issue in overgit, please report it privately:
 
 - **GitHub:** open a [private security advisory](https://github.com/overcodelions/overgit/security/advisories/new) on this repository.
-- **Email:** lionelfarr@gmail.com.
+- **Email:** security@codelionsllc.com.
 
 Please include enough detail to reproduce — overgit is a desktop client that shells out to `git`, `gh`, and (optionally) `claude` / `codex` / `gemini`, so reports about command-injection, path-escape, or credential exfiltration are especially welcome.
 

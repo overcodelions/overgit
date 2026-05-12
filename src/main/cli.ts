@@ -185,10 +185,142 @@ export async function suggestCommitMessage(
   return { ok: true, message: cleaned, tool };
 }
 
+const BACKUP_NAME_PROMPT = `You are naming a git "backup" branch that will preserve about-to-be-discarded local work.
+
+Given the unpushed commits and dirty-tree summary below, return:
+- line 1: a short kebab-case branch name beginning with "backup/", 2-5 words, summarizing the work (e.g. "backup/checkout-redesign-stash")
+- line 2 onward: ONE sentence (<= 100 chars) summarizing what the work was about so the user can find it again later
+
+Output ONLY those two lines. No quotes, no markdown, no preamble.`;
+
+/// Ask an LLM CLI to invent a backup branch name + one-line summary for
+/// the work the user is about to abandon. Used by the Abandon-local-
+/// commits sheet so the user gets a meaningful "backup/…-something"
+/// instead of the date-only fallback. Best-effort: any failure falls
+/// back to the caller's default name without surfacing as an error.
+export async function suggestBackupBranchName(
+  tool: LlmTool,
+  context: string,
+): Promise<
+  | { ok: true; name: string; summary: string; tool: LlmTool }
+  | { ok: false; error: string; tool: LlmTool }
+> {
+  if (!context.trim()) {
+    return { ok: false, error: 'No work to summarize.', tool };
+  }
+  const result = await runOneShot(tool, BACKUP_NAME_PROMPT + '\n\n' + context);
+  if (!result.ok) {
+    return { ok: false, error: result.error ?? 'CLI failed', tool };
+  }
+  const cleaned = stripFences(result.output).trim();
+  if (!cleaned) {
+    return { ok: false, error: 'CLI returned an empty response.', tool };
+  }
+  const lines = cleaned.split('\n').map((l) => l.trim()).filter(Boolean);
+  const rawName = lines[0] ?? '';
+  const summary = lines.slice(1).join(' ').trim();
+  // Strip any quotes / surrounding punctuation the model sometimes
+  // wraps the name in, then enforce a sensible character set so we
+  // never hand git something it'll reject.
+  const name = rawName
+    .replace(/^["'`]+|["'`]+$/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/[^A-Za-z0-9._/-]/g, '');
+  if (!name) {
+    return { ok: false, error: 'CLI returned no valid name.', tool };
+  }
+  return { ok: true, name, summary, tool };
+}
+
 function stripFences(s: string): string {
   // Tolerate ```text\n…\n``` or ```\n…\n``` wrappers some CLIs emit.
   const m = s.match(/^```[a-zA-Z]*\n([\s\S]*?)\n```\s*$/);
   return m ? m[1] : s;
+}
+
+const CONFLICT_RESOLVE_PROMPT = `You are resolving a git merge conflict.
+
+You will receive a single source file that contains one or more conflict regions delimited by:
+
+  <<<<<<< <ours-label>
+  …our side…
+  ======= (or |||||||  base ... ======= for diff3)
+  …their side…
+  >>>>>>> <theirs-label>
+
+You may also receive short commit-message logs describing the recent work on each side. Use them to understand *intent*, not just syntax — when both sides edited the same region, prefer the combination that preserves both intents, not just the side that's longer.
+
+Rules:
+- Output the ENTIRE file, exactly as it should appear after the resolution.
+- Remove every conflict marker (<<<<<<<, |||||||, =======, >>>>>>>). The result must compile / parse as the original language.
+- Do NOT add commentary, headings, explanations, or markdown fences. Output the raw file content only.
+- Preserve all unchanged context lines verbatim — do not reformat or refactor code outside the conflict regions.
+- If a hunk is a pure addition on one side, keep both unless they're clearly mutually exclusive.
+- Keep imports, declarations, and ordering consistent with the surrounding file.`;
+
+export interface ConflictResolveResult {
+  ok: boolean;
+  /// The proposed resolved file content. Always present (may be empty
+  /// on failure) so the renderer can show whatever partial output the
+  /// CLI produced.
+  content: string;
+  error?: string;
+  tool: LlmTool;
+}
+
+/// Ask an LLM CLI to resolve a conflict file end-to-end. The renderer
+/// is responsible for *previewing* the result (diff vs. current state)
+/// and gating Accept behind explicit user confirmation — this helper
+/// never writes to disk.
+export async function resolveConflictWithLlm(args: {
+  tool: LlmTool;
+  fileContent: string;
+  filePath: string;
+  oursLog: string[] | null;
+  theirsLog: string[] | null;
+}): Promise<ConflictResolveResult> {
+  const { tool, fileContent, filePath, oursLog, theirsLog } = args;
+  if (!fileContent.includes('<<<<<<<')) {
+    return {
+      ok: false,
+      content: '',
+      error: 'File contains no conflict markers.',
+      tool,
+    };
+  }
+  const ctxLines: string[] = [`File: ${filePath}`];
+  if (oursLog && oursLog.length) {
+    ctxLines.push('', 'Recent commits on our side (HEAD):');
+    for (const l of oursLog) ctxLines.push(`  ${l}`);
+  }
+  if (theirsLog && theirsLog.length) {
+    ctxLines.push('', 'Recent commits on their side (MERGE_HEAD):');
+    for (const l of theirsLog) ctxLines.push(`  ${l}`);
+  }
+  const prompt =
+    CONFLICT_RESOLVE_PROMPT +
+    '\n\n' +
+    ctxLines.join('\n') +
+    '\n\n----- BEGIN FILE -----\n' +
+    fileContent +
+    '\n----- END FILE -----\n';
+  const result = await runOneShot(tool, prompt);
+  if (!result.ok) {
+    return { ok: false, content: result.output, error: result.error ?? 'CLI failed', tool };
+  }
+  const cleaned = stripFences(result.output);
+  if (!cleaned.trim()) {
+    return { ok: false, content: '', error: 'CLI returned an empty file.', tool };
+  }
+  if (cleaned.includes('<<<<<<<') || cleaned.includes('=======') || cleaned.includes('>>>>>>>')) {
+    return {
+      ok: false,
+      content: cleaned,
+      error: 'CLI left conflict markers in the output — review and edit before accepting.',
+      tool,
+    };
+  }
+  return { ok: true, content: cleaned, tool };
 }
 
 /// Shared one-shot LLM invocation: spawn `tool argsForTool(tool)`, write
@@ -294,7 +426,7 @@ interface GhPrJson {
 /// pass `--json number,url,state` so we can distinguish "no PR exists"
 /// (gh exits non-zero with "no pull requests found" stderr) from a
 /// real failure mode (no GitHub remote, gh auth missing). The caller
-/// uses this to keep workspace open-PRs idempotent — if a PR already
+/// uses this to keep workset open-PRs idempotent — if a PR already
 /// exists we won't try to create a duplicate.
 export async function findOpenPRForCurrentBranch(
   repoPath: string,
@@ -381,8 +513,8 @@ export async function createPRWithGh(
 /// List open PRs for a single repo via `gh pr list --json`. Returns
 /// `null` (with a reason) for repos with no GitHub remote, no gh auth,
 /// or any other gh error — those are not failures of overgit, just
-/// "this repo isn't a GitHub repo from gh's POV". Callers (the workspace
-/// aggregator) keep the reason and render the rest of the workspace.
+/// "this repo isn't a GitHub repo from gh's POV". Callers (the workset
+/// aggregator) keep the reason and render the rest of the workset.
 export async function listOpenPRs(
   repoPath: string,
 ): Promise<{ prs: PullRequest[] | null; error?: string }> {
