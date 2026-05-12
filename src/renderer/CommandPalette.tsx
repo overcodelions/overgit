@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent, Ref } from 'react';
 import { useStore } from './store';
-import type { BranchSummary, Repo, UUID, Workspace } from '@shared/types';
+import type { BranchSummary, Repo, UUID, Workset } from '@shared/types';
 
 // See App.tsx — stable empty fallback for Zustand selectors so React's
 // useSyncExternalStore snapshot equality holds across renders.
@@ -10,7 +10,7 @@ const EMPTY_FILES: Array<{ path: string; ignored: boolean }> = [];
 
 /// Cmd+K command palette. One overlay, one search box, one list. The
 /// list is built by concatenating heterogenous sections (Actions,
-/// Branches in the open repo, Repos, Workspaces) and filtering against
+/// Branches in the open repo, Repos, Worksets) and filtering against
 /// the typed query. Selecting an item runs its `perform` callback.
 ///
 /// Branches in the palette are scoped to the currently-open repo —
@@ -24,9 +24,9 @@ export function CommandPalette(): JSX.Element | null {
   const close = useStore((s) => s.togglePalette);
 
   const repos = useStore((s) => s.repos);
-  const workspaces = useStore((s) => s.workspaces);
+  const worksets = useStore((s) => s.worksets);
   const selectedRepoId = useStore((s) => s.selectedRepoId);
-  const selectedWsId = useStore((s) => s.selectedWorkspaceId);
+  const selectedWsId = useStore((s) => s.selectedWorksetId);
   const branchSummaries = useStore((s) =>
     selectedRepoId
       ? s.repoBranchSummaries[selectedRepoId] ?? EMPTY_BRANCHES
@@ -54,7 +54,7 @@ export function CommandPalette(): JSX.Element | null {
   const refreshFileList = useStore((s) => s.refreshRepoFileList);
   const refreshChanges = useStore((s) => s.refreshRepoChanges);
   const selectRepo = useStore((s) => s.selectRepo);
-  const selectWorkspace = useStore((s) => s.selectWorkspace);
+  const selectWorkset = useStore((s) => s.selectWorkset);
   const checkoutRepo = useStore((s) => s.checkoutRepo);
   const createBranch = useStore((s) => s.createRepoBranch);
   const setSheet = useStore((s) => s.setSheet);
@@ -111,7 +111,7 @@ export function CommandPalette(): JSX.Element | null {
       buildSections({
         query,
         repos,
-        workspaces,
+        worksets,
         branches: branchSummaries,
         // Command palette only proposes non-ignored files — opening a
         // build artifact via the palette is rarely intentional.
@@ -125,7 +125,7 @@ export function CommandPalette(): JSX.Element | null {
         actions: {
           close: () => close(false),
           selectRepo,
-          selectWorkspace,
+          selectWorkset,
           checkoutRepo,
           createBranch,
           setSheet,
@@ -144,7 +144,7 @@ export function CommandPalette(): JSX.Element | null {
     [
       query,
       repos,
-      workspaces,
+      worksets,
       branchSummaries,
       fileList,
       stagedPaths,
@@ -155,7 +155,7 @@ export function CommandPalette(): JSX.Element | null {
       lastCommitUnpushed,
       close,
       selectRepo,
-      selectWorkspace,
+      selectWorkset,
       checkoutRepo,
       createBranch,
       setSheet,
@@ -397,7 +397,7 @@ function stopKeyboardEvent(e: KeyboardEvent | ReactKeyboardEvent): void {
 interface BuildArgs {
   query: string;
   repos: Repo[];
-  workspaces: Workspace[];
+  worksets: Workset[];
   branches: BranchSummary[];
   files: string[];
   stagedPaths: string[];
@@ -409,7 +409,7 @@ interface BuildArgs {
   actions: {
     close: () => void;
     selectRepo: (id: UUID | null) => void;
-    selectWorkspace: (id: UUID | null) => void;
+    selectWorkset: (id: UUID | null) => void;
     checkoutRepo: (
       id: UUID,
       branch: string,
@@ -434,7 +434,7 @@ function buildSections(args: BuildArgs): PaletteSection[] {
   const {
     query,
     repos,
-    workspaces,
+    worksets,
     branches,
     files,
     stagedPaths,
@@ -634,7 +634,7 @@ function buildSections(args: BuildArgs): PaletteSection[] {
       title: `Create branch "${query.trim()}" across workset`,
       glyph: '⎇',
       perform: () => {
-        actions.setSheet({ kind: 'newBranchInWorkspace', workspaceId: selectedWsId });
+        actions.setSheet({ kind: 'newBranchInWorkset', worksetId: selectedWsId });
         actions.close();
       },
     });
@@ -647,7 +647,7 @@ function buildSections(args: BuildArgs): PaletteSection[] {
         hint: 'Shared message · skips detached HEAD',
         glyph: '✓',
         perform: () => {
-          actions.setSheet({ kind: 'commitAllInWorkspace', workspaceId: selectedWsId });
+          actions.setSheet({ kind: 'commitAllInWorkset', worksetId: selectedWsId });
           actions.close();
         },
       },
@@ -657,7 +657,7 @@ function buildSections(args: BuildArgs): PaletteSection[] {
         hint: 'Push every repo whose branch is ahead of upstream',
         glyph: '↑',
         perform: () => {
-          actions.setSheet({ kind: 'pushAllInWorkspace', workspaceId: selectedWsId });
+          actions.setSheet({ kind: 'pushAllInWorkset', worksetId: selectedWsId });
           actions.close();
         },
       },
@@ -667,7 +667,7 @@ function buildSections(args: BuildArgs): PaletteSection[] {
         hint: cli?.gh ? 'Shared title and body · gh pr create per repo' : 'Install gh first',
         glyph: '⇧',
         perform: () => {
-          actions.setSheet({ kind: 'openPRsInWorkspace', workspaceId: selectedWsId });
+          actions.setSheet({ kind: 'openPRsInWorkset', worksetId: selectedWsId });
           actions.close();
         },
       },
@@ -694,11 +694,11 @@ function buildSections(args: BuildArgs): PaletteSection[] {
       },
     },
     {
-      id: 'new-workspace',
+      id: 'new-workset',
       title: 'New workset…',
       glyph: '+',
       perform: () => {
-        actions.setSheet({ kind: 'newWorkspace' });
+        actions.setSheet({ kind: 'newWorkset' });
         actions.close();
       },
     },
@@ -807,9 +807,9 @@ function buildSections(args: BuildArgs): PaletteSection[] {
     }));
   if (repoItems.length) sections.push({ label: 'Repos', items: repoItems });
 
-  // Workspaces to jump to. Archived workspaces are intentionally excluded —
+  // Worksets to jump to. Archived worksets are intentionally excluded —
   // the palette is for active work; reactivating happens from the sidebar.
-  const wsItems: PaletteItem[] = workspaces
+  const wsItems: PaletteItem[] = worksets
     .filter((w) => !w.archived && w.id !== selectedWsId && matches(w.name))
     .slice(0, 30)
     .map((w) => ({
@@ -818,7 +818,7 @@ function buildSections(args: BuildArgs): PaletteSection[] {
       hint: `${w.repoIds.length} ${w.repoIds.length === 1 ? 'repo' : 'repos'}`,
       glyph: '⎘',
       perform: () => {
-        actions.selectWorkspace(w.id);
+        actions.selectWorkset(w.id);
         actions.close();
       },
     }));

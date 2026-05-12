@@ -8,6 +8,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Store } from './store';
 import {
+  abandonLocalPreview,
   abortCherryPick,
   abortMerge,
   abortRebase,
@@ -51,6 +52,7 @@ import {
   pruneCandidates,
   pruneSquashCandidates,
   pruneWorktrees,
+  refreshOriginHead,
   squashMergeLinks,
   pushTag,
   removeRemote,
@@ -60,15 +62,18 @@ import {
   looksLikeRepo,
   markResolved,
   mergeBranch,
+  mergeSideLogs,
   resolveConflictSide,
   readMergeMsg,
   commitMerge,
   pull as gitPull,
+  pullFastForward,
   pullForce as gitPullForce,
   push as gitPush,
   rawDiff,
   readGitConfigIdentity,
   rebaseOnto,
+  resetToUpstream,
   setRemoteUrl,
   stageFiles,
   stash as gitStash,
@@ -80,23 +85,30 @@ import {
 } from './git';
 import { listFilesUnder, listRepoFiles, readFileUnderRoot, writeFileUnderRoot } from './fs';
 import {
-  aggregateWorkspaceDirtyDiff,
-  workspaceActivity,
-  workspaceBranchSuggestions,
-  workspaceCheckout,
-  workspaceCommitAll,
-  workspaceFetch,
-  workspaceListPRs,
-  workspaceOpenPRs,
+  aggregateWorksetDirtyDiff,
+  worksetActivity,
+  worksetBranchSuggestions,
+  worksetCheckout,
+  worksetCommitAll,
+  worksetFetch,
+  worksetListPRs,
+  worksetOpenPRs,
+  resetRepoToDefault,
   resetReposToDefault,
-  workspaceResetToDefault,
-  workspacePushAll,
-  workspaceStatus,
-  workspaceSyncAndBranch,
-  workspaceSyncMemberToBranch,
-  workspaceWorktrees,
-} from './workspace';
-import { detectCliPresence, reviewDiffWithLlm, suggestCommitMessage } from './cli';
+  worksetResetToDefault,
+  worksetPushAll,
+  worksetStatus,
+  worksetSyncAndBranch,
+  worksetSyncMemberToBranch,
+  worksetWorktrees,
+} from './workset';
+import {
+  detectCliPresence,
+  resolveConflictWithLlm,
+  reviewDiffWithLlm,
+  suggestBackupBranchName,
+  suggestCommitMessage,
+} from './cli';
 import { Identity, Repo, ResolvedIdentity } from '../shared/types';
 
 /// Resolve which identity should be applied (via env override) when
@@ -229,6 +241,7 @@ function makeRepoFromPath(repoPath: string): Repo {
 function registerIpc(): void {
   ipcMain.handle('store:load', () => Store.load());
   ipcMain.handle('store:saveRepos', (_e, repos) => Store.saveRepos(repos));
+  ipcMain.handle('store:saveWorksets', (_e, worksets) => Store.saveWorksets(worksets));
   ipcMain.handle('store:saveWorkspaces', (_e, workspaces) => Store.saveWorkspaces(workspaces));
   ipcMain.handle('store:saveSettings', (_e, settings) => Store.saveSettings(settings));
 
@@ -385,7 +398,7 @@ function registerIpc(): void {
 
   // `retryCheckout` and `checkout` are the same primitive — `checkout` is
   // for explicit branch-picker actions, `retryCheckout` is invoked by the
-  // workspace's stash-and-retry flow. Keeping both names makes call sites
+  // workset's stash-and-retry flow. Keeping both names makes call sites
   // self-documenting.
   const handleCheckout = async (
     _e: unknown,
@@ -480,6 +493,73 @@ function registerIpc(): void {
     if (!repo) return { ok: false, error: 'Unknown repo' };
     return gitFetch(repo.path);
   });
+
+  ipcMain.handle('repo:abandonLocalPreview', async (_e, repoId: string) => {
+    const repo = repoFromArg(repoId);
+    if (!repo) {
+      return { upstream: null, unpushed: [], dirtyFiles: [], diffStat: '' };
+    }
+    return abandonLocalPreview(repo.path);
+  });
+
+  ipcMain.handle(
+    'repo:resetToUpstream',
+    async (
+      _e,
+      args: {
+        repoId: string;
+        upstreamRef: string;
+        backupBranch?: string;
+        cleanUntracked?: boolean;
+      },
+    ) => {
+      const repo = repoFromArg(args);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return resetToUpstream(repo.path, {
+        upstreamRef: args.upstreamRef,
+        backupBranch: args.backupBranch,
+        cleanUntracked: args.cleanUntracked,
+      });
+    },
+  );
+
+  ipcMain.handle(
+    'repo:suggestBackupBranchName',
+    async (
+      _e,
+      args: { repoId: string; tool: 'claude' | 'codex' | 'gemini' },
+    ) => {
+      const repo = repoFromArg(args);
+      if (!repo) {
+        return { ok: false, error: 'Unknown repo', tool: args.tool };
+      }
+      // Assemble the context the LLM names from: unpushed-commit log
+      // subjects, the dirty-tree diff stat, and the branch name. We keep
+      // it short so the model isn't asked to read a giant diff just to
+      // pick a 4-word name.
+      const preview = await abandonLocalPreview(repo.path);
+      const lines: string[] = [];
+      const st = await gitStatus(repo.id, repo.path, repo.defaultBranch);
+      if (st.branch) lines.push(`Branch: ${st.branch}`);
+      if (preview.upstream) lines.push(`Upstream: ${preview.upstream}`);
+      if (preview.unpushed.length) {
+        lines.push('', 'Unpushed commits (newest first):');
+        for (const c of preview.unpushed) {
+          lines.push(`  ${c.shortSha} ${c.subject} — ${c.author}`);
+        }
+      }
+      if (preview.dirtyFiles.length) {
+        lines.push('', `Dirty files (${preview.dirtyFiles.length}):`);
+        for (const f of preview.dirtyFiles.slice(0, 30)) {
+          lines.push(`  ${f.indexStatus}${f.worktreeStatus} ${f.path}`);
+        }
+      }
+      if (preview.diffStat.trim()) {
+        lines.push('', 'Diff stat:', preview.diffStat.trim());
+      }
+      return suggestBackupBranchName(args.tool, lines.join('\n'));
+    },
+  );
 
   ipcMain.handle(
     'repo:createBranch',
@@ -743,6 +823,22 @@ function registerIpc(): void {
     return detectDefaultBranch(repo.path);
   });
 
+  ipcMain.handle('repo:refreshDefaultBranch', async (_e, repoId: string) => {
+    const repo = repoFromArg(repoId);
+    if (!repo) return { ok: false as const, error: 'Unknown repo' };
+    const res = await refreshOriginHead(repo.path);
+    if (!res.ok) return res;
+    // Persist the freshly detected default so the next reset, status
+    // check, and PR-base resolution all use it without the user
+    // touching settings.
+    const state = Store.load();
+    const updated = state.repos.map((r) =>
+      r.id === repo.id ? { ...r, defaultBranch: res.defaultBranch ?? undefined } : r,
+    );
+    Store.saveRepos(updated);
+    return { ok: true as const, defaultBranch: res.defaultBranch };
+  });
+
   ipcMain.handle(
     'repo:fileLog',
     async (_e, args: { repoId: string; path: string; limit?: number }) => {
@@ -920,127 +1016,127 @@ function registerIpc(): void {
     },
   );
 
-  ipcMain.handle('workspace:status', async (_e, workspaceId: string) => {
-    const { workspaces, repos } = Store.load();
-    return workspaceStatus(workspaceId, workspaces, repos);
+  ipcMain.handle('workset:status', async (_e, worksetId: string) => {
+    const { worksets, repos } = Store.load();
+    return worksetStatus(worksetId, worksets, repos);
   });
 
   ipcMain.handle(
-    'workspace:checkoutBranch',
+    'workset:checkoutBranch',
     async (
       _e,
-      args: { workspaceId: string; branch: string; createIfMissing: boolean },
+      args: { worksetId: string; branch: string; createIfMissing: boolean },
     ) => {
-      const { workspaces, repos } = Store.load();
-      return workspaceCheckout(args.workspaceId, args.branch, args.createIfMissing, workspaces, repos);
+      const { worksets, repos } = Store.load();
+      return worksetCheckout(args.worksetId, args.branch, args.createIfMissing, worksets, repos);
     },
   );
 
-  ipcMain.handle('workspace:fetchAll', async (_e, workspaceId: string) => {
-    const { workspaces, repos } = Store.load();
-    return workspaceFetch(workspaceId, workspaces, repos);
+  ipcMain.handle('workset:fetchAll', async (_e, worksetId: string) => {
+    const { worksets, repos } = Store.load();
+    return worksetFetch(worksetId, worksets, repos);
   });
 
-  ipcMain.handle('workspace:branchSuggestions', async (_e, workspaceId: string) => {
-    const { workspaces, repos } = Store.load();
-    return workspaceBranchSuggestions(workspaceId, workspaces, repos);
+  ipcMain.handle('workset:branchSuggestions', async (_e, worksetId: string) => {
+    const { worksets, repos } = Store.load();
+    return worksetBranchSuggestions(worksetId, worksets, repos);
   });
 
-  ipcMain.handle('workspace:listPRs', async (_e, workspaceId: string) => {
-    const { workspaces, repos } = Store.load();
-    return workspaceListPRs(workspaceId, workspaces, repos);
+  ipcMain.handle('workset:listPRs', async (_e, worksetId: string) => {
+    const { worksets, repos } = Store.load();
+    return worksetListPRs(worksetId, worksets, repos);
   });
 
   ipcMain.handle(
-    'workspace:syncAndBranch',
+    'workset:syncAndBranch',
     async (
       _e,
       args: {
-        workspaceId: string;
+        worksetId: string;
         branch: string;
         syncDefault: boolean;
         pullBeforeBranch: boolean;
       },
     ) => {
-      const { workspaces, repos } = Store.load();
-      return workspaceSyncAndBranch(
-        args.workspaceId,
+      const { worksets, repos } = Store.load();
+      return worksetSyncAndBranch(
+        args.worksetId,
         args.branch,
         args.syncDefault,
         args.pullBeforeBranch,
-        workspaces,
+        worksets,
         repos,
       );
     },
   );
 
   ipcMain.handle(
-    'workspace:syncMemberToBranch',
+    'workset:syncMemberToBranch',
     async (_e, args: { repoId: string; branch: string }) => {
       const { repos } = Store.load();
-      return workspaceSyncMemberToBranch(args.repoId, args.branch, repos);
+      return worksetSyncMemberToBranch(args.repoId, args.branch, repos);
     },
   );
 
   ipcMain.handle(
-    'workspace:commitAll',
-    async (_e, args: { workspaceId: string; message: string }) => {
-      const { workspaces, repos, settings } = Store.load();
-      return workspaceCommitAll(args.workspaceId, args.message, workspaces, repos, settings);
+    'workset:commitAll',
+    async (_e, args: { worksetId: string; message: string }) => {
+      const { worksets, repos, settings } = Store.load();
+      return worksetCommitAll(args.worksetId, args.message, worksets, repos, settings);
     },
   );
 
-  ipcMain.handle('workspace:worktrees', async (_e, workspaceId: string) => {
-    const { workspaces, repos } = Store.load();
-    return workspaceWorktrees(workspaceId, workspaces, repos);
+  ipcMain.handle('workset:worktrees', async (_e, worksetId: string) => {
+    const { worksets, repos } = Store.load();
+    return worksetWorktrees(worksetId, worksets, repos);
   });
 
-  ipcMain.handle('workspace:pushAll', async (_e, workspaceId: string) => {
-    const { workspaces, repos } = Store.load();
-    return workspacePushAll(workspaceId, workspaces, repos);
+  ipcMain.handle('workset:pushAll', async (_e, worksetId: string) => {
+    const { worksets, repos } = Store.load();
+    return worksetPushAll(worksetId, worksets, repos);
   });
 
   ipcMain.handle(
-    'workspace:activity',
-    async (_e, args: { workspaceId: string; perRepo?: number }) => {
-      const { workspaces, repos } = Store.load();
-      return workspaceActivity(
-        args.workspaceId,
+    'workset:activity',
+    async (_e, args: { worksetId: string; perRepo?: number }) => {
+      const { worksets, repos } = Store.load();
+      return worksetActivity(
+        args.worksetId,
         args.perRepo ?? 25,
-        workspaces,
+        worksets,
         repos,
       );
     },
   );
 
   ipcMain.handle(
-    'workspace:openPRs',
+    'workset:openPRs',
     async (
       _e,
-      args: { workspaceId: string; title: string; body: string; draft: boolean },
+      args: { worksetId: string; title: string; body: string; draft: boolean },
     ) => {
-      const { workspaces, repos } = Store.load();
-      return workspaceOpenPRs(
-        args.workspaceId,
+      const { worksets, repos } = Store.load();
+      return worksetOpenPRs(
+        args.worksetId,
         args.title,
         args.body,
         args.draft,
-        workspaces,
+        worksets,
         repos,
       );
     },
   );
 
   ipcMain.handle(
-    'workspace:resetToDefault',
+    'workset:resetToDefault',
     async (
       _e,
-      args: { workspaceId: string; cleanupBranch?: string },
+      args: { worksetId: string; cleanupBranch?: string },
     ) => {
-      const { workspaces, repos } = Store.load();
-      return workspaceResetToDefault(
-        args.workspaceId,
-        workspaces,
+      const { worksets, repos } = Store.load();
+      return worksetResetToDefault(
+        args.worksetId,
+        worksets,
         repos,
         args.cleanupBranch,
       );
@@ -1057,6 +1153,57 @@ function registerIpc(): void {
         ? repos.filter((r) => repoIds.includes(r.id))
         : repos;
     return resetReposToDefault(targets);
+  });
+
+  ipcMain.handle(
+    'workspace:resetToDefault',
+    async (_e, args: { workspaceId: string }) => {
+      const { workspaces, repos } = Store.load();
+      const ws = workspaces.find((w) => w.id === args.workspaceId);
+      if (!ws) return [];
+      const targets = repos.filter((r) => ws.repoIds.includes(r.id));
+      return resetReposToDefault(targets);
+    },
+  );
+
+  ipcMain.handle(
+    'repo:resetToDefault',
+    async (_e, args: { repoId: string; force?: boolean }) => {
+      const repo = Store.load().repos.find((r) => r.id === args.repoId);
+      if (!repo) {
+        return {
+          repoId: args.repoId,
+          defaultBranch: null,
+          result: 'no-default-branch' as const,
+          message: 'Unknown repo',
+        };
+      }
+      return resetRepoToDefault(repo, undefined, {
+        forceLoseUnpushed: args.force === true,
+      });
+    },
+  );
+
+  ipcMain.handle(
+    'repo:fastForward',
+    async (_e, args: { repoId: string }) => {
+      const repo = repoFromArg(args);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return pullFastForward(repo.path);
+    },
+  );
+
+  ipcMain.handle('workspace:fetchAll', async (_e, workspaceId: string) => {
+    const { workspaces, repos } = Store.load();
+    const ws = workspaces.find((w) => w.id === workspaceId);
+    if (!ws) return [];
+    const targets = repos.filter((r) => ws.repoIds.includes(r.id));
+    return Promise.all(
+      targets.map(async (r) => {
+        const res = await gitFetch(r.path);
+        return { repoId: r.id, ok: res.ok, error: res.error };
+      }),
+    );
   });
 
   ipcMain.handle('repo:worktrees', async (_e, repoId: string) => {
@@ -1156,15 +1303,40 @@ function registerIpc(): void {
   );
 
   ipcMain.handle(
-    'workspace:reviewChanges',
+    'cli:resolveConflict',
     async (
       _e,
-      args: { workspaceId: string; tool: 'claude' | 'codex' | 'gemini' },
+      args: { repoId: string; path: string; tool: 'claude' | 'codex' | 'gemini' },
     ) => {
-      const { workspaces, repos } = Store.load();
-      const aggregate = await aggregateWorkspaceDirtyDiff(
-        args.workspaceId,
-        workspaces,
+      const repo = repoFromArg(args);
+      if (!repo) {
+        return { ok: false, content: '', error: 'Unknown repo', tool: args.tool };
+      }
+      const file = readFileUnderRoot(repo.path, args.path);
+      if (!file.ok) {
+        return { ok: false, content: '', error: file.error, tool: args.tool };
+      }
+      const logs = await mergeSideLogs(repo.path);
+      return resolveConflictWithLlm({
+        tool: args.tool,
+        fileContent: file.content,
+        filePath: args.path,
+        oursLog: logs.ours,
+        theirsLog: logs.theirs,
+      });
+    },
+  );
+
+  ipcMain.handle(
+    'workset:reviewChanges',
+    async (
+      _e,
+      args: { worksetId: string; tool: 'claude' | 'codex' | 'gemini' },
+    ) => {
+      const { worksets, repos } = Store.load();
+      const aggregate = await aggregateWorksetDirtyDiff(
+        args.worksetId,
+        worksets,
         repos,
       );
       if (!aggregate.text.trim()) {
@@ -1182,15 +1354,15 @@ function registerIpc(): void {
   );
 
   ipcMain.handle(
-    'workspace:suggestCommitMessage',
+    'workset:suggestCommitMessage',
     async (
       _e,
-      args: { workspaceId: string; tool: 'claude' | 'codex' | 'gemini' },
+      args: { worksetId: string; tool: 'claude' | 'codex' | 'gemini' },
     ) => {
-      const { workspaces, repos } = Store.load();
-      const aggregate = await aggregateWorkspaceDirtyDiff(
-        args.workspaceId,
-        workspaces,
+      const { worksets, repos } = Store.load();
+      const aggregate = await aggregateWorksetDirtyDiff(
+        args.worksetId,
+        worksets,
         repos,
       );
       if (!aggregate.text.trim()) {
