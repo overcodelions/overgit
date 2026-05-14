@@ -589,6 +589,23 @@ export interface AppSettings {
   /// what overgit is doing on their behalf. Off by default to avoid
   /// cluttering the UI for fluent users.
   explainMode?: boolean;
+  /// Squash-merge link detection in the History graph. Off by default
+  /// because on big repos with many stale branches it spawns dozens of
+  /// concurrent `git diff` + `patch-id` subprocesses for 15–25s in
+  /// the background, and those compete with foreground IPCs
+  /// (branches, stash, workset status) for CPU. The advisory dashed
+  /// connectors it produces are nice but not load-bearing, so the
+  /// trade isn't worth it unless the user explicitly opts in.
+  detectSquashMerges?: boolean;
+  /// Per-repo History view mode. 'graph' (default) renders the
+  /// lane rail with branch connectors — informative but pays
+  /// `git log --all --topo-order` + trunk-set walk + SVG render
+  /// cost on every open. 'list' drops the rail and uses a HEAD-only
+  /// `git log` (no `--all`, no `--topo-order`), matching what
+  /// GitHub Desktop / Tower do. Roughly 3-5× faster on big repos.
+  /// Missing entries default to 'graph' so the existing behavior
+  /// is preserved on upgrade.
+  historyMode?: Record<UUID, 'graph' | 'list'>;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -635,8 +652,10 @@ export interface IPCInvokeMap {
     | { ok: false; error: string }
     | { ok: false; cancelled: true };
   'repo:status': (repoId: UUID) => RepoStatus;
-  'repo:listBranches': (repoId: UUID) => { local: string[]; remote: string[] };
-  'repo:log': (args: { repoId: UUID; limit?: number }) => Commit[];
+  /// Just the HEAD commit (or null on an unborn HEAD). Used by the
+  /// Changes tab to populate the Amend toggle's target without paying
+  /// the cost of fetching + lane-laying out a 200-commit graph.
+  'repo:headCommit': (repoId: UUID) => Commit | null;
   /// Diff for a specific commit (parent..sha) when `sha` is set, otherwise
   /// the working tree vs HEAD (staged + unstaged combined).
   'repo:diff': (args: { repoId: UUID; sha?: string }) => FileDiff[];
@@ -736,6 +755,15 @@ export interface IPCInvokeMap {
     side: 'staged' | 'unstaged' | 'combined';
   }) => FileDiff[];
   'repo:graph': (args: { repoId: UUID; limit?: number }) => GraphCommit[];
+  /// Fast / List-mode graph fetch. On a non-default branch with a
+  /// known default, scopes to `git log <default>..HEAD -N` so the
+  /// user only sees commits unique to the current branch — matches
+  /// what PR-review tools default to showing. On the default branch
+  /// (or when the default can't be resolved), falls back to flat
+  /// `git log -N`. No `--all`, no `--topo-order`, no trunk-set walk.
+  /// Every commit comes back with `lane: 0` and `parentLanes: [0,…]`
+  /// since the rail isn't rendered in list mode.
+  'repo:graphFast': (args: { repoId: UUID; limit?: number }) => GraphCommit[];
   'repo:listStashes': (repoId: UUID) => Stash[];
   'repo:applyStash': (args: {
     repoId: UUID;

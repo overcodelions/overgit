@@ -29,6 +29,7 @@ import {
   cherryPick,
   commitAll,
   commitGraph,
+  commitGraphFast,
   commitStaged,
   createBranch,
   deleteBranch,
@@ -42,7 +43,6 @@ import {
   fetch as gitFetch,
   fileLog as gitFileLog,
   lfsStatus,
-  listBranches,
   listBranchCommits,
   listRemotes,
   listStashes,
@@ -58,7 +58,7 @@ import {
   removeRemote,
   removeWorktree,
   initRepo,
-  log as gitLog,
+  headCommit,
   looksLikeRepo,
   markResolved,
   mergeBranch,
@@ -356,16 +356,10 @@ function registerIpc(): void {
     return gitStatus(repo.id, repo.path, repo.defaultBranch);
   });
 
-  ipcMain.handle('repo:listBranches', async (_e, repoId: string) => {
+  ipcMain.handle('repo:headCommit', async (_e, repoId: string) => {
     const repo = Store.load().repos.find((r) => r.id === repoId);
-    if (!repo) return { local: [], remote: [] };
-    return listBranches(repo.path);
-  });
-
-  ipcMain.handle('repo:log', async (_e, args: { repoId: string; limit?: number }) => {
-    const repo = Store.load().repos.find((r) => r.id === args.repoId);
-    if (!repo) return [];
-    return gitLog(repo.path, args.limit ?? 50);
+    if (!repo) return null;
+    return headCommit(repo.path);
   });
 
   ipcMain.handle('repo:diff', async (_e, args: { repoId: string; sha?: string }) => {
@@ -749,6 +743,12 @@ function registerIpc(): void {
     const repo = repoFromArg(args);
     if (!repo) return [];
     return commitGraph(repo.path, args.limit ?? 200, repo.defaultBranch);
+  });
+
+  ipcMain.handle('repo:graphFast', async (_e, args: { repoId: string; limit?: number }) => {
+    const repo = repoFromArg(args);
+    if (!repo) return [];
+    return commitGraphFast(repo.path, repo.defaultBranch, args.limit ?? 100);
   });
 
   ipcMain.handle('repo:listStashes', async (_e, repoId: string) => {

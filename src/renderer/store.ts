@@ -113,6 +113,11 @@ interface UiState {
   /// the Workspace itself.
   selectedWorkspaceId: UUID | null;
   worksetStatuses: Record<UUID, RepoStatus[]>;
+  /// True while `refreshWorksetStatus(id)` is in flight. Lets the
+  /// overview surface a "Refreshing…" hint when statuses are cached
+  /// from a prior visit so the user knows the displayed counts are
+  /// about to update rather than stale-and-stuck.
+  worksetRefreshing: Record<UUID, boolean>;
   worksetPRs: Record<UUID, RepoPRs[]>;
   /// Activity-feed cache per workset. Each refresh replaces the full
   /// list; we don't paginate or merge historical fetches because the
@@ -124,11 +129,15 @@ interface UiState {
   /// can appear in multiple worksets — caching by workset would
   /// duplicate the data and risk drift between views.
   worksetWorktrees: Record<UUID, Worktree[]>;
-  repoLog: Record<UUID, Commit[]>;
   repoDiff: Record<UUID, { key: string; files: FileDiff[] }>;
   repoChanges: Record<UUID, RepoChanges>;
   repoStatus: Record<UUID, RepoStatus>;
-  repoBranches: Record<UUID, { local: string[]; remote: string[] }>;
+  /// HEAD commit per repo, populated for the Changes-tab Amend toggle.
+  /// Kept separate from `repoGraph` because the graph is gated behind
+  /// the History tab — fetching the full graph just to show the last
+  /// commit's subject on the Changes tab was the second-biggest cost
+  /// on initial repo open after the graph itself.
+  repoHeadCommit: Record<UUID, Commit | null>;
   repoBranchSummaries: Record<UUID, BranchSummary[]>;
   repoGraph: Record<UUID, GraphCommit[]>;
   /// Advisory squash-merge links per repo. Refreshed alongside the
@@ -184,10 +193,10 @@ interface UiState {
   selectWorkset: (id: UUID | null) => void;
   selectRepo: (id: UUID | null) => void;
   selectWorkspace: (id: UUID | null) => void;
-  refreshWorksetStatus: (id: UUID) => Promise<void>;
-  refreshWorksetPRs: (id: UUID) => Promise<void>;
-  refreshWorksetWorktrees: (id: UUID) => Promise<void>;
-  refreshWorksetActivity: (id: UUID) => Promise<void>;
+  refreshWorksetStatus: (id: UUID, force?: boolean) => Promise<void>;
+  refreshWorksetPRs: (id: UUID, force?: boolean) => Promise<void>;
+  refreshWorksetWorktrees: (id: UUID, force?: boolean) => Promise<void>;
+  refreshWorksetActivity: (id: UUID, force?: boolean) => Promise<void>;
   /// Stamp the workset's `lastSeen` to "now". Called when the user
   /// opens the workset pane so the activity feed's "new since" pip
   /// shifts forward — and on explicit "Mark all read" too.
@@ -224,7 +233,6 @@ interface UiState {
   /// CheckoutOutcome shape so the existing "Last switch" table renders.
   resumeWorksetBranch: (id: UUID, branch: string) => Promise<void>;
   fetchWorkset: (id: UUID) => Promise<void>;
-  refreshRepoLog: (id: UUID) => Promise<void>;
   refreshRepoDiff: (id: UUID, sha?: string) => Promise<void>;
   stashRepo: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
   commitAllRepo: (id: UUID, message: string) => Promise<{ ok: boolean; error?: string }>;
@@ -232,11 +240,17 @@ interface UiState {
 
   refreshRepoChanges: (id: UUID) => Promise<void>;
   refreshRepoStatus: (id: UUID) => Promise<void>;
+  refreshRepoHeadCommit: (id: UUID, force?: boolean) => Promise<void>;
   /// Fan out `repo:status` for every known repo so the sidebar can flag
   /// dirty / ahead / behind state without the user having to click into
   /// each one. Failures on individual repos are swallowed — a single
   /// broken repo shouldn't blank out the markers for the rest.
-  refreshAllRepoStatuses: () => Promise<void>;
+  refreshAllRepoStatuses: (force?: boolean) => Promise<void>;
+  /// Same fan-out as `refreshAllRepoStatuses` but scoped to a specific
+  /// set of repo ids. Used by the workspace pane so opening a workspace
+  /// doesn't kick off status calls for every repo overgit knows about —
+  /// archived ones, repos in other workspaces, repos in worksets, etc.
+  refreshRepoStatuses: (ids: UUID[]) => Promise<void>;
   /// Fan out fetch → switch to default → pull across every repo in
   /// the sidebar. Returns per-repo outcomes so the caller can surface
   /// dirty/failed reasons.
@@ -301,12 +315,16 @@ interface UiState {
   /// prompt shouldn't surface as a toast for a background sync. Calls
   /// `refreshAllRepoStatuses` when done so the dots actually move.
   fetchAllReposQuiet: () => Promise<void>;
-  refreshRepoBranches: (id: UUID) => Promise<void>;
-  refreshRepoBranchSummaries: (id: UUID) => Promise<void>;
+  refreshRepoBranchSummaries: (id: UUID, force?: boolean) => Promise<void>;
   refreshRepoGraph: (id: UUID) => Promise<void>;
+  /// Fast-path graph fetch used by the History tab's "List" mode.
+  /// Drops `--all` + `--topo-order` + trunk-set walk; just a flat
+  /// `git log -100` of the current branch. 3-5× faster on big repos.
+  refreshRepoGraphFast: (id: UUID) => Promise<void>;
   refreshRepoSquashLinks: (id: UUID) => Promise<void>;
+  setRepoHistoryMode: (id: UUID, mode: 'graph' | 'list') => Promise<void>;
   refreshRepoFileList: (id: UUID) => Promise<void>;
-  refreshRepoStashes: (id: UUID) => Promise<void>;
+  refreshRepoStashes: (id: UUID, force?: boolean) => Promise<void>;
   applyStash: (
     id: UUID,
     index: number,
@@ -426,6 +444,55 @@ function diffKey(sha: string | undefined): string {
   return sha ?? '__working__';
 }
 
+/// TTL + in-flight dedupe shared by the "refresh on selection" actions
+/// (worksetStatus, worksetPRs, worksetWorktrees, worksetActivity,
+/// repoBranchSummaries, repoStashes). Two problems we're solving:
+///
+///   1. Rapid clicks — bouncing between two worksets fires the full
+///      fan-out twice. With dedupe, the second click reuses the
+///      in-flight promise instead of spawning another wave of git/gh.
+///   2. Repeat opens — clicking the same workset twice within a few
+///      seconds repaints with already-fresh data; the IPC roundtrip
+///      adds nothing but latency. Skip when last refresh is recent.
+///
+/// Callers pass `force: true` after a mutation (commit, push, fetch)
+/// because the cached data is now stale even if the timestamp is fresh.
+const _inflight = new Map<string, Promise<unknown>>();
+const _lastRefresh = new Map<string, number>();
+
+async function cached<T>(
+  key: string,
+  ttlMs: number,
+  fn: () => Promise<T>,
+  force = false,
+): Promise<T | undefined> {
+  if (!force) {
+    const last = _lastRefresh.get(key) ?? 0;
+    if (Date.now() - last < ttlMs) return undefined;
+    const existing = _inflight.get(key) as Promise<T> | undefined;
+    if (existing) return existing;
+  }
+  const p = fn();
+  _inflight.set(key, p);
+  try {
+    const result = await p;
+    _lastRefresh.set(key, Date.now());
+    return result;
+  } finally {
+    if (_inflight.get(key) === p) _inflight.delete(key);
+  }
+}
+
+/// Invalidate cache entries so the next refresh actually fires. Used
+/// after operations that mutate underlying state in ways the caller
+/// didn't directly refresh (e.g., a workset checkout invalidates every
+/// per-repo branch-summary cache).
+function invalidateCache(prefix: string): void {
+  for (const key of _lastRefresh.keys()) {
+    if (key.startsWith(prefix)) _lastRefresh.delete(key);
+  }
+}
+
 export const useStore = create<UiState>((set, get) => ({
   loaded: false,
   repos: [],
@@ -443,14 +510,14 @@ export const useStore = create<UiState>((set, get) => ({
   selectedRepoId: null,
   selectedWorkspaceId: null,
   worksetStatuses: {},
+  worksetRefreshing: {},
   worksetPRs: {},
   worksetActivity: {},
   worksetWorktrees: {},
-  repoLog: {},
   repoDiff: {},
   repoChanges: {},
   repoStatus: {},
-  repoBranches: {},
+  repoHeadCommit: {},
   repoBranchSummaries: {},
   repoGraph: {},
   repoSquashLinks: {},
@@ -505,9 +572,14 @@ export const useStore = create<UiState>((set, get) => ({
     }
     // Background-refresh statuses for every repo so the sidebar can
     // surface dirty / ahead / behind dots without waiting for the user
-    // to click each one. Don't await — the rest of the UI should render
-    // immediately even if this fan-out is slow on a big library.
-    void get().refreshAllRepoStatuses();
+    // to click each one. Deferred ~600ms after init so the user's
+    // first click (workset, repo, branches tab) gets a clean lane —
+    // otherwise 25+ repos × ~5 git subprocesses each competes with
+    // the foreground IPCs and everything feels glued. The TTL cache
+    // on `refreshAllRepoStatuses` keeps repeat triggers cheap.
+    window.setTimeout(() => {
+      void get().refreshAllRepoStatuses();
+    }, 600);
   },
 
   pickAndAddRepo: async () => {
@@ -612,35 +684,124 @@ export const useStore = create<UiState>((set, get) => ({
   selectRepo: (id) => {
     set({ selectedRepoId: id, selectedWorkspaceId: null });
     if (id) {
-      get().refreshRepoLog(id);
       get().refreshRepoChanges(id);
       get().refreshRepoStatus(id);
-      get().refreshRepoBranches(id);
     }
   },
 
-  refreshWorksetStatus: async (id) => {
-    const statuses = await window.overgit.invoke('workset:status', id);
-    set({ worksetStatuses: { ...get().worksetStatuses, [id]: statuses } });
+  refreshWorksetStatus: async (id, force = false) => {
+    await cached(
+      `worksetStatus:${id}`,
+      5_000,
+      async () => {
+        const ws = get().worksets.find((w) => w.id === id);
+        if (!ws || ws.repoIds.length === 0) {
+          set({ worksetStatuses: { ...get().worksetStatuses, [id]: [] } });
+          return;
+        }
+        const repos = get().repos;
+        const memberIds = ws.repoIds.filter((rid) => repos.some((r) => r.id === rid));
+        if (memberIds.length === 0) {
+          set({ worksetStatuses: { ...get().worksetStatuses, [id]: [] } });
+          return;
+        }
+
+        set({ worksetRefreshing: { ...get().worksetRefreshing, [id]: true } });
+        try {
+          // Progressive fan-out: stream each member's status into the
+          // store as it completes so the overview lights up row by row
+          // instead of staring at "Loading 0/N…" until the slowest
+          // repo finishes. We bypass the `workset:status` IPC (which
+          // was an all-or-nothing batch) in favor of per-repo
+          // `repo:status` invocations from the renderer. 3 in flight
+          // is the same bound the main-process `pool(3, …)` enforced;
+          // it keeps concurrent git pressure manageable while letting
+          // the user see real data within ~250ms of clicking the
+          // workset, even on cold start.
+          //
+          // Cached entries (from a prior visit) are seeded into the
+          // working map so the UI doesn't visibly clear during refresh
+          // — they get overwritten as fresh data arrives.
+          const byRepoId = new Map<UUID, RepoStatus>(
+            (get().worksetStatuses[id] ?? []).map((s) => [s.repoId, s]),
+          );
+          const orderedSnapshot = (): RepoStatus[] =>
+            memberIds
+              .map((rid) => byRepoId.get(rid))
+              .filter((s): s is RepoStatus => !!s);
+
+          let next = 0;
+          const worker = async () => {
+            while (true) {
+              const i = next++;
+              if (i >= memberIds.length) return;
+              const rid = memberIds[i];
+              try {
+                const st = await window.overgit.invoke('repo:status', rid);
+                byRepoId.set(rid, st);
+                set({
+                  worksetStatuses: {
+                    ...get().worksetStatuses,
+                    [id]: orderedSnapshot(),
+                  },
+                });
+              } catch {
+                /* leave whatever was already cached for this repo */
+              }
+            }
+          };
+          await Promise.all(
+            Array.from({ length: Math.min(3, memberIds.length) }, worker),
+          );
+        } finally {
+          set({ worksetRefreshing: { ...get().worksetRefreshing, [id]: false } });
+        }
+      },
+      force,
+    );
   },
 
-  refreshWorksetPRs: async (id) => {
-    const prs = await window.overgit.invoke('workset:listPRs', id);
-    set({ worksetPRs: { ...get().worksetPRs, [id]: prs } });
+  refreshWorksetPRs: async (id, force = false) => {
+    // PRs change rarely and `gh pr list` is the slowest fan-out by far;
+    // a 30s TTL means navigating between worksets feels instant without
+    // hiding PR updates that the user actually cares about.
+    await cached(
+      `worksetPRs:${id}`,
+      30_000,
+      async () => {
+        const prs = await window.overgit.invoke('workset:listPRs', id);
+        set({ worksetPRs: { ...get().worksetPRs, [id]: prs } });
+      },
+      force,
+    );
   },
 
-  refreshWorksetWorktrees: async (id) => {
-    const rows = await window.overgit.invoke('workset:worktrees', id);
-    const next = { ...get().worksetWorktrees };
-    for (const row of rows) next[row.repoId] = row.worktrees;
-    set({ worksetWorktrees: next });
+  refreshWorksetWorktrees: async (id, force = false) => {
+    await cached(
+      `worksetWorktrees:${id}`,
+      10_000,
+      async () => {
+        const rows = await window.overgit.invoke('workset:worktrees', id);
+        const next = { ...get().worksetWorktrees };
+        for (const row of rows) next[row.repoId] = row.worktrees;
+        set({ worksetWorktrees: next });
+      },
+      force,
+    );
   },
 
-  refreshWorksetActivity: async (id) => {
-    const items = await window.overgit.invoke('workset:activity', {
-      worksetId: id,
-    });
-    set({ worksetActivity: { ...get().worksetActivity, [id]: items } });
+  refreshWorksetActivity: async (id, force = false) => {
+    await cached(
+      `worksetActivity:${id}`,
+      10_000,
+      async () => {
+        const items = await window.overgit.invoke('workset:activity', {
+          worksetId: id,
+        });
+        set({ worksetActivity: { ...get().worksetActivity, [id]: items } });
+      },
+      force,
+    );
   },
 
   markWorksetSeen: async (id) => {
@@ -692,8 +853,7 @@ export const useStore = create<UiState>((set, get) => ({
         get().refreshRepoWorktrees(id),
         get().refreshRepoStatus(id),
         get().refreshRepoChanges(id),
-        get().refreshRepoBranches(id),
-        get().refreshRepoBranchSummaries(id),
+        get().refreshRepoBranchSummaries(id, true),
       ]);
     }
     return res;
@@ -705,7 +865,7 @@ export const useStore = create<UiState>((set, get) => ({
       message,
     });
     // Refresh status so the dirty count drops on each row that committed.
-    await get().refreshWorksetStatus(id);
+    await get().refreshWorksetStatus(id, true);
     return outcomes;
   },
 
@@ -715,13 +875,12 @@ export const useStore = create<UiState>((set, get) => ({
     // set — refresh status so the workset overview is accurate. If
     // a single repo is also open, refresh its log + graph too so the
     // History tab's ref labels track the new upstream.
-    await get().refreshWorksetStatus(id);
+    await get().refreshWorksetStatus(id, true);
     const selectedRepoId = get().selectedRepoId;
     if (selectedRepoId) {
       await Promise.all([
-        get().refreshRepoLog(selectedRepoId),
         get().refreshRepoGraph(selectedRepoId),
-        get().refreshRepoBranchSummaries(selectedRepoId),
+        get().refreshRepoBranchSummaries(selectedRepoId, true),
       ]);
     }
     return outcomes;
@@ -737,7 +896,7 @@ export const useStore = create<UiState>((set, get) => ({
     // Newly created PRs should show up in the workset PR list
     // immediately. Refresh after the call so the user sees their work
     // reflected without a manual refresh click.
-    await get().refreshWorksetPRs(id);
+    await get().refreshWorksetPRs(id, true);
     return outcomes;
   },
 
@@ -748,7 +907,7 @@ export const useStore = create<UiState>((set, get) => ({
       createIfMissing,
     });
     set({ lastCheckout: { worksetId: id, branch, outcomes } });
-    await get().refreshWorksetStatus(id);
+    await get().refreshWorksetStatus(id, true);
   },
 
   resumeWorksetBranch: async (id, branch) => {
@@ -797,17 +956,15 @@ export const useStore = create<UiState>((set, get) => ({
       };
     });
     set({ lastCheckout: { worksetId: id, branch, outcomes } });
-    await get().refreshWorksetStatus(id);
+    await get().refreshWorksetStatus(id, true);
   },
 
   fetchWorkset: async (id) => {
     await window.overgit.invoke('workset:fetchAll', id);
-    await Promise.all([get().refreshWorksetStatus(id), get().refreshWorksetPRs(id)]);
-  },
-
-  refreshRepoLog: async (id) => {
-    const commits = await window.overgit.invoke('repo:log', { repoId: id, limit: 100 });
-    set({ repoLog: { ...get().repoLog, [id]: commits } });
+    await Promise.all([
+      get().refreshWorksetStatus(id, true),
+      get().refreshWorksetPRs(id, true),
+    ]);
   },
 
   refreshRepoDiff: async (id, sha) => {
@@ -842,20 +999,50 @@ export const useStore = create<UiState>((set, get) => ({
     // Branch-summary cache must follow a successful retry too — same
     // staleness story as `checkoutRepo`.
     await Promise.all([
-      get().refreshWorksetStatus(last.worksetId),
+      get().refreshWorksetStatus(last.worksetId, true),
       get().refreshRepoStatus(id),
-      get().refreshRepoBranchSummaries(id),
+      get().refreshRepoBranchSummaries(id, true),
     ]);
   },
 
   refreshRepoChanges: async (id) => {
-    const ch = await window.overgit.invoke('repo:changes', id);
-    set({ repoChanges: { ...get().repoChanges, [id]: ch } });
+    // TTL=0 means we only get the in-flight dedupe behavior, not the
+    // skip-if-recent behavior. The original 2s TTL existed to collapse
+    // `selectRepo` + `RepoDetail mount` firing in the same tick — but
+    // those run synchronously and the in-flight check alone handles
+    // that case. A 2s skip-gate was silently swallowing post-mutation
+    // refreshes (checkout, pull, etc.) when the user had just clicked
+    // in to the repo, leaving the changes pane stale.
+    await cached(`repoChanges:${id}`, 0, async () => {
+      const ch = await window.overgit.invoke('repo:changes', id);
+      set({ repoChanges: { ...get().repoChanges, [id]: ch } });
+    });
   },
 
   refreshRepoStatus: async (id) => {
-    const st = await window.overgit.invoke('repo:status', id);
-    set({ repoStatus: { ...get().repoStatus, [id]: st } });
+    // Same story as `refreshRepoChanges`: TTL=0 keeps in-flight
+    // dedupe (concurrent fires share one IPC) but doesn't block
+    // fresh post-mutation refreshes. The 2s gate was the real reason
+    // the History tab showed stale commits after a branch switch —
+    // checkoutRepo's `refreshRepoStatus` was being eaten by TTL, so
+    // `status.branch` never updated and the branch-change watcher
+    // in HistoryTab never fired.
+    await cached(`repoStatus:${id}`, 0, async () => {
+      const st = await window.overgit.invoke('repo:status', id);
+      set({ repoStatus: { ...get().repoStatus, [id]: st } });
+    });
+  },
+
+  refreshRepoHeadCommit: async (id, force = false) => {
+    await cached(
+      `repoHeadCommit:${id}`,
+      5_000,
+      async () => {
+        const c = await window.overgit.invoke('repo:headCommit', id);
+        set({ repoHeadCommit: { ...get().repoHeadCommit, [id]: c } });
+      },
+      force,
+    );
   },
 
   resetAllReposToDefault: async () => {
@@ -1062,40 +1249,51 @@ export const useStore = create<UiState>((set, get) => ({
     });
   },
 
-  refreshAllRepoStatuses: async () => {
-    const ids = get().repos.map((r) => r.id);
+  refreshAllRepoStatuses: async (force = false) => {
+    // TTL'd: a startup + a post-add + a focus-tick can all fire this
+    // within seconds, and each pass is 25+ status fan-outs. Coalesce
+    // bursts so the sidebar doesn't get re-walked 3 times in a row.
+    await cached(
+      'refreshAllRepoStatuses',
+      15_000,
+      () => get().refreshRepoStatuses(get().repos.map((r) => r.id)),
+      force,
+    );
+  },
+
+  refreshRepoStatuses: async (ids) => {
     if (ids.length === 0) return;
-    // Bound the fan-out so a 24-repo workset doesn't fire 24
-    // simultaneous `repo:status` IPCs (each of which spawns several
-    // git processes). Without this cap the periodic 60s tick + a
-    // running squash scan was painting Activity Monitor with
-    // hundreds of `git` rows. 4 in flight is enough to keep the
-    // sidebar fresh without thrashing.
-    const STATUS_CONCURRENCY = 4;
-    const results: ([UUID, Awaited<ReturnType<typeof window.overgit.invoke<'repo:status'>>>] | null)[] = new Array(ids.length);
+    // Bound the fan-out. Each `gitStatus` spawns ~4 parallel git
+    // subprocesses; STATUS_CONCURRENCY=3 = ~12 concurrent gits worst
+    // case, which a modern Mac handles fine without saturating. We
+    // tried 4 (16 concurrent) — that pegged CPU and starved
+    // foreground IPCs. 3 fills a 19-repo workspace in ~2s instead of
+    // ~4s, with headroom for the user's next click to land on time.
+    //
+    // Routes through `refreshRepoStatus(id)` rather than calling
+    // `repo:status` raw so the 2s TTL + in-flight dedupe on that
+    // action collapses overlapping fan-outs — startup's all-repo
+    // sweep and a workspace's per-member sweep no longer double-walk
+    // the repos they share. Statuses still merge into the store as
+    // each one resolves (the inner refreshRepoStatus is the one
+    // doing the `set`), so rows light up progressively.
+    const STATUS_CONCURRENCY = 3;
+    const refresh = get().refreshRepoStatus;
     let next = 0;
     const worker = async () => {
       while (true) {
         const i = next++;
         if (i >= ids.length) return;
-        const id = ids[i];
         try {
-          const st = await window.overgit.invoke('repo:status', id);
-          results[i] = [id, st];
+          await refresh(ids[i]);
         } catch {
-          results[i] = null;
+          /* leave existing status alone */
         }
       }
     };
     await Promise.all(
       Array.from({ length: Math.min(STATUS_CONCURRENCY, ids.length) }, worker),
     );
-    const merged = { ...get().repoStatus };
-    for (const row of results) {
-      if (!row) continue;
-      merged[row[0]] = row[1];
-    }
-    set({ repoStatus: merged });
   },
 
   fetchAllReposQuiet: async () => {
@@ -1113,14 +1311,20 @@ export const useStore = create<UiState>((set, get) => ({
     await get().refreshAllRepoStatuses();
   },
 
-  refreshRepoBranches: async (id) => {
-    const br = await window.overgit.invoke('repo:listBranches', id);
-    set({ repoBranches: { ...get().repoBranches, [id]: br } });
-  },
-
-  refreshRepoBranchSummaries: async (id) => {
-    const summaries = await window.overgit.invoke('repo:branchSummaries', id);
-    set({ repoBranchSummaries: { ...get().repoBranchSummaries, [id]: summaries } });
+  refreshRepoBranchSummaries: async (id, force = false) => {
+    // Branch summaries are the most expensive read on monorepos with
+    // thousands of remote refs (`for-each-ref` walks every ref and
+    // sorts by committerdate). 10s TTL keeps re-opening the picker
+    // instant without staleness that the user would actually notice.
+    await cached(
+      `repoBranchSummaries:${id}`,
+      10_000,
+      async () => {
+        const summaries = await window.overgit.invoke('repo:branchSummaries', id);
+        set({ repoBranchSummaries: { ...get().repoBranchSummaries, [id]: summaries } });
+      },
+      force,
+    );
   },
 
   setRepoDefaultBranch: async (id, branch) => {
@@ -1155,11 +1359,13 @@ export const useStore = create<UiState>((set, get) => ({
   commitRepo: async (id, message) => {
     const res = await window.overgit.invoke('repo:commit', { repoId: id, message });
     if (res.ok) {
-      // Refresh log + changes + status; the new commit changes all three.
+      // Refresh changes + status; the new commit clears the staging
+      // area and may move ahead-of-upstream counters. HEAD moved too,
+      // so the Amend target needs refreshing.
       await Promise.all([
-        get().refreshRepoLog(id),
         get().refreshRepoChanges(id),
         get().refreshRepoStatus(id),
+        get().refreshRepoHeadCommit(id, true),
       ]);
     }
     return res;
@@ -1169,12 +1375,12 @@ export const useStore = create<UiState>((set, get) => ({
     const res = await window.overgit.invoke('repo:undoLastCommit', { repoId: id });
     if (res.ok) {
       // Soft reset rewinds HEAD and re-stages the commit's tree, so
-      // history, graph, status, and the Changes pane all shift.
+      // graph, status, head-commit, and the Changes pane all shift.
       await Promise.all([
-        get().refreshRepoLog(id),
         get().refreshRepoGraph(id),
         get().refreshRepoChanges(id),
         get().refreshRepoStatus(id),
+        get().refreshRepoHeadCommit(id, true),
       ]);
     }
     return res;
@@ -1185,12 +1391,11 @@ export const useStore = create<UiState>((set, get) => ({
     if (res.ok) {
       // Push moves the upstream ref (and may set tracking on first
       // push), so the History tab's ref labels and ahead/behind line
-      // are stale until log + graph + branch summaries refresh too.
+      // are stale until graph + branch summaries refresh too.
       await Promise.all([
         get().refreshRepoStatus(id),
-        get().refreshRepoLog(id),
         get().refreshRepoGraph(id),
-        get().refreshRepoBranchSummaries(id),
+        get().refreshRepoBranchSummaries(id, true),
       ]);
     }
     return res;
@@ -1200,11 +1405,11 @@ export const useStore = create<UiState>((set, get) => ({
     const res = await window.overgit.invoke('repo:pull', id);
     if (res.ok) {
       await Promise.all([
-        get().refreshRepoLog(id),
         get().refreshRepoGraph(id),
         get().refreshRepoChanges(id),
         get().refreshRepoStatus(id),
-        get().refreshRepoBranchSummaries(id),
+        get().refreshRepoBranchSummaries(id, true),
+        get().refreshRepoHeadCommit(id, true),
       ]);
     }
     return res;
@@ -1222,9 +1427,9 @@ export const useStore = create<UiState>((set, get) => ({
     await Promise.all([
       get().refreshRepoStatus(id),
       get().refreshRepoChanges(id),
-      get().refreshRepoLog(id),
       get().refreshRepoGraph(id),
-      get().refreshRepoStashes(id),
+      get().refreshRepoStashes(id, true),
+      get().refreshRepoHeadCommit(id, true),
     ]);
     return res;
   },
@@ -1245,15 +1450,14 @@ export const useStore = create<UiState>((set, get) => ({
       // Branch summaries carry the `isCurrent` flag the picker uses to
       // render the "ON" badge — without refreshing them here, the
       // picker keeps showing the old branch as current after a switch
-      // until the user manually re-fetches. Same logic for branches +
-      // graph (HEAD pill / lane assignments are branch-dependent).
+      // until the user manually re-fetches. Graph also depends on HEAD
+      // for lane assignment, and HEAD moved so the Amend target shifts.
       await Promise.all([
         get().refreshRepoStatus(id),
         get().refreshRepoChanges(id),
-        get().refreshRepoLog(id),
-        get().refreshRepoBranches(id),
-        get().refreshRepoBranchSummaries(id),
+        get().refreshRepoBranchSummaries(id, true),
         get().refreshRepoGraph(id),
+        get().refreshRepoHeadCommit(id, true),
       ]);
     }
     return outcome;
@@ -1268,9 +1472,8 @@ export const useStore = create<UiState>((set, get) => ({
     });
     if (res.ok) {
       await Promise.all([
-        get().refreshRepoBranches(id),
         get().refreshRepoStatus(id),
-        get().refreshRepoBranchSummaries(id),
+        get().refreshRepoBranchSummaries(id, true),
         get().refreshRepoGraph(id),
       ]);
     }
@@ -1283,7 +1486,7 @@ export const useStore = create<UiState>((set, get) => ({
       name,
       force,
     });
-    if (res.ok) await get().refreshRepoBranches(id);
+    if (res.ok) await get().refreshRepoBranchSummaries(id, true);
     return res;
   },
 
@@ -1304,9 +1507,8 @@ export const useStore = create<UiState>((set, get) => ({
     });
     if (res.ok) {
       await Promise.all([
-        get().refreshRepoBranches(id),
         get().refreshRepoStatus(id),
-        get().refreshRepoBranchSummaries(id),
+        get().refreshRepoBranchSummaries(id, true),
         get().refreshRepoGraph(id),
       ]);
     }
@@ -1323,7 +1525,31 @@ export const useStore = create<UiState>((set, get) => ({
   },
 
   refreshRepoGraph: async (id) => {
-    const commits = await window.overgit.invoke('repo:graph', { repoId: id, limit: 200 });
+    // Single graph-refresh entry point. Picks the fast HEAD-only
+    // variant when the user's in list mode for this repo, otherwise
+    // the full `--all --topo-order` graph for rail rendering.
+    // Centralizing this here means every HEAD-moving action
+    // (checkout, pull, merge, rebase, amend, undo…) automatically
+    // refreshes with the right shape — without this, list mode kept
+    // getting `--all` data spliced in by mutation handlers and the
+    // user saw extra refs appear and then disappear on tab toggle.
+    //
+    // 100 commits is the sweet spot for "recent history at a glance":
+    // covers a few weeks of activity on most repos without forcing
+    // `git log --all --topo-order` to walk deeper than necessary.
+    // The trunk-set cap in commitGraph() adapts to whatever limit
+    // is in flight, so this is the only knob to twist.
+    const mode = get().settings.historyMode?.[id] ?? 'list';
+    const channel = mode === 'list' ? 'repo:graphFast' : 'repo:graph';
+    const commits = await window.overgit.invoke(channel, { repoId: id, limit: 100 });
+    set({ repoGraph: { ...get().repoGraph, [id]: commits } });
+  },
+
+  refreshRepoGraphFast: async (id) => {
+    // Kept as a direct alias for the HEAD-only variant — used by
+    // HistoryTab's mount effect when it knows it's in list mode and
+    // wants to bypass the mode-lookup in `refreshRepoGraph`.
+    const commits = await window.overgit.invoke('repo:graphFast', { repoId: id, limit: 100 });
     set({ repoGraph: { ...get().repoGraph, [id]: commits } });
   },
 
@@ -1332,14 +1558,30 @@ export const useStore = create<UiState>((set, get) => ({
     set({ repoSquashLinks: { ...get().repoSquashLinks, [id]: links } });
   },
 
+  setRepoHistoryMode: async (id, mode) => {
+    const next: AppSettings = {
+      ...get().settings,
+      historyMode: { ...(get().settings.historyMode ?? {}), [id]: mode },
+    };
+    set({ settings: next });
+    await window.overgit.invoke('store:saveSettings', next);
+  },
+
   refreshRepoFileList: async (id) => {
     const files = await window.overgit.invoke('fs:listRepoFiles', id);
     set({ repoFileList: { ...get().repoFileList, [id]: files } });
   },
 
-  refreshRepoStashes: async (id) => {
-    const stashes = await window.overgit.invoke('repo:listStashes', id);
-    set({ repoStashes: { ...get().repoStashes, [id]: stashes } });
+  refreshRepoStashes: async (id, force = false) => {
+    await cached(
+      `repoStashes:${id}`,
+      5_000,
+      async () => {
+        const stashes = await window.overgit.invoke('repo:listStashes', id);
+        set({ repoStashes: { ...get().repoStashes, [id]: stashes } });
+      },
+      force,
+    );
   },
 
   applyStash: async (id, index, pop) => {
@@ -1351,7 +1593,7 @@ export const useStore = create<UiState>((set, get) => ({
       await Promise.all([
         get().refreshRepoStatus(id),
         get().refreshRepoChanges(id),
-        get().refreshRepoStashes(id),
+        get().refreshRepoStashes(id, true),
       ]);
     }
     return res;
@@ -1367,7 +1609,7 @@ export const useStore = create<UiState>((set, get) => ({
       await Promise.all([
         get().refreshRepoStatus(id),
         get().refreshRepoChanges(id),
-        get().refreshRepoStashes(id),
+        get().refreshRepoStashes(id, true),
       ]);
     }
     return res;
@@ -1375,7 +1617,7 @@ export const useStore = create<UiState>((set, get) => ({
 
   dropStash: async (id, index) => {
     const res = await window.overgit.invoke('repo:dropStash', { repoId: id, index });
-    if (res.ok) await get().refreshRepoStashes(id);
+    if (res.ok) await get().refreshRepoStashes(id, true);
     return res;
   },
 
@@ -1404,8 +1646,8 @@ export const useStore = create<UiState>((set, get) => ({
     await Promise.all([
       get().refreshRepoStatus(id),
       get().refreshRepoChanges(id),
-      get().refreshRepoLog(id),
       get().refreshRepoGraph(id),
+      get().refreshRepoHeadCommit(id, true),
     ]);
     return res;
   },
@@ -1447,8 +1689,8 @@ export const useStore = create<UiState>((set, get) => ({
       await Promise.all([
         get().refreshRepoStatus(id),
         get().refreshRepoChanges(id),
-        get().refreshRepoLog(id),
         get().refreshRepoGraph(id),
+        get().refreshRepoHeadCommit(id, true),
       ]);
     }
     return res;
@@ -1459,8 +1701,8 @@ export const useStore = create<UiState>((set, get) => ({
     await Promise.all([
       get().refreshRepoStatus(id),
       get().refreshRepoChanges(id),
-      get().refreshRepoLog(id),
       get().refreshRepoGraph(id),
+      get().refreshRepoHeadCommit(id, true),
     ]);
     return res;
   },
@@ -1479,8 +1721,8 @@ export const useStore = create<UiState>((set, get) => ({
     await Promise.all([
       get().refreshRepoStatus(id),
       get().refreshRepoChanges(id),
-      get().refreshRepoLog(id),
       get().refreshRepoGraph(id),
+      get().refreshRepoHeadCommit(id, true),
     ]);
     return res;
   },
@@ -1499,8 +1741,8 @@ export const useStore = create<UiState>((set, get) => ({
     await Promise.all([
       get().refreshRepoStatus(id),
       get().refreshRepoChanges(id),
-      get().refreshRepoLog(id),
       get().refreshRepoGraph(id),
+      get().refreshRepoHeadCommit(id, true),
     ]);
     return res;
   },
@@ -1520,14 +1762,15 @@ export const useStore = create<UiState>((set, get) => ({
       message,
     });
     if (res.ok) {
-      // Amend rewrites HEAD; refresh the log + graph so History shows
-      // the new commit, and reset changes since `--amend` typically
-      // consumed the staged set.
+      // Amend rewrites HEAD; refresh the graph so History shows
+      // the new commit, reset changes since `--amend` typically
+      // consumed the staged set, and refresh the head-commit cache
+      // so the Amend toggle subject updates in place.
       await Promise.all([
         get().refreshRepoChanges(id),
         get().refreshRepoStatus(id),
-        get().refreshRepoLog(id),
         get().refreshRepoGraph(id),
+        get().refreshRepoHeadCommit(id, true),
       ]);
     }
     return res;
@@ -1547,7 +1790,7 @@ export const useStore = create<UiState>((set, get) => ({
       await Promise.all([
         get().refreshRepoStatus(id),
         get().refreshRepoChanges(id),
-        get().refreshRepoStashes(id),
+        get().refreshRepoStashes(id, true),
       ]);
     }
     return res;

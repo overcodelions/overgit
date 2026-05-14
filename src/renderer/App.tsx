@@ -295,10 +295,8 @@ function SidebarWithResize(): JSX.Element {
 function useSidebarStatusRefresh(): void {
   const refreshAll = useStore((s) => s.refreshAllRepoStatuses);
   const refreshWsStatus = useStore((s) => s.refreshWorksetStatus);
-  const refreshRepoLog = useStore((s) => s.refreshRepoLog);
   const refreshRepoChanges = useStore((s) => s.refreshRepoChanges);
   const refreshRepoStatus = useStore((s) => s.refreshRepoStatus);
-  const refreshRepoBranches = useStore((s) => s.refreshRepoBranches);
   const loaded = useStore((s) => s.loaded);
 
   useEffect(() => {
@@ -315,17 +313,17 @@ function useSidebarStatusRefresh(): void {
       lastRun = now;
       void refreshAll();
       const { selectedWorksetId: wsId, selectedRepoId: repoId } = useStore.getState();
-      if (wsId) void refreshWsStatus(wsId);
-      /// Re-run the same per-repo refresh fan-out `selectRepo` uses
-      /// (log / changes / status / branches) for the already-open repo
+      // Force past the TTL cache — this is the periodic / focus-driven
+      // refresh whose whole purpose is to catch terminal-side changes
+      // the cache can't predict.
+      if (wsId) void refreshWsStatus(wsId, true);
+      /// Re-run the per-repo refresh fan-out for the already-open repo
       /// so RepoDetail picks up changes made in a terminal while
       /// overgit was backgrounded. Without this, the user has to
       /// deselect and reselect the repo to see new commits or dirty files.
       if (repoId) {
-        void refreshRepoLog(repoId);
         void refreshRepoChanges(repoId);
         void refreshRepoStatus(repoId);
-        void refreshRepoBranches(repoId);
       }
     };
     const onFocus = () => run();
@@ -347,10 +345,8 @@ function useSidebarStatusRefresh(): void {
     loaded,
     refreshAll,
     refreshWsStatus,
-    refreshRepoLog,
     refreshRepoChanges,
     refreshRepoStatus,
-    refreshRepoBranches,
   ]);
 }
 
@@ -496,8 +492,9 @@ function useGlobalShortcuts(): void {
           void refreshRepoStatus(selectedRepoId);
           void refreshRepoChanges(selectedRepoId);
         } else if (selectedWsId) {
-          void refreshWsStatus(selectedWsId);
-          void refreshWsPRs(selectedWsId);
+          // Cmd+R is the explicit refresh shortcut — bypass TTL.
+          void refreshWsStatus(selectedWsId, true);
+          void refreshWsPRs(selectedWsId, true);
         }
         return;
       }
@@ -1687,7 +1684,7 @@ function WorkspaceDetail({ workspaceId }: { workspaceId: UUID }): JSX.Element {
   );
   const repos = useStore((s) => s.repos);
   const repoStatuses = useStore((s) => s.repoStatus);
-  const refreshAllRepoStatuses = useStore((s) => s.refreshAllRepoStatuses);
+  const refreshRepoStatuses = useStore((s) => s.refreshRepoStatuses);
   const runResetWorkspaceFlow = useStore((s) => s.runResetWorkspaceFlow);
   const fetchAllInWorkspace = useStore((s) => s.fetchAllInWorkspace);
   const removeWorkspace = useStore((s) => s.removeWorkspace);
@@ -1695,12 +1692,29 @@ function WorkspaceDetail({ workspaceId }: { workspaceId: UUID }): JSX.Element {
   const setSheet = useStore((s) => s.setSheet);
   const selectRepo = useStore((s) => s.selectRepo);
   const [busy, setBusy] = useState<'reset' | 'fetch' | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const memberIds = useMemo(
+    () => (workspace ? workspace.repoIds : []),
+    [workspace],
+  );
 
   // Refresh statuses on mount so the table is honest the moment the
   // pane opens, not whatever was cached from the last sidebar tick.
+  // Scoped to this workspace's members — refreshing every repo overgit
+  // knows about (archived, other workspaces, worksets) was making a
+  // 19-repo workspace wait on dozens of unrelated status calls.
   useEffect(() => {
-    void refreshAllRepoStatuses();
-  }, [workspaceId, refreshAllRepoStatuses]);
+    if (memberIds.length === 0) return;
+    setRefreshing(true);
+    let cancelled = false;
+    refreshRepoStatuses(memberIds).finally(() => {
+      if (!cancelled) setRefreshing(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [memberIds, refreshRepoStatuses]);
 
   const members = useMemo(() => {
     if (!workspace) return [];
@@ -1775,6 +1789,12 @@ function WorkspaceDetail({ workspaceId }: { workspaceId: UUID }): JSX.Element {
               <span className="text-[11px] uppercase tracking-wider text-ink-faint">
                 Workspace
               </span>
+              {refreshing && (
+                <span className="text-[11px] text-amber-300 flex items-center gap-1.5">
+                  <span className="inline-block h-2.5 w-2.5 rounded-full bg-amber-400 animate-pulse shadow-[0_0_6px_rgba(251,191,36,0.7)]" />
+                  Refreshing…
+                </span>
+              )}
             </div>
             <p className="text-[12px] text-ink-faint mt-1">
               {members.length} {members.length === 1 ? 'repo' : 'repos'} in this
@@ -1954,7 +1974,13 @@ function WorkspaceMemberRow({
         </div>
       </div>
       <div className="text-[12px] text-ink-muted font-mono tabular-nums text-right truncate">
-        {branch ?? <span className="text-amber-300/80">detached</span>}
+        {status === undefined ? (
+          <span className="text-ink-faint">…</span>
+        ) : branch ? (
+          branch
+        ) : (
+          <span className="text-amber-300/80">detached</span>
+        )}
       </div>
       <div
         className={`text-[12px] tabular-nums text-right ${
@@ -1985,6 +2011,7 @@ function WorksetView({ worksetId }: { worksetId: UUID }): JSX.Element {
   const ws = useStore((s) => s.worksets.find((w) => w.id === worksetId));
   const repos = useStore((s) => s.repos);
   const statuses = useStore((s) => s.worksetStatuses[worksetId] ?? EMPTY_STATUSES);
+  const refreshing = useStore((s) => s.worksetRefreshing[worksetId] ?? false);
   const prs = useStore((s) => s.worksetPRs[worksetId] ?? EMPTY_PRS);
   const activity = useStore((s) => s.worksetActivity[worksetId] ?? EMPTY_ACTIVITY);
   const lastSeen = useStore(
@@ -2016,10 +2043,18 @@ function WorksetView({ worksetId }: { worksetId: UUID }): JSX.Element {
   const [seenAtOpen] = useState<string | null>(lastSeen);
 
   useEffect(() => {
+    // Status + worktrees populate visible overview tiles, so kick them
+    // off immediately. PRs and activity feed render below the fold —
+    // defer them so a quick fly-through doesn't pay for fan-outs that
+    // were never going to be looked at. The TTL cache in the store
+    // then collapses repeat-visit refreshes into no-ops anyway.
     refresh(worksetId);
-    refreshPRs(worksetId);
     refreshWorktrees(worksetId);
-    refreshActivity(worksetId);
+    const t = window.setTimeout(() => {
+      refreshPRs(worksetId);
+      refreshActivity(worksetId);
+    }, 250);
+    return () => window.clearTimeout(t);
   }, [refresh, refreshPRs, refreshWorktrees, refreshActivity, worksetId]);
 
   // On unmount (or workset switch), advance lastSeen so the next
@@ -2096,6 +2131,37 @@ function WorksetView({ worksetId }: { worksetId: UUID }): JSX.Element {
     };
   }, [ws?.repoIds.length, statuses, repos]);
 
+  // Merge commits (from worksetActivity) with PRs (from worksetPRs,
+  // already fetched by refreshWorksetPRs) into one timeline. The main
+  // process used to fetch PRs in both endpoints, which doubled the
+  // `gh pr list` calls on every workset open — slow, especially with
+  // many repos. Now PRs flow through a single fetch and the renderer
+  // joins them in.
+  const mergedActivity = useMemo<WorksetActivity[]>(() => {
+    const repoNameById = new Map(repos.map((r) => [r.id, r.name]));
+    const prItems: WorksetActivity[] = [];
+    for (const row of prs) {
+      if (!row.prs) continue;
+      const repoName = repoNameById.get(row.repoId) ?? '';
+      for (const pr of row.prs) {
+        prItems.push({
+          kind: 'pr',
+          repoId: row.repoId,
+          repoName,
+          number: pr.number,
+          title: pr.title,
+          url: pr.url,
+          state: pr.state,
+          author: pr.author,
+          at: pr.updatedAt,
+        });
+      }
+    }
+    return [...activity, ...prItems].sort((a, b) =>
+      a.at < b.at ? 1 : a.at > b.at ? -1 : 0,
+    );
+  }, [activity, prs, repos]);
+
   if (!ws) return <main className="flex-1" />;
 
   const reposById = new Map(repos.map((r) => [r.id, r]));
@@ -2158,6 +2224,12 @@ function WorksetView({ worksetId }: { worksetId: UUID }): JSX.Element {
             <span className="text-[11px] text-ink-faint">
               {ws.repoIds.length} {ws.repoIds.length === 1 ? 'repo' : 'repos'} · CLIs: {cliSummary(cli)}
             </span>
+            {refreshing && (
+              <span className="text-[11px] text-amber-300 inline-flex items-center gap-1.5">
+                <span className="inline-block h-2.5 w-2.5 rounded-full bg-amber-400 animate-pulse shadow-[0_0_6px_rgba(251,191,36,0.7)]" />
+                Refreshing…
+              </span>
+            )}
           </div>
         </div>
         <div className="flex gap-2">
@@ -2285,8 +2357,10 @@ function WorksetView({ worksetId }: { worksetId: UUID }): JSX.Element {
             <button
               disabled={busy}
               onClick={() => {
-                refresh(worksetId);
-                refreshPRs(worksetId);
+                // Manual "Refresh" button — explicit user intent, so
+                // bypass the TTL cache.
+                refresh(worksetId, true);
+                refreshPRs(worksetId, true);
               }}
               className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
             >
@@ -2414,7 +2488,9 @@ function WorksetView({ worksetId }: { worksetId: UUID }): JSX.Element {
         <OverviewTile label="Repos" value={summary.total.toString()} hint={
           summary.loaded < summary.total
             ? `Loading ${summary.loaded}/${summary.total}…`
-            : 'all loaded'
+            : refreshing
+              ? 'Refreshing…'
+              : 'all loaded'
         } />
         <OverviewTile
           label="Dirty"
@@ -2442,22 +2518,37 @@ function WorksetView({ worksetId }: { worksetId: UUID }): JSX.Element {
             tone="warn"
           />
         ) : (
-          <OverviewTile
-            label="Branch spread"
-            value={
-              summary.sortedBranches.length === 0
-                ? '—'
-                : summary.sortedBranches[0][0]
+          (() => {
+            const branchCount = summary.sortedBranches.length;
+            if (branchCount <= 1) {
+              const onlyBranch = summary.sortedBranches[0];
+              const reposOnIt = onlyBranch?.[1] ?? 0;
+              return (
+                <OverviewTile
+                  label="Branch spread"
+                  value={branchCount === 0 ? '—' : onlyBranch![0]}
+                  hint={`${reposOnIt} ${reposOnIt === 1 ? 'repo' : 'repos'}`}
+                  tone="muted"
+                />
+              );
             }
-            hint={
-              summary.sortedBranches.length <= 1
-                ? `${summary.sortedBranches[0]?.[1] ?? 0} ${
-                    (summary.sortedBranches[0]?.[1] ?? 0) === 1 ? 'repo' : 'repos'
-                  }`
-                : `${summary.sortedBranches.length} different branches`
-            }
-            tone={summary.sortedBranches.length > 1 ? 'warn' : 'muted'}
-          />
+            const onTarget = commonBranch
+              ? summary.sortedBranches.find(([b]) => b === commonBranch)?.[1] ?? 0
+              : 0;
+            const offTarget = summary.loaded - onTarget;
+            return (
+              <OverviewTile
+                label="Branch spread"
+                value={`${branchCount} branches`}
+                hint={
+                  commonBranch
+                    ? `${offTarget} of ${summary.loaded} off ${commonBranch}`
+                    : 'no common branch'
+                }
+                tone="warn"
+              />
+            );
+          })()
         )}
       </section>
 
@@ -2567,7 +2658,7 @@ function WorksetView({ worksetId }: { worksetId: UUID }): JSX.Element {
       </section>
 
       <ActivitySection
-        items={activity}
+        items={mergedActivity}
         reposById={reposById}
         seenAtOpen={seenAtOpen}
         onSelectRepo={selectRepo}
@@ -2720,7 +2811,9 @@ function WorksetUnifiedCommit({
   const runRefresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      await refreshWorksetStatus(worksetId);
+      // Explicit refresh path (focus / visibility / manual click) —
+      // bypass TTL so terminal-side changes show up immediately.
+      await refreshWorksetStatus(worksetId, true);
       /// Re-read after the status fan-out so we fetch changes for the
       /// *current* dirty set, not whatever the render-time closure of
       /// `dirtyOnBranch` happened to capture. This is what was missing
@@ -2854,7 +2947,7 @@ function WorksetUnifiedCommit({
       }
       // After running, refresh the workset + per-repo changes so the
       // pane reflects what's left (clean repos drop off the list).
-      await refreshWorksetStatus(worksetId);
+      await refreshWorksetStatus(worksetId, true);
       await Promise.all(
         committable.map((s) => refreshRepoChanges(s.repoId)),
       );
@@ -3635,7 +3728,7 @@ function CheckoutOutcomeRow({
         label: 'created',
         message: 'message' in res ? res.message : undefined,
       });
-      if (worksetId) await refreshWs(worksetId);
+      if (worksetId) await refreshWs(worksetId, true);
     } else {
       setCreatedResult({
         kind: 'done',
@@ -4057,7 +4150,7 @@ function SyncToCommonBranchButton({
                 branch: commonBranch,
               });
               if ('repoId' in res) setOutcome(res);
-              await refresh(worksetId);
+              await refresh(worksetId, true);
             } finally {
               setBusy(false);
             }
