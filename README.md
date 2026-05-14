@@ -83,7 +83,7 @@ overgit is a collaboration between **[Lionel Farr](https://github.com/lionelfarr
 
 Issues, bug reports, and PRs welcome — please open an issue first for anything non-trivial so we can talk about the shape of it.
 
-- [Open an issue](https://github.com/overcodelions/overgit/issues/new) — or email **assistant@codelionsllc.com**
+- [Open an issue](https://github.com/overcodelions/overgit/issues/new) for bugs, features, or questions
 - Read [`CONTRIBUTING.md`](./CONTRIBUTING.md) for dev setup and PR expectations
 - See [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md) before participating
 - Found a security bug? Don't file a public issue — see [`SECURITY.md`](./SECURITY.md)
