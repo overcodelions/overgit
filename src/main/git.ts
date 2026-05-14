@@ -282,6 +282,105 @@ async function mapBounded<T, R>(
   return results;
 }
 
+/// Stream `git <logArgs>` output into `git patch-id --stable` via
+/// native Node child-process pipes, and parse the patch-id lines as
+/// they emit. Critically, the huge `git log -p` output NEVER enters
+/// the JS heap — the OS pipes shovel bytes from one subprocess to the
+/// other and we only buffer patch-id's tiny output (one "<pid> <sha>"
+/// line per commit).
+///
+/// This is what `runWithInput` does NOT do: the old path buffered the
+/// entire log-p stream into a JS string, then wrote that string to
+/// patch-id's stdin in one chunk — both moves block the Electron main
+/// thread on hundreds of MB of patch data, which is exactly what made
+/// every other IPC (workset status, sync, branches) feel glued until
+/// squash detection finished.
+function pipeGitToPatchId(
+  cwd: string,
+  logArgs: string[],
+): Promise<{ ok: boolean; entries: { pid: string; sha: string }[] }> {
+  return new Promise((resolve) => {
+    const logChild = spawn('git', logArgs, { cwd, env: process.env });
+    const pidChild = spawn('git', ['patch-id', '--stable'], {
+      cwd,
+      env: process.env,
+    });
+    let pidStdout = '';
+    let pidStdoutBytes = 0;
+    let logStderr = '';
+    let pidStderr = '';
+    let truncated = false;
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      const entries: { pid: string; sha: string }[] = [];
+      for (const line of pidStdout.split('\n')) {
+        const [pid, sha] = line.trim().split(/\s+/);
+        if (pid && sha) entries.push({ pid, sha });
+      }
+      resolve({ ok: ok && entries.length >= 0, entries });
+    };
+    // Pipe log → patch-id natively. Errors on either pipe are
+    // non-fatal — we just resolve with whatever entries we've parsed.
+    logChild.stdout.pipe(pidChild.stdin).on('error', () => {
+      /* patch-id may have closed early on malformed input; the close
+         handlers below will report the final outcome */
+    });
+    pidChild.stdout.on('data', (b: Buffer) => {
+      if (truncated) return;
+      if (pidStdoutBytes + b.length > MAX_GIT_OUTPUT_BYTES) {
+        truncated = true;
+        try {
+          logChild.kill('SIGTERM');
+          pidChild.kill('SIGTERM');
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+      pidStdoutBytes += b.length;
+      pidStdout += b.toString('utf8');
+    });
+    logChild.stderr.on('data', (b: Buffer) => {
+      logStderr += b.toString('utf8');
+    });
+    pidChild.stderr.on('data', (b: Buffer) => {
+      pidStderr += b.toString('utf8');
+    });
+    let logExited = false;
+    let pidExited = false;
+    let logOk = false;
+    let pidOk = false;
+    logChild.on('close', (code) => {
+      logExited = true;
+      logOk = code === 0;
+      // Close patch-id stdin when log finishes so patch-id flushes.
+      try {
+        pidChild.stdin.end();
+      } catch {
+        /* ignore */
+      }
+      if (pidExited) finish(logOk && pidOk && !truncated);
+    });
+    pidChild.on('close', (code) => {
+      pidExited = true;
+      pidOk = code === 0;
+      if (logExited) finish(logOk && pidOk && !truncated);
+    });
+    logChild.on('error', () => {
+      finish(false);
+    });
+    pidChild.on('error', () => {
+      finish(false);
+    });
+    // Silence unused-var lint; the captured stderr is available for
+    // future logging without changing the resolve shape.
+    void logStderr;
+    void pidStderr;
+  });
+}
+
 /// Run `git <args>` with a string fed to stdin. Used by the squash-merge
 /// detector so we can pipe `git log -p` output into `git patch-id`
 /// without going through a shell (no quoting, no injection surface).
@@ -450,11 +549,28 @@ export async function status(
     };
   }
 
-  const branchRes = await run(repoPath, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  // Status fan-out: HEAD branch, working-tree porcelain, upstream
+  // distance, and diff shortstat are all independent reads of the
+  // same repo state. Running them serially used to dominate
+  // repo-open latency on big repos (each step is 50–500ms of git +
+  // disk I/O). Fire in parallel — wall time is now max(steps), not
+  // sum(steps). Concurrent git pressure is controlled by the outer
+  // fan-out caps (`STATUS_CONCURRENCY=2` in the renderer, `pool(3, …)`
+  // in worksetStatus), not by serializing here.
+  //
+  // Default-branch distance still depends on `branch` (to avoid
+  // comparing HEAD to itself when on the default branch), so that
+  // piece runs after the initial fan-out resolves.
+  const [branchRes, porcelainRes, upstreamRes, shortstatRes] = await Promise.all([
+    run(repoPath, ['rev-parse', '--abbrev-ref', 'HEAD']),
+    run(repoPath, ['status', '--porcelain=v1']),
+    run(repoPath, ['rev-list', '--left-right', '--count', '@{u}...HEAD']),
+    run(repoPath, ['diff', '--shortstat', 'HEAD']),
+  ]);
+
   const rawBranch = branchRes.stdout.trim();
   const branch = rawBranch && rawBranch !== 'HEAD' ? rawBranch : null;
 
-  const porcelainRes = await run(repoPath, ['status', '--porcelain=v1']);
   const dirtyCount = porcelainRes.stdout
     .split('\n')
     .filter((line) => line.trim().length > 0).length;
@@ -485,12 +601,6 @@ export async function status(
   let hasUpstream = false;
   let upstreamGone = false;
   if (branch) {
-    const upstreamRes = await run(repoPath, [
-      'rev-list',
-      '--left-right',
-      '--count',
-      '@{u}...HEAD',
-    ]);
     if (upstreamRes.ok) {
       hasUpstream = true;
       const [b, a] = upstreamRes.stdout.trim().split(/\s+/).map((n) => Number.parseInt(n, 10));
@@ -522,8 +632,10 @@ export async function status(
   if (defaultBranch && branch && branch !== defaultBranch) {
     const remoteRef = `refs/remotes/origin/${defaultBranch}`;
     const localRef = `refs/heads/${defaultBranch}`;
-    const remoteExists = await run(repoPath, ['show-ref', '--verify', '--quiet', remoteRef]);
-    const localExists = await run(repoPath, ['show-ref', '--verify', '--quiet', localRef]);
+    const [remoteExists, localExists] = await Promise.all([
+      run(repoPath, ['show-ref', '--verify', '--quiet', remoteRef]),
+      run(repoPath, ['show-ref', '--verify', '--quiet', localRef]),
+    ]);
     const ref = remoteExists.ok
       ? `origin/${defaultBranch}`
       : localExists.ok
@@ -557,19 +669,16 @@ export async function status(
   // aren't included; that's `git diff` semantics, not a bug.
   let worktreeAdds: number | null = null;
   let worktreeDels: number | null = null;
-  if (branch) {
-    const shortstat = await run(repoPath, ['diff', '--shortstat', 'HEAD']);
-    if (shortstat.ok) {
-      const out = shortstat.stdout;
-      const ins = out.match(/(\d+)\s+insertion/);
-      const del = out.match(/(\d+)\s+deletion/);
-      if (ins || del) {
-        worktreeAdds = ins ? Number.parseInt(ins[1], 10) : 0;
-        worktreeDels = del ? Number.parseInt(del[1], 10) : 0;
-      } else if (/files? changed/.test(out)) {
-        worktreeAdds = 0;
-        worktreeDels = 0;
-      }
+  if (branch && shortstatRes.ok) {
+    const out = shortstatRes.stdout;
+    const ins = out.match(/(\d+)\s+insertion/);
+    const del = out.match(/(\d+)\s+deletion/);
+    if (ins || del) {
+      worktreeAdds = ins ? Number.parseInt(ins[1], 10) : 0;
+      worktreeDels = del ? Number.parseInt(del[1], 10) : 0;
+    } else if (/files? changed/.test(out)) {
+      worktreeAdds = 0;
+      worktreeDels = 0;
     }
   }
 
@@ -721,6 +830,37 @@ export async function listBranches(
   return { local, remote };
 }
 
+/// Resolve a possibly-miscased branch name to its canonical case by
+/// scanning the repo's local heads and `origin/` remote refs. Git
+/// itself treats refs as case-sensitive, but on case-insensitive
+/// filesystems (macOS APFS) and in casual team usage, a user typing
+/// `feature/ib-56` usually means `feature/IB-56`. Returns the actual
+/// ref name when a case-insensitive match exists, else null.
+async function resolveBranchCase(
+  repoPath: string,
+  branch: string,
+): Promise<string | null> {
+  const refs = await run(repoPath, [
+    'for-each-ref',
+    '--format=%(refname)',
+    'refs/heads',
+    'refs/remotes/origin',
+  ]);
+  if (!refs.ok) return null;
+  const target = branch.toLowerCase();
+  for (const line of refs.stdout.split('\n')) {
+    const ref = line.trim();
+    if (!ref) continue;
+    let name = '';
+    if (ref.startsWith('refs/heads/')) name = ref.slice('refs/heads/'.length);
+    else if (ref.startsWith('refs/remotes/origin/')) name = ref.slice('refs/remotes/origin/'.length);
+    else continue;
+    if (name === branch) return name;
+    if (name.toLowerCase() === target) return name;
+  }
+  return null;
+}
+
 /// Try to switch a single repo to `branch`. The four shapes we report
 /// each map to a real, distinct user remediation in the UI:
 /// - `switched`: nothing more to do
@@ -738,37 +878,60 @@ export async function checkoutBranch(
     return { repoId, result: 'error', branch, message: 'Not a git repo' };
   }
 
+  let target = branch;
   const head = await run(repoPath, ['rev-parse', '--abbrev-ref', 'HEAD']);
-  if (head.ok && head.stdout.trim() === branch) {
-    return { repoId, result: 'already-on-branch', branch };
+  if (head.ok && head.stdout.trim() === target) {
+    return { repoId, result: 'already-on-branch', branch: target };
   }
 
   // `show-ref --verify --quiet refs/heads/<branch>` is the cheapest
   // existence test for a local branch. Falls back to a remote-tracking
   // ref so the user can switch to a branch they've fetched but not yet
   // checked out locally.
-  const localExists = await run(repoPath, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`]);
+  let localExists = await run(repoPath, ['show-ref', '--verify', '--quiet', `refs/heads/${target}`]);
   let remoteExists = await run(repoPath, [
     'show-ref',
     '--verify',
     '--quiet',
-    `refs/remotes/origin/${branch}`,
+    `refs/remotes/origin/${target}`,
   ]);
+
+  // Case-insensitive fallback: if neither the typed-case local nor
+  // remote ref exists, look across known refs for a case-insensitive
+  // match and rebind `target` to the canonical name. This catches the
+  // common "user typed `feature/ib-56`, repo has `feature/IB-56`" case
+  // without making git's case-sensitive ref model leak into the UI.
+  if (!localExists.ok && !remoteExists.ok) {
+    const resolved = await resolveBranchCase(repoPath, target);
+    if (resolved && resolved !== target) {
+      target = resolved;
+      if (head.ok && head.stdout.trim() === target) {
+        return { repoId, result: 'already-on-branch', branch: target };
+      }
+      localExists = await run(repoPath, ['show-ref', '--verify', '--quiet', `refs/heads/${target}`]);
+      remoteExists = await run(repoPath, [
+        'show-ref',
+        '--verify',
+        '--quiet',
+        `refs/remotes/origin/${target}`,
+      ]);
+    }
+  }
 
   // Cache miss: ask the actual remote whether it has this branch. A
   // freshly-added repo has no remote-tracking refs until something is
   // fetched, so without this probe a workset checkout would falsely
   // report `missing-branch` for a branch that exists on origin.
   if (!localExists.ok && !remoteExists.ok) {
-    const ls = await run(repoPath, ['ls-remote', '--heads', 'origin', branch], undefined, NETWORK_TIMEOUT_MS);
+    const ls = await run(repoPath, ['ls-remote', '--heads', 'origin', target], undefined, NETWORK_TIMEOUT_MS);
     if (ls.ok && ls.stdout.trim().length > 0) {
-      const fetchRes = await run(repoPath, ['fetch', 'origin', branch], undefined, NETWORK_TIMEOUT_MS);
+      const fetchRes = await run(repoPath, ['fetch', 'origin', target], undefined, NETWORK_TIMEOUT_MS);
       if (fetchRes.ok) {
         remoteExists = await run(repoPath, [
           'show-ref',
           '--verify',
           '--quiet',
-          `refs/remotes/origin/${branch}`,
+          `refs/remotes/origin/${target}`,
         ]);
       }
     }
@@ -776,11 +939,11 @@ export async function checkoutBranch(
 
   if (!localExists.ok && !remoteExists.ok) {
     if (!createIfMissing) {
-      return { repoId, result: 'missing-branch', branch };
+      return { repoId, result: 'missing-branch', branch: target };
     }
-    const create = await run(repoPath, ['checkout', '-b', branch]);
-    if (create.ok) return { repoId, result: 'switched', branch };
-    return classifyFailure(repoId, branch, create);
+    const create = await run(repoPath, ['checkout', '-b', target]);
+    if (create.ok) return { repoId, result: 'switched', branch: target };
+    return classifyFailure(repoId, target, create);
   }
 
   // `git switch` refuses to clobber local changes; that's exactly what we
@@ -793,10 +956,10 @@ export async function checkoutBranch(
   // name only resolves to the remote-tracking ref via DWIM. Be explicit
   // with `origin/<branch>` so git doesn't bail with "invalid reference".
   const switchRes = localExists.ok
-    ? await run(repoPath, ['switch', branch])
-    : await run(repoPath, ['switch', '-c', branch, '--track', `origin/${branch}`]);
-  if (switchRes.ok) return { repoId, result: 'switched', branch };
-  return classifyFailure(repoId, branch, switchRes);
+    ? await run(repoPath, ['switch', target])
+    : await run(repoPath, ['switch', '-c', target, '--track', `origin/${target}`]);
+  if (switchRes.ok) return { repoId, result: 'switched', branch: target };
+  return classifyFailure(repoId, target, switchRes);
 }
 
 /// Move a linked worktree's branch into the main checkout. Optionally
@@ -1063,6 +1226,32 @@ export async function fetch(repoPath: string): Promise<{ ok: boolean; error?: st
 // on \x1f stays predictable even when the body contains the field
 // separator (it shouldn't, but `%b` is the only multi-line field).
 const LOG_FORMAT = '%H%x1f%h%x1f%P%x1f%s%x1f%an%x1f%ae%x1f%aI%x1f%b%x1e';
+
+/// Cheap "what is HEAD pointing at" lookup for the Changes-tab Amend
+/// toggle. A full graph fetch is ~50–500ms on big repos because of the
+/// `--all --topo-order` walk plus the trunk-set scan plus lane layout;
+/// this single `git log -1` shaves all of that when the user only
+/// needs the most recent commit's metadata.
+export async function headCommit(repoPath: string): Promise<Commit | null> {
+  if (!looksLikeRepo(repoPath)) return null;
+  const res = await run(repoPath, ['log', '-1', `--pretty=format:${LOG_FORMAT}`]);
+  if (!res.ok) return null;
+  const record = res.stdout.split('\x1e')[0]?.replace(/^\s+|\s+$/g, '') ?? '';
+  if (!record) return null;
+  const [sha, shortSha, parents, subject, author, authorEmail, date, body] =
+    record.split('\x1f');
+  if (!sha) return null;
+  return {
+    sha,
+    shortSha: shortSha ?? sha.slice(0, 7),
+    parents: parents ? parents.split(' ').filter(Boolean) : [],
+    subject: subject ?? '',
+    author: author ?? '',
+    authorEmail: authorEmail ?? '',
+    date: date ?? '',
+    body: (body ?? '').trim(),
+  };
+}
 
 export async function log(repoPath: string, limit = 50): Promise<Commit[]> {
   if (!looksLikeRepo(repoPath)) return [];
@@ -2821,46 +3010,42 @@ async function detectSquashMerges(
     ? (oldestRes.stdout.split('\n').find((l) => l.trim()) ?? candidates[0].mergeBase)
     : candidates[0].mergeBase;
 
-  const trunkLog = await run(repoPath, [
+  // Stream `git log -p ...` directly into `git patch-id` via native
+  // OS pipes (see `pipeGitToPatchId`). The huge patch stream never
+  // enters JS memory, which is what used to lock up the main thread
+  // and stall every other IPC for ~30-60s on a busy repo. With
+  // streaming we can afford a larger window — 500 first-parent
+  // commits covers weeks/months of trunk activity on most repos and
+  // catches old squash absorbers again without the responsiveness hit.
+  const patchIdToSha = new Map<string, string>();
+  const piped = await pipeGitToPatchId(repoPath, [
     'log',
     '-p',
     '--first-parent',
     '--no-merges',
+    '--max-count=500',
     '--format=commit %H',
     `${oldestMergeBase}..${trunkRef}`,
   ]);
-  const patchIdToSha = new Map<string, string>();
-  if (trunkLog.ok && trunkLog.stdout.length > 0) {
-    const pidRes = await runWithInput(repoPath, ['patch-id', '--stable'], trunkLog.stdout);
-    if (pidRes.ok) {
-      for (const line of pidRes.stdout.split('\n')) {
-        const [pid, sha] = line.trim().split(/\s+/);
-        if (pid && sha) patchIdToSha.set(pid, sha);
-      }
-    }
-  }
+  for (const { pid, sha } of piped.entries) patchIdToSha.set(pid, sha);
 
-  // Per-candidate patch-id matching, also bounded to 4-wide.
+  // Per-candidate patch-id matching, also bounded to 4-wide. Each
+  // candidate streams its own `git diff <merge-base>..<tip>` directly
+  // into `git patch-id` — same native-pipe pattern as the trunk-log
+  // path, so no per-candidate diff (potentially MB on a substantial
+  // feature branch) ever lands in JS memory. Without this, even with
+  // the trunk-log fix, the per-candidate loop alone could allocate
+  // hundreds of MB of strings across 4 concurrent workers and stall
+  // every other IPC for the duration.
   return mapBounded(candidates, 4, async (c) => {
     let absorbingSha: string | null = null;
     if (patchIdToSha.size > 0) {
-      const diff = await run(
-        repoPath,
-        ['diff', `${c.mergeBase}..${c.sha}`],
-        undefined,
-        PER_OP_TIMEOUT_MS,
-      );
-      if (diff.ok && diff.stdout.length > 0) {
-        const pidRes = await runWithInput(
-          repoPath,
-          ['patch-id', '--stable'],
-          diff.stdout,
-        );
-        if (pidRes.ok) {
-          const pid = pidRes.stdout.trim().split(/\s+/)[0];
-          if (pid) absorbingSha = patchIdToSha.get(pid) ?? null;
-        }
-      }
+      const piped = await pipeGitToPatchId(repoPath, [
+        'diff',
+        `${c.mergeBase}..${c.sha}`,
+      ]);
+      const pid = piped.entries[0]?.pid;
+      if (pid) absorbingSha = patchIdToSha.get(pid) ?? null;
     }
     return { branchName: c.name, branchSha: c.sha, absorbingSha, trunkTipSha };
   });
@@ -3138,6 +3323,84 @@ export async function renameBranch(
 
 const GRAPH_FORMAT = '%H%x1f%h%x1f%P%x1f%s%x1f%an%x1f%ae%x1f%aI%x1f%D%x1f%b%x1e';
 
+/// Fast / List-mode variant of `commitGraph`. Drops `--all`,
+/// `--topo-order`, and the trunk-set rev-list. When a `defaultBranch`
+/// is supplied AND the current HEAD isn't on it, the result is scoped
+/// to commits unique to the current branch (`git log <default>..HEAD`)
+/// — what every PR-review tool defaults to showing. On the default
+/// branch itself (or when default can't be resolved), falls back to
+/// flat `git log -N` since "branch-only" of master vs master is empty.
+///
+/// All commits come back with lane=0 / parentLanes=[0, …] since the
+/// renderer hides the rail in list mode anyway.
+export async function commitGraphFast(
+  repoPath: string,
+  defaultBranch?: string,
+  limit = 100,
+): Promise<GraphCommit[]> {
+  if (!looksLikeRepo(repoPath)) return [];
+  const lim = Math.max(1, Math.min(limit, 200));
+
+  // Decide the log range. We try `origin/<default>..HEAD` first
+  // because the up-to-date remote tracking ref is what the user
+  // actually compares against in PR review (local default may lag).
+  // Fall through to the local default ref, then to a plain
+  // HEAD-only log when none of the above resolves or when HEAD is
+  // already on the default branch.
+  const args: string[] = ['log', `-${lim}`, `--pretty=format:${GRAPH_FORMAT}`];
+  if (defaultBranch) {
+    const headRes = await run(repoPath, ['rev-parse', '--abbrev-ref', 'HEAD']);
+    const headBranch = headRes.ok ? headRes.stdout.trim() : '';
+    if (headBranch && headBranch !== defaultBranch && headBranch !== 'HEAD') {
+      const candidates = [`origin/${defaultBranch}`, defaultBranch];
+      let chosenRange: string | null = null;
+      for (const ref of candidates) {
+        const verify = await run(repoPath, [
+          'rev-parse',
+          '--verify',
+          '--quiet',
+          ref,
+        ]);
+        if (verify.ok) {
+          chosenRange = `${ref}..HEAD`;
+          break;
+        }
+      }
+      if (chosenRange) args.push(chosenRange);
+    }
+  }
+
+  const res = await run(repoPath, args);
+  if (!res.ok) return [];
+  const out: GraphCommit[] = [];
+  for (const record of res.stdout.split('\x1e')) {
+    const t = record.replace(/^\s+|\s+$/g, '');
+    if (!t) continue;
+    const [sha, shortSha, parents, subject, author, authorEmail, date, refs, body] =
+      t.split('\x1f');
+    if (!sha) continue;
+    const parentShas = parents ? parents.split(' ').filter(Boolean) : [];
+    out.push({
+      sha,
+      shortSha: shortSha ?? sha.slice(0, 7),
+      parents: parentShas,
+      subject: subject ?? '',
+      author: author ?? '',
+      authorEmail: authorEmail ?? '',
+      date: date ?? '',
+      body: (body ?? '').trim(),
+      refs: refs
+        ? refs.split(',').map((r) => r.trim()).filter(Boolean)
+        : [],
+      // Single-lane placeholder. The full `commitGraph` call that
+      // races alongside this one will overwrite with real lane data.
+      lane: 0,
+      parentLanes: parentShas.map(() => 0),
+    });
+  }
+  return out;
+}
+
 /// Build a small commit graph for the branch visualization. Pulls
 /// `git log --all --topo-order` and lays the commits onto vertical lanes
 /// so the UI can draw a left-rail graph with branch labels.
@@ -3207,9 +3470,16 @@ export async function commitGraph(
         ? defaultBranch
         : null;
     if (trunkRef) {
+      // Only commits inside `parsed` can be pinned to lane 0, so
+      // there's no point walking trunk's full first-parent chain on a
+      // monorepo with 100K+ commits on main — that single rev-list
+      // dominated graph latency on big repos. Cap to roughly the
+      // depth of the parsed graph (with a small buffer so the trunk
+      // ref's own head is always included).
       const chain = await run(repoPath, [
         'rev-list',
         '--first-parent',
+        `--max-count=${Math.max(200, parsed.length) + 32}`,
         trunkRef,
       ]);
       if (chain.ok) {

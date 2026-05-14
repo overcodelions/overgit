@@ -75,19 +75,15 @@ function explainForRowAction(
 /// because all of them apply regardless of which tab is active.
 export function RepoDetail({ repoId }: { repoId: UUID }): JSX.Element {
   const repo = useStore((s) => s.repos.find((r) => r.id === repoId));
-  const refreshLog = useStore((s) => s.refreshRepoLog);
   const refreshChanges = useStore((s) => s.refreshRepoChanges);
   const refreshStatus = useStore((s) => s.refreshRepoStatus);
-  const refreshBranches = useStore((s) => s.refreshRepoBranches);
 
   const [tab, setTab] = useState<Tab>('changes');
 
   useEffect(() => {
-    refreshLog(repoId);
     refreshChanges(repoId);
     refreshStatus(repoId);
-    refreshBranches(repoId);
-  }, [refreshLog, refreshChanges, refreshStatus, refreshBranches, repoId]);
+  }, [refreshChanges, refreshStatus, repoId]);
 
   if (!repo) return <main className="flex-1" />;
 
@@ -660,15 +656,16 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
   const stashFilesAction = useStore((s) => s.stashFiles);
   const pushToast = useStore((s) => s.pushToast);
   const requestConfirm = useStore((s) => s.requestConfirm);
-  // Last commit — pulled from the graph (already cached for History)
-  // so this doesn't trigger an extra IPC call.
-  const lastCommit = useStore((s) => s.repoGraph[repoId]?.[0]);
-  const refreshGraph = useStore((s) => s.refreshRepoGraph);
-  // Make sure the graph is loaded so the Amend toggle has a target
-  // commit to show. Cheap to call when already cached.
+  // Last commit — fetched via a dedicated `git log -1` IPC rather than
+  // sourcing from `repoGraph[0]`. Pulling from the graph forced a full
+  // `git log --all --topo-order` + trunk-set scan + lane layout on
+  // every initial Changes-tab open just to render one shortSha in the
+  // Amend toggle; the dedicated call is milliseconds even on big repos.
+  const lastCommit = useStore((s) => s.repoHeadCommit[repoId]);
+  const refreshHeadCommit = useStore((s) => s.refreshRepoHeadCommit);
   useEffect(() => {
-    if (!lastCommit) refreshGraph(repoId);
-  }, [lastCommit, refreshGraph, repoId]);
+    if (lastCommit === undefined) refreshHeadCommit(repoId);
+  }, [lastCommit, refreshHeadCommit, repoId]);
 
   // Stashing prompts inline via the FileGroup bar (Electron renderers
   // refuse window.prompt). The message is optional — empty string ⇒
@@ -3850,7 +3847,19 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
   const graphLoaded = useStore((s) => s.repoGraph[repoId] !== undefined);
   const squashLinks = useStore((s) => s.repoSquashLinks[repoId] ?? EMPTY_SQUASH_LINKS);
   const refreshGraph = useStore((s) => s.refreshRepoGraph);
+  const refreshGraphFast = useStore((s) => s.refreshRepoGraphFast);
   const refreshSquashLinks = useStore((s) => s.refreshRepoSquashLinks);
+  // Per-repo History view mode. Default 'list' — the rail is
+  // informative on smaller repos but on a busy repo it pegs CPU
+  // and clutters the row with lanes the user usually isn't tracking
+  // visually. Branch refs + commit subjects already convey 95% of
+  // what the lanes show. Users can flip to 'graph' per-repo when
+  // they want the visual topology.
+  const historyMode = useStore(
+    (s) => s.settings.historyMode?.[repoId] ?? 'list',
+  );
+  const setHistoryMode = useStore((s) => s.setRepoHistoryMode);
+  const isList = historyMode === 'list';
   const refreshDiff = useStore((s) => s.refreshRepoDiff);
   const diffEntry = useStore((s) => s.repoDiff[repoId]);
   const asideWidth = useStore((s) => s.settings.historyAsideWidth);
@@ -3878,19 +3887,100 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
   const [menu, setMenu] = useState<{ sha: string; x: number; y: number } | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
 
+  // Clicking a branch ref badge narrows the visible commits to ones
+  // whose subject/sha/author/ref matches that name — see
+  // `filteredCommits` which already greps refs.toLowerCase() against
+  // the filter. We strip any leading `origin/` so clicking
+  // `origin/master` also matches the local `master` ref on the same
+  // commit (typical case after a fetch).
+  const onFilterRef = useCallback((ref: string) => {
+    const trimmed = ref.replace(/^origin\//, '');
+    setFilter(trimmed);
+  }, []);
+
+  // Clicking a tag badge copies the tag name to the clipboard.
+  // Filtering would just show that one commit (tags = single ref),
+  // so the more useful action is "give me the name to paste into a
+  // checkout / release notes". Toasts on success so the click has
+  // visible feedback.
+  const onCopyTag = useCallback(
+    (tag: string) => {
+      navigator.clipboard
+        .writeText(tag)
+        .then(() => {
+          pushToast({ kind: 'success', message: `Copied "${tag}"` });
+        })
+        .catch(() => {
+          pushToast({ kind: 'error', message: `Could not copy "${tag}"` });
+        });
+    },
+    [pushToast],
+  );
+
   // Keep squash-link state co-resident with the rest of the tab's
   // mount work, but don't block on it. The graph paints from
   // `commits` alone; squash connectors stream in separately.
   const haveSquashLinks = useStore(
     (s) => s.repoSquashLinks[repoId] !== undefined,
   );
+  // Mount-tied refreshes: keyed on repoId only so they don't re-fire
+  // (and clobber the user's selection / filter) when other deps in
+  // this view churn — most notably `haveSquashLinks`, which flips
+  // from false to true the moment squash detection completes.
+  // `historyMode` IS a dep because flipping graph↔list needs to
+  // re-fetch with the appropriate IPC (full vs HEAD-only log).
   useEffect(() => {
-    refreshGraph(repoId);
-    if (!haveSquashLinks) refreshSquashLinks(repoId);
+    if (isList) {
+      refreshGraphFast(repoId);
+    } else {
+      refreshGraph(repoId);
+    }
     refreshDiff(repoId, undefined);
     setSelected('working');
     setFilter('');
-  }, [refreshGraph, refreshSquashLinks, refreshDiff, repoId, haveSquashLinks]);
+  }, [refreshGraph, refreshGraphFast, refreshDiff, repoId, isList]);
+
+  // Re-fetch the graph when HEAD moves (branch switch, pull, reset,
+  // amend, etc.) so the History list reflects the new branch
+  // immediately. Without this, switching branches while sitting on
+  // History showed stale commits until the user clicked off and back.
+  // `repoStatus.branch` flips synchronously after checkoutRepo's
+  // status refresh completes; gating on that (rather than re-running
+  // on every status tick) keeps the IPC count low. Selection / filter
+  // intentionally NOT reset here — only the graph data refreshes, so
+  // a user who'd scrolled or typed a filter keeps their place.
+  const headBranch = repoStatus?.branch ?? null;
+  useEffect(() => {
+    if (headBranch === null) return;
+    if (isList) {
+      refreshGraphFast(repoId);
+    } else {
+      refreshGraph(repoId);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [headBranch]);
+
+  // Squash-merge link detection is off by default — even with the
+  // native-pipe streaming fix it still spawns dozens of concurrent
+  // git subprocesses (cherry/merge-base/diff/patch-id per branch) and
+  // those compete with foreground IPCs (branches, stash, workset
+  // status) for CPU for the 15-25s it runs in the background. On
+  // big repos this made History the single biggest perceived
+  // "everything got slow" trigger. The advisory dashed connectors it
+  // produces are useful for prune-flow context, not load-bearing for
+  // the History view itself — so users opt in via
+  // `settings.detectSquashMerges` rather than paying the cost on
+  // every History tab open.
+  const detectSquash = useStore((s) => s.settings.detectSquashMerges ?? false);
+  useEffect(() => {
+    if (isList) return; // no rail → no squash connectors to draw
+    if (!detectSquash) return;
+    if (haveSquashLinks) return;
+    const t = window.setTimeout(() => {
+      refreshSquashLinks(repoId);
+    }, 600);
+    return () => window.clearTimeout(t);
+  }, [refreshSquashLinks, repoId, haveSquashLinks, detectSquash, isList]);
 
   const filteredCommits = useMemo(() => {
     const q = filter.trim().toLowerCase();
@@ -3918,8 +4008,15 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
     [filteredCommits],
   );
   // Add half a lane of slack so the dashed squash-merge connector's
-  // control point doesn't get clipped at the right edge.
-  const railWidth = Math.max(RAIL_BASE_WIDTH, PADDING_X * 2 + (maxLane + 1.5) * LANE_WIDTH);
+  // control point doesn't get clipped at the right edge. In list
+  // mode the rail isn't rendered at all, so width collapses to 0.
+  const railWidth = isList
+    ? 0
+    : Math.max(RAIL_BASE_WIDTH, PADDING_X * 2 + (maxLane + 1.5) * LANE_WIDTH);
+  // Row inset on the left. In graph mode the rail occupies this
+  // space; in list mode we still want a bit of breathing room so
+  // rows don't hug the resizer / pane edge.
+  const rowPaddingLeft = isList ? 12 : railWidth;
 
   const headSha = useMemo(() => {
     const head = commits.find((c) => c.refs.some((r) => r.startsWith('HEAD')));
@@ -4044,6 +4141,36 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
               ✕
             </button>
           )}
+          {/* Graph / List toggle. Persisted per-repo. List drops the
+              rail SVG and uses HEAD-only `git log` instead of
+              `git log --all --topo-order`, which is the difference
+              between a snappy History tab on a big repo and one
+              that pegs CPU for seconds. Default 'graph' to preserve
+              existing behavior on repos where the rail is useful. */}
+          <div className="flex items-center text-[10px] rounded border border-card overflow-hidden">
+            <button
+              onClick={() => setHistoryMode(repoId, 'graph')}
+              className={`px-2 py-1 ${
+                !isList
+                  ? 'bg-card text-ink'
+                  : 'text-ink-muted hover:text-ink hover:bg-card/60'
+              }`}
+              title="Show branch graph rail (slower on big repos)"
+            >
+              Graph
+            </button>
+            <button
+              onClick={() => setHistoryMode(repoId, 'list')}
+              className={`px-2 py-1 border-l border-card ${
+                isList
+                  ? 'bg-card text-ink'
+                  : 'text-ink-muted hover:text-ink hover:bg-card/60'
+              }`}
+              title="Flat list, HEAD-only history (faster on big repos)"
+            >
+              List
+            </button>
+          </div>
         </div>
 
         {/* Scroll container. Rows + overlay SVG share this so the
@@ -4070,7 +4197,7 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
                 className={`w-full text-left flex items-center gap-2 text-xs border-b border-card relative z-10 ${
                   selected === 'working' ? 'bg-accent text-white' : 'hover:bg-card'
                 }`}
-                style={{ height: ROW_HEIGHT, paddingLeft: railWidth, paddingRight: 12 }}
+                style={{ height: ROW_HEIGHT, paddingLeft: rowPaddingLeft, paddingRight: 12 }}
               >
                 <span className="font-medium truncate">Working tree</span>
                 <span
@@ -4097,14 +4224,21 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
                     onContextMenu={(e) => openContextMenu(e, c.sha)}
                     style={{
                       height: ROW_HEIGHT,
-                      paddingLeft: railWidth,
+                      paddingLeft: rowPaddingLeft,
                       paddingRight: 12,
                     }}
                     className={`w-full text-left flex items-center gap-2 text-xs border-b border-card relative z-10 ${
                       active ? 'bg-accent text-white' : 'hover:bg-card'
                     }`}
                   >
-                    <CommitGraphRow commit={c} active={active} isHead={isHead} />
+                    <CommitGraphRow
+                      commit={c}
+                      active={active}
+                      isHead={isHead}
+                      onFilterRef={onFilterRef}
+                      onCopyTag={onCopyTag}
+                      hideTags={isList}
+                    />
                   </button>
                 </Explain>
               );
@@ -4156,6 +4290,7 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
               </div>
             )}
 
+            {!isList && (
             <svg
               width={railWidth}
               height={totalHeight}
@@ -4265,6 +4400,7 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
                 );
               })}
             </svg>
+            )}
           </div>
         </div>
       </aside>
@@ -4555,18 +4691,38 @@ function CommitGraphRow({
   commit,
   active,
   isHead,
+  onFilterRef,
+  onCopyTag,
+  hideTags,
 }: {
   commit: GraphCommit;
   active: boolean;
   isHead: boolean;
+  onFilterRef?: (ref: string) => void;
+  onCopyTag?: (tag: string) => void;
+  /// Drop `tag: …` entries from the row's ref badges. Set in list
+  /// mode where release-build tags can dominate every row and bury
+  /// the actually-useful branch refs. The tags are still reachable
+  /// in graph mode and (eventually) in the CommitDetail pane.
+  hideTags?: boolean;
 }): JSX.Element {
   const ago = useMemo(() => relativeOrAbsolute(commit.date), [commit.date]);
   // Refs minus the bare "HEAD" / "HEAD -> X" entries — those are
-  // represented by the HEAD pill so we don't double-up.
-  const branchRefs = useMemo(
-    () => commit.refs.filter((r) => !r.startsWith('HEAD')),
-    [commit.refs],
-  );
+  // represented by the HEAD pill so we don't double-up. Branch refs
+  // sort before tag refs so a 3-slot slice doesn't bury an
+  // origin/branch behind three release tags.
+  const branchRefs = useMemo(() => {
+    const kept = commit.refs.filter((r) => {
+      if (r.startsWith('HEAD')) return false;
+      if (hideTags && r.startsWith('tag: ')) return false;
+      return true;
+    });
+    return kept.sort((a, b) => {
+      const aTag = a.startsWith('tag: ') ? 1 : 0;
+      const bTag = b.startsWith('tag: ') ? 1 : 0;
+      return aTag - bTag;
+    });
+  }, [commit.refs, hideTags]);
   return (
     <>
       {isHead && (
@@ -4581,7 +4737,13 @@ function CommitGraphRow({
         </span>
       )}
       {branchRefs.length > 0 && (
-        <RefBadges refs={branchRefs} laneColor={laneColor(commit.lane)} active={active} />
+        <RefBadges
+          refs={branchRefs}
+          laneColor={laneColor(commit.lane)}
+          active={active}
+          onFilterRef={onFilterRef}
+          onCopyTag={onCopyTag}
+        />
       )}
       <span
         className={`truncate flex-1 min-w-0 ${active ? 'font-medium' : ''}`}
@@ -4641,30 +4803,85 @@ function RefBadges({
   refs,
   laneColor,
   active,
+  onFilterRef,
+  onCopyTag,
 }: {
   refs: string[];
   laneColor: string;
   active: boolean;
+  /// Click handler for branch refs (origin/master, feature/IB-56,
+  /// etc.). Receives the ref name and is expected to narrow the
+  /// history list to commits that mention it — typically by setting
+  /// the filter input. Optional so non-history call sites (e.g. the
+  /// CommitDetail pane) can omit it and get static badges.
+  onFilterRef?: (ref: string) => void;
+  /// Click handler for tag refs. Receives the tag name (without
+  /// the `tag: ` prefix) — typically copies it to the clipboard
+  /// since a tag points to exactly one commit and filtering to it
+  /// would just show that single row.
+  onCopyTag?: (tag: string) => void;
 }): JSX.Element {
   return (
     <div className="flex gap-1 flex-shrink-0">
       {refs.slice(0, 3).map((r) => {
         const clean = r.replace(/^HEAD -> /, '');
         const isHead = r.startsWith('HEAD');
+        const isTag = r.startsWith('tag: ');
+        const tagName = isTag ? r.slice('tag: '.length) : '';
+        const clickable =
+          (isTag && onCopyTag) || (!isHead && !isTag && onFilterRef);
+        const onClick = (e: React.MouseEvent) => {
+          if (!clickable) return;
+          // Stop propagation so clicking a ref inside a row doesn't
+          // also "select" the row — that would scroll the diff pane
+          // and lose the user's place when they just wanted to filter.
+          e.stopPropagation();
+          if (isTag && onCopyTag) onCopyTag(tagName);
+          else if (!isHead && onFilterRef) onFilterRef(clean);
+        };
+        const baseClass =
+          'px-1.5 py-0.5 rounded text-[9px] font-mono leading-none';
+        const style: React.CSSProperties = {
+          background: active
+            ? 'rgba(255,255,255,0.18)'
+            : `color-mix(in srgb, ${laneColor} 22%, transparent)`,
+          border: `1px solid color-mix(in srgb, ${laneColor} 50%, transparent)`,
+          color: active ? '#fff' : isHead ? laneColor : 'var(--c-ink-muted)',
+          fontWeight: isHead ? 600 : 400,
+        };
+        if (clickable) {
+          // <span> not <button> here because the badge sits inside
+          // the row's clickable <button> (commit row picker) — nested
+          // buttons are invalid HTML and React's validateDOMNesting
+          // warns + click handling gets flaky. role="button" +
+          // keydown handler gives the same accessibility surface
+          // without the nesting.
+          return (
+            <span
+              key={r}
+              role="button"
+              tabIndex={0}
+              onClick={onClick}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  onClick(e as unknown as React.MouseEvent);
+                }
+              }}
+              className={`${baseClass} hover:brightness-125 cursor-pointer transition-[filter] select-none`}
+              style={style}
+              title={
+                isTag
+                  ? `Copy tag "${tagName}" to clipboard`
+                  : `Filter history to "${clean}"`
+              }
+            >
+              {clean}
+            </span>
+          );
+        }
         return (
-          <span
-            key={r}
-            className="px-1.5 py-0.5 rounded text-[9px] font-mono leading-none"
-            style={{
-              background: active
-                ? 'rgba(255,255,255,0.18)'
-                : `color-mix(in srgb, ${laneColor} 22%, transparent)`,
-              border: `1px solid color-mix(in srgb, ${laneColor} 50%, transparent)`,
-              color: active ? '#fff' : isHead ? laneColor : 'var(--c-ink-muted)',
-              fontWeight: isHead ? 600 : 400,
-            }}
-            title={r}
-          >
+          <span key={r} className={baseClass} style={style} title={r}>
             {clean}
           </span>
         );
