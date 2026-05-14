@@ -39,7 +39,6 @@ export function BranchPicker({ repoId, anchorRef, initialMode, onClose }: Props)
   const refresh = useStore((s) => s.refreshRepoBranchSummaries);
   const checkout = useStore((s) => s.checkoutRepo);
   const create = useStore((s) => s.createRepoBranch);
-  const refreshBranches = useStore((s) => s.refreshRepoBranches);
   const pushToast = useStore((s) => s.pushToast);
   const requestConfirm = useStore((s) => s.requestConfirm);
 
@@ -215,7 +214,6 @@ export function BranchPicker({ repoId, anchorRef, initialMode, onClose }: Props)
         return false;
       }
       await refresh(repoId);
-      await refreshBranches(repoId);
       return true;
     } finally {
       setBusy(false);
@@ -288,7 +286,6 @@ export function BranchPicker({ repoId, anchorRef, initialMode, onClose }: Props)
         return;
       }
       await refresh(repoId);
-      await refreshBranches(repoId);
       onClose();
     } finally {
       setBusy(false);
