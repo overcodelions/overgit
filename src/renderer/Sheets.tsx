@@ -2636,14 +2636,26 @@ function ResetWorkspaceProgressSheet({
     return init;
   });
   const [allDone, setAllDone] = useState(false);
-  /// Tracks whether the user closed the sheet mid-flight. We can't
-  /// abort the in-flight IPC calls (each one is a sequence of git
-  /// processes that already started), but we can stop scheduling
-  /// new ones and avoid a toast for a flow the user walked away from.
+  /// Tracks whether the user explicitly cancelled (via Esc, overlay
+  /// click, or "Close" once finished). We can't abort the in-flight
+  /// IPC calls (each one is a sequence of git processes that already
+  /// started), but we can stop scheduling new ones and skip the
+  /// completion toast for a flow the user walked away from.
   const cancelledRef = useRef(false);
+  /// Set when the user clicks "Run in background". Distinct from
+  /// cancellation — workers keep running, we just close the sheet.
+  /// Completion toast then fires from the loop directly (since the
+  /// React `allDone` effect won't run after unmount).
+  const backgroundRef = useRef(false);
+  /// Buffer the workspace name at effect-creation time so the
+  /// background-completion toast (which fires after the component
+  /// has unmounted) can still name the workspace correctly.
+  const workspaceName = workspace?.name ?? 'workspace';
 
   // Kick off the loop exactly once on mount. Closing the sheet flips
-  // `cancelledRef` so the loop bails after the in-flight calls land.
+  // `cancelledRef` so the loop bails after the in-flight calls land —
+  // unless the user clicked "Run in background", in which case the
+  // workers continue and toast directly when finished.
   // NOTE: React StrictMode runs effects twice in dev (mount → cleanup
   // → mount), so we reset cancelledRef at the START of each effect
   // run. Without that, the first cleanup pinned cancelled=true and the
@@ -2651,11 +2663,17 @@ function ResetWorkspaceProgressSheet({
   // bailed silently — rows sat in 'running' forever.
   useEffect(() => {
     cancelledRef.current = false;
+    backgroundRef.current = false;
     if (repoIds.length === 0) {
       setAllDone(true);
       return;
     }
     let cursor = 0;
+    // Track outcomes in a closure too. `setRows` updates are no-ops
+    // once the sheet unmounts (background mode), so we can't read the
+    // final tally back out of React state — keep our own copy for the
+    // background-completion toast.
+    const outcomes: WorksetResetOutcome[] = [];
     const worker = async () => {
       while (true) {
         if (cancelledRef.current) return;
@@ -2666,23 +2684,23 @@ function ResetWorkspaceProgressSheet({
         try {
           const outcome = await resetRepoToDefault(id);
           if (cancelledRef.current) return;
+          outcomes.push(outcome);
           setRows((prev) => ({
             ...prev,
             [id]: { phase: 'done', outcome },
           }));
         } catch (err) {
           if (cancelledRef.current) return;
+          const outcome: WorksetResetOutcome = {
+            repoId: id,
+            defaultBranch: null,
+            result: 'pull-failed',
+            message: err instanceof Error ? err.message : String(err),
+          };
+          outcomes.push(outcome);
           setRows((prev) => ({
             ...prev,
-            [id]: {
-              phase: 'done',
-              outcome: {
-                repoId: id,
-                defaultBranch: null,
-                result: 'pull-failed',
-                message: err instanceof Error ? err.message : String(err),
-              },
-            },
+            [id]: { phase: 'done', outcome },
           }));
         }
       }
@@ -2692,9 +2710,36 @@ function ResetWorkspaceProgressSheet({
       if (cancelledRef.current) return;
       setAllDone(true);
       void refreshAllRepoStatuses();
+      // Background mode: the React effect-tied toast won't fire
+      // because the component is unmounted. Push from here directly
+      // via the store so the user still gets notified.
+      if (backgroundRef.current) {
+        const failed = outcomes.filter((o) => o.result !== 'reset');
+        const store = useStore.getState();
+        if (failed.length === 0) {
+          store.pushToast({
+            kind: 'success',
+            message: `All ${outcomes.length} ${outcomes.length === 1 ? 'repo is' : 'repos are'} on default in ${workspaceName}.`,
+          });
+        } else if (failed.length === outcomes.length) {
+          store.pushToast({
+            kind: 'error',
+            message: `Reset failed for every repo in ${workspaceName}. Re-open the workspace to investigate.`,
+          });
+        } else {
+          store.pushToast({
+            kind: 'warn',
+            message: `${outcomes.length - failed.length} reset, ${failed.length} skipped or failed in ${workspaceName}.`,
+          });
+        }
+      }
     });
     return () => {
-      cancelledRef.current = true;
+      // Only cancel if the user closed via cancel/Esc — background
+      // mode leaves the workers running and skips the cleanup flag.
+      if (!backgroundRef.current) {
+        cancelledRef.current = true;
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [repoIds]);
@@ -2754,6 +2799,17 @@ function ResetWorkspaceProgressSheet({
 
   const onClose = () => {
     cancelledRef.current = true;
+    setSheet(null);
+  };
+
+  /// "Run in background" — close the sheet but let the workers
+  /// continue to completion. The unmount cleanup checks
+  /// `backgroundRef.current` and skips setting `cancelledRef`, so the
+  /// loop keeps scheduling repos and the completion handler fires a
+  /// toast directly via the store (the React `allDone` toast effect
+  /// won't run after unmount).
+  const onRunInBackground = () => {
+    backgroundRef.current = true;
     setSheet(null);
   };
 
@@ -2868,7 +2924,7 @@ function ResetWorkspaceProgressSheet({
               : 'Running fetch → switch → pull on each repo. Dirty repos are skipped.'}
           </div>
           <button
-            onClick={onClose}
+            onClick={allDone ? onClose : onRunInBackground}
             className={`text-xs py-1.5 px-3 rounded ${
               allDone
                 ? 'bg-accent text-white hover:bg-accent/90'
@@ -3382,17 +3438,24 @@ function FetchWorkspaceProgressSheet({
   });
   const [allDone, setAllDone] = useState(false);
   const cancelledRef = useRef(false);
+  /// See the Reset sheet — set when the user clicks "Run in
+  /// background"; cleanup then leaves the workers running and the
+  /// completion handler fires the toast directly via the store.
+  const backgroundRef = useRef(false);
+  const workspaceName = workspace?.name ?? 'workspace';
 
   useEffect(() => {
     // See the Reset sheet for the StrictMode story — same fix:
     // reset cancelled at the start of every effect run so the
     // dev-mode cleanup doesn't permanently mute the workers.
     cancelledRef.current = false;
+    backgroundRef.current = false;
     if (repoIds.length === 0) {
       setAllDone(true);
       return;
     }
     let cursor = 0;
+    const outcomes: FetchOutcome[] = [];
     const worker = async () => {
       while (true) {
         if (cancelledRef.current) return;
@@ -3403,21 +3466,22 @@ function FetchWorkspaceProgressSheet({
         try {
           const res = await fetchRepo(id);
           if (cancelledRef.current) return;
+          const outcome = { ok: res.ok, error: res.error };
+          outcomes.push(outcome);
           setRows((prev) => ({
             ...prev,
-            [id]: { phase: 'done', outcome: { ok: res.ok, error: res.error } },
+            [id]: { phase: 'done', outcome },
           }));
         } catch (err) {
           if (cancelledRef.current) return;
+          const outcome = {
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          };
+          outcomes.push(outcome);
           setRows((prev) => ({
             ...prev,
-            [id]: {
-              phase: 'done',
-              outcome: {
-                ok: false,
-                error: err instanceof Error ? err.message : String(err),
-              },
-            },
+            [id]: { phase: 'done', outcome },
           }));
         }
       }
@@ -3432,9 +3496,31 @@ function FetchWorkspaceProgressSheet({
       if (cancelledRef.current) return;
       setAllDone(true);
       void refreshAllRepoStatuses();
+      if (backgroundRef.current) {
+        const failed = outcomes.filter((o) => !o.ok);
+        const store = useStore.getState();
+        if (failed.length === 0) {
+          store.pushToast({
+            kind: 'success',
+            message: `Fetched ${outcomes.length} ${outcomes.length === 1 ? 'repo' : 'repos'} in ${workspaceName}.`,
+          });
+        } else if (failed.length === outcomes.length) {
+          store.pushToast({
+            kind: 'error',
+            message: `Fetch failed for every repo in ${workspaceName}. Re-open the workspace to investigate.`,
+          });
+        } else {
+          store.pushToast({
+            kind: 'warn',
+            message: `${outcomes.length - failed.length} fetched, ${failed.length} failed in ${workspaceName}.`,
+          });
+        }
+      }
     });
     return () => {
-      cancelledRef.current = true;
+      if (!backgroundRef.current) {
+        cancelledRef.current = true;
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [repoIds]);
@@ -3486,6 +3572,11 @@ function FetchWorkspaceProgressSheet({
     setSheet(null);
   };
 
+  const onRunInBackground = () => {
+    backgroundRef.current = true;
+    setSheet(null);
+  };
+
   return (
     <>
       <SheetHeader
@@ -3517,7 +3608,7 @@ function FetchWorkspaceProgressSheet({
               : 'Running git fetch on each repo. Six in flight at a time.'}
           </div>
           <button
-            onClick={onClose}
+            onClick={allDone ? onClose : onRunInBackground}
             className={`text-xs py-1.5 px-3 rounded ${
               allDone
                 ? 'bg-accent text-white hover:bg-accent/90'
@@ -3654,17 +3745,22 @@ function SyncBehindProgressSheet({
   });
   const [allDone, setAllDone] = useState(false);
   const cancelledRef = useRef(false);
+  /// Set when "Run in background" is clicked. Distinct from cancel.
+  const backgroundRef = useRef(false);
+  const workspaceName = workspace?.name ?? 'workspace';
 
   useEffect(() => {
     // See the Reset sheet for the StrictMode story — reset cancelled
     // at the start of every effect run so the dev-mode cleanup
     // doesn't permanently mute the workers.
     cancelledRef.current = false;
+    backgroundRef.current = false;
     if (repoIds.length === 0) {
       setAllDone(true);
       return;
     }
     let cursor = 0;
+    const outcomes: SyncOutcome[] = [];
     const worker = async () => {
       while (true) {
         if (cancelledRef.current) return;
@@ -3675,21 +3771,21 @@ function SyncBehindProgressSheet({
         try {
           const res = await fastForwardRepo(id);
           if (cancelledRef.current) return;
+          outcomes.push(res);
           setRows((prev) => ({
             ...prev,
             [id]: { phase: 'done', outcome: res },
           }));
         } catch (err) {
           if (cancelledRef.current) return;
+          const outcome = {
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          };
+          outcomes.push(outcome);
           setRows((prev) => ({
             ...prev,
-            [id]: {
-              phase: 'done',
-              outcome: {
-                ok: false,
-                error: err instanceof Error ? err.message : String(err),
-              },
-            },
+            [id]: { phase: 'done', outcome },
           }));
         }
       }
@@ -3699,9 +3795,31 @@ function SyncBehindProgressSheet({
       if (cancelledRef.current) return;
       setAllDone(true);
       void refreshAllRepoStatuses();
+      if (backgroundRef.current) {
+        const failed = outcomes.filter((o) => !o.ok);
+        const store = useStore.getState();
+        if (failed.length === 0) {
+          store.pushToast({
+            kind: 'success',
+            message: `Synced ${outcomes.length} ${outcomes.length === 1 ? 'repo' : 'repos'} in ${workspaceName}.`,
+          });
+        } else if (failed.length === outcomes.length) {
+          store.pushToast({
+            kind: 'error',
+            message: `Sync failed for every repo in ${workspaceName}. Re-open the workspace to investigate.`,
+          });
+        } else {
+          store.pushToast({
+            kind: 'warn',
+            message: `${outcomes.length - failed.length} synced, ${failed.length} need attention in ${workspaceName}.`,
+          });
+        }
+      }
     });
     return () => {
-      cancelledRef.current = true;
+      if (!backgroundRef.current) {
+        cancelledRef.current = true;
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [repoIds]);
@@ -3755,6 +3873,11 @@ function SyncBehindProgressSheet({
     setSheet(null);
   };
 
+  const onRunInBackground = () => {
+    backgroundRef.current = true;
+    setSheet(null);
+  };
+
   return (
     <>
       <SheetHeader
@@ -3786,7 +3909,7 @@ function SyncBehindProgressSheet({
               : 'Running git pull --ff-only on each behind repo. Diverged branches refuse the sync.'}
           </div>
           <button
-            onClick={onClose}
+            onClick={allDone ? onClose : onRunInBackground}
             className={`text-xs py-1.5 px-3 rounded ${
               allDone
                 ? 'bg-accent text-white hover:bg-accent/90'
