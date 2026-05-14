@@ -16,6 +16,10 @@ permissions:
 
 jobs:
   analyze:
+    # CodeQL upload requires GitHub Advanced Security on private repos.
+    # Skip while private; the workflow lights up automatically once the
+    # repo is made public (CodeQL is free for public repos).
+    if: github.event.repository.visibility == 'public'
     name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
     strategy:
