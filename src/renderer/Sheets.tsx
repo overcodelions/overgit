@@ -1892,9 +1892,22 @@ function WorksetSheet({ worksetId }: { worksetId?: UUID } = {}): JSX.Element {
             worktreePath: o.worktreePath,
           });
         }
+        // If the repo had the branch under a different case
+        // (`feature/IB-56` vs the typed `feature/ib-56`), the main
+        // process resolved to the real ref and returned it in the
+        // outcome. Rebind the workset's preferredBranch to that
+        // canonical case so drift detection compares against the real
+        // ref name, not the user's typed casing.
+        const canonical = outcomes
+          .filter((o) => o.result === 'switched' || o.result === 'already-on-branch')
+          .map((o) => o.branch)
+          .find((b): b is string => Boolean(b) && b !== trimmedBranch);
+        if (canonical) {
+          await updateWorkset(createdId, { preferredBranch: canonical });
+        }
       }
 
-      await refreshWorksetStatus(createdId);
+      await refreshWorksetStatus(createdId, true);
       const failures = rows.filter((r) => !r.ok);
       if (failures.length === 0) {
         pushToast({
@@ -1948,7 +1961,7 @@ function WorksetSheet({ worksetId }: { worksetId?: UUID } = {}): JSX.Element {
           : p,
       );
       const wsId = useStore.getState().selectedWorksetId;
-      if (wsId) await refreshWorksetStatus(wsId);
+      if (wsId) await refreshWorksetStatus(wsId, true);
     } finally {
       setAdoptingId(null);
     }
@@ -1988,7 +2001,7 @@ function WorksetSheet({ worksetId }: { worksetId?: UUID } = {}): JSX.Element {
           : p,
       );
       const wsId = useStore.getState().selectedWorksetId;
-      if (wsId) await refreshWorksetStatus(wsId);
+      if (wsId) await refreshWorksetStatus(wsId, true);
     } finally {
       setStashingId(null);
     }
@@ -2002,7 +2015,7 @@ function WorksetSheet({ worksetId }: { worksetId?: UUID } = {}): JSX.Element {
       branch: commonBranch,
     });
     setSyncState((s) => ({ ...s, [repoId]: { kind: 'done', outcome } }));
-    await refreshWorksetStatus(editingId);
+    await refreshWorksetStatus(editingId, true);
   };
 
   const runSyncAll = async () => {
@@ -4356,9 +4369,7 @@ function AbandonLocalSheet({ repoId }: { repoId: UUID }): JSX.Element {
   const pushToast = useStore((s) => s.pushToast);
   const requestConfirm = useStore((s) => s.requestConfirm);
   const refreshRepoStatus = useStore((s) => s.refreshRepoStatus);
-  const refreshRepoLog = useStore((s) => s.refreshRepoLog);
   const refreshRepoChanges = useStore((s) => s.refreshRepoChanges);
-  const refreshRepoBranches = useStore((s) => s.refreshRepoBranches);
   const refreshRepoBranchSummaries = useStore((s) => s.refreshRepoBranchSummaries);
   const refreshWorksetStatus = useStore((s) => s.refreshWorksetStatus);
   const worksets = useStore((s) => s.worksets);
@@ -4507,11 +4518,9 @@ function AbandonLocalSheet({ repoId }: { repoId: UUID }): JSX.Element {
         .map((w) => w.id);
       await Promise.all([
         refreshRepoStatus(repoId),
-        refreshRepoLog(repoId),
         refreshRepoChanges(repoId),
-        refreshRepoBranches(repoId),
-        refreshRepoBranchSummaries(repoId),
-        ...memberOf.map((id) => refreshWorksetStatus(id)),
+        refreshRepoBranchSummaries(repoId, true),
+        ...memberOf.map((id) => refreshWorksetStatus(id, true)),
       ]);
       setSheet(null);
     } finally {
@@ -5059,7 +5068,7 @@ function WorksetBranchSheet({ worksetId }: { worksetId: UUID }): JSX.Element {
         pullBeforeBranch: pullBefore,
       });
       setOutcomes(res);
-      await refreshStatus(worksetId);
+      await refreshStatus(worksetId, true);
     } finally {
       setBusy(false);
       setBusyLabel(null);

@@ -157,6 +157,41 @@ function reposFor(workset: Workset, repos: Repo[]): Repo[] {
   return workset.repoIds.map((id) => byId.get(id)).filter((r): r is Repo => !!r);
 }
 
+/// Bounded parallel map. Used for hot-path fan-outs (status, PR list,
+/// worktrees, activity) so a 24-repo workset doesn't fire 24 simultaneous
+/// subprocesses — credential helpers, gh's auth probing, and the OS
+/// process budget all dislike that. Three is enough to overlap network
+/// latency without thrashing.
+async function pool<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  if (items.length === 0) return out;
+  let next = 0;
+  const width = Math.max(1, Math.min(concurrency, items.length));
+  const worker = async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      out[i] = await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: width }, worker));
+  return out;
+}
+
+/// Local-only GitHub-remote check. Avoids spawning `gh` for repos that
+/// will never have a PR — bitbucket-only repos, internal git servers,
+/// freshly-init'd local repos. `gh` itself takes ~0.5–2s per call even
+/// when it bails out with "not a GitHub repository", which compounds
+/// painfully across a workset.
+async function hasGitHubRemote(repoPath: string): Promise<boolean> {
+  const provider = await detectProvider(repoPath);
+  return provider.kind === 'github';
+}
+
 export async function worksetStatus(
   worksetId: UUID,
   worksets: Workset[],
@@ -165,9 +200,14 @@ export async function worksetStatus(
   const ws = worksets.find((w) => w.id === worksetId);
   if (!ws) return [];
   const members = reposFor(ws, repos);
-  // Status calls are independent and read-only — fan them out so
-  // worksets with many repos don't take linear time to refresh.
-  return Promise.all(members.map((r) => gitStatus(r.id, r.path, r.defaultBranch)));
+  // Status calls are independent and read-only — fan them out, but
+  // bound to 3 in flight. Each `gitStatus` spawns ~4 parallel git
+  // subprocesses (status, rev-list, shortstat, show-ref); unbounded
+  // fan-out on a 20-repo workset = 80 concurrent git processes,
+  // which pegs CPU and stalls everything else (sidebar refresh, the
+  // user's branch-tab click). 3 wide × 4 sub = 12 concurrent gits,
+  // which keeps wall time low without saturating.
+  return pool(members, 3, (r) => gitStatus(r.id, r.path, r.defaultBranch));
 }
 
 export async function worksetCheckout(
@@ -382,7 +422,7 @@ export async function worksetSyncAndBranch(
   const members = reposFor(ws, repos);
   const out: SyncAndBranchOutcome[] = [];
   for (const r of members) {
-    out.push(await syncRepoToBranchStep(r, branch, syncDefault, pullBeforeBranch));
+    out.push(await syncRepoToBranchStep(r, branch, syncDefault, pullBeforeBranch, 'checkout'));
   }
   return out;
 }
@@ -488,7 +528,66 @@ export async function resetRepoToDefault(
     }
   }
 
-  // 5. Refuse to discard unpushed local commits unless forced.
+  // 5. Fast path: already on the default branch, no force flag.
+  // The common case for a workspace reset is "20 clean repos, half
+  // on master, please sync them all" — so we want this path to be
+  // as few git spawns as possible. Skip the explicit
+  // branchExistsOnOrigin + countUnpushedOnBranch probes that the
+  // checkout -B path needs; `git merge --ff-only` itself fails
+  // distinctly on each error mode and we parse the stderr to map it
+  // back to the user-facing outcome shape.
+  //
+  // `preStatus.branch` from step 1 already knows the current branch
+  // (no extra rev-parse spawn). Cumulative win: 3 git spawns instead
+  // of 5 per "on default" repo, which adds up across 20+ repos.
+  if (preStatus.branch === defaultBranch && !opts.forceLoseUnpushed) {
+    const ff = await run(r.path, [
+      'merge',
+      '--ff-only',
+      `origin/${defaultBranch}`,
+    ]);
+    if (ff.ok) {
+      return { repoId: r.id, defaultBranch, result: 'reset' };
+    }
+    const errBlob = `${ff.stderr ?? ''}\n${ff.stdout ?? ''}`;
+    // ff-only refuses on diverged history — could be unpushed local
+    // commits or a non-fast-forwardable rewrite. Run the cheaper
+    // ahead-count query now (only on this failure branch, not on the
+    // happy path) so the user gets a "N unpushed commits" message
+    // instead of a raw git error.
+    if (/non-fast-forward|Not possible to fast-forward|refusing to merge unrelated/.test(errBlob)) {
+      const unpushed = await countUnpushedOnBranch(r.path, defaultBranch);
+      return {
+        repoId: r.id,
+        defaultBranch,
+        result: 'unpushed-commits',
+        message:
+          unpushed > 0
+            ? `${unpushed} local ${unpushed === 1 ? 'commit' : 'commits'} on ${defaultBranch} not pushed to origin. Force reset will discard them.`
+            : `Local ${defaultBranch} has diverged from origin/${defaultBranch}. Force reset will discard the divergence.`,
+        unpushedCount: unpushed,
+      };
+    }
+    // Origin ref missing (typical when the upstream branch was
+    // renamed). Surface the existing 'upstream-gone' outcome so the
+    // reset-progress UI can prompt to re-detect default.
+    if (/unknown revision|bad revision|ambiguous argument|not.*valid object/.test(errBlob)) {
+      return {
+        repoId: r.id,
+        defaultBranch,
+        result: 'upstream-gone',
+        message: `origin/${defaultBranch} not found — pick a new default in Settings or open the repo to investigate.`,
+        staleRef: defaultBranch,
+      };
+    }
+    // Unknown ff failure — fall through to the hard-reset path,
+    // which has better diagnostics for edge cases (worktree locks,
+    // permission issues, etc.).
+  }
+
+  // 6. Refuse to discard unpushed local commits unless forced. Only
+  // reached when we're NOT on the default branch (the fast path
+  // above handles the on-default case via the ff-merge result).
   if (!opts.forceLoseUnpushed) {
     const unpushed = await countUnpushedOnBranch(r.path, defaultBranch);
     if (unpushed > 0) {
@@ -502,7 +601,7 @@ export async function resetRepoToDefault(
     }
   }
 
-  // 6. Hard-reset local default to origin's tip.
+  // 7. Hard-reset local default to origin's tip.
   // `git checkout -B <default> origin/<default>` does both "create or
   // reset the local branch" and "switch to it" atomically. If we're
   // currently on the default already, it resets it; if we're on a
@@ -573,10 +672,13 @@ async function countUnpushedOnBranch(
 }
 
 /// Fan out `resetRepoToDefault` over every repo in the list. Bounded
-/// to 3-wide so a 24-repo workset doesn't fire 24 simultaneous
-/// `git fetch` operations against the same remotes — credential
-/// helpers, rate-limited hosts, and the OS process budget all dislike
-/// that. Three is enough to overlap network latency without thrashing.
+/// to 6-wide. Each per-repo job is dominated by the `git fetch`
+/// network round-trip, not CPU — so we can run more in flight than
+/// the status/squash fan-outs (which are CPU-bound on the main
+/// thread). 6 keeps a 20-repo workspace reset under ~3 batches
+/// while staying gentle on credential helpers and remote rate
+/// limits; pushing higher risks server-side throttling against
+/// Bitbucket / GitLab without commensurate wall-time savings.
 export async function resetReposToDefault(
   repos: Repo[],
   cleanupBranch?: string,
@@ -590,7 +692,7 @@ export async function resetReposToDefault(
       out[i] = await resetRepoToDefault(repos[i], cleanupBranch);
     }
   };
-  const concurrency = Math.min(3, repos.length);
+  const concurrency = Math.min(8, repos.length);
   await Promise.all(Array.from({ length: concurrency }, worker));
   return out;
 }
@@ -941,10 +1043,12 @@ export async function worksetOpenPRs(
 }
 
 /// Aggregated workset timeline: recent commits across all repos
-/// (current branch only — per-branch tracking is a future-pass thing)
-/// merged with the workset's open PR list. Sorted newest-first.
-/// Read-only and best-effort: a repo we can't reach (missing on disk,
-/// git not in PATH for that path, etc.) just contributes no items.
+/// (current branch only — per-branch tracking is a future-pass thing).
+/// PR items are merged in by the renderer from the separately-fetched
+/// `worksetPRs` state — fetching them here too would double the gh
+/// calls on every workset open. Sorted newest-first. Read-only and
+/// best-effort: a repo we can't reach (missing on disk, git not in
+/// PATH for that path, etc.) just contributes no items.
 export async function worksetActivity(
   worksetId: UUID,
   perRepo: number,
@@ -956,17 +1060,17 @@ export async function worksetActivity(
   const members = reposFor(ws, repos);
   const out: WorksetActivity[] = [];
 
-  // Commits — fan out, every repo is independent. We use the repo's
-  // current branch as the source; a future pass could walk every
-  // tracked branch but that's overkill for a "what's new" surface.
-  const commitFanout = await Promise.all(
-    members.map(async (r) => {
-      const st = await gitStatus(r.id, r.path, r.defaultBranch);
-      const branch = st.branch ?? '(detached)';
-      const commits = await gitLog(r.path, perRepo);
-      return { repo: r, branch, commits };
-    }),
-  );
+  // Commits — bounded fan-out. Local-only git commands, so we can
+  // afford a wider pool than the gh calls. Branch name is fetched via
+  // a single rev-parse instead of full `git status` (which is the hot
+  // path's status refresh and would be duplicate work here).
+  const commitFanout = await pool(members, 5, async (r) => {
+    const branchRes = await run(r.path, ['rev-parse', '--abbrev-ref', 'HEAD']);
+    const raw = branchRes.ok ? branchRes.stdout.trim() : '';
+    const branch = !raw || raw === 'HEAD' ? '(detached)' : raw;
+    const commits = await gitLog(r.path, perRepo);
+    return { repo: r, branch, commits };
+  });
   for (const { repo, branch, commits } of commitFanout) {
     for (const c of commits) {
       out.push({
@@ -979,29 +1083,6 @@ export async function worksetActivity(
         subject: c.subject,
         author: c.author,
         at: c.date,
-      });
-    }
-  }
-
-  // PRs — listOpenPRs already gates on `gh` being installed and
-  // returns null when there's no GitHub remote. Skip null results
-  // silently; we surface gh-presence in the dedicated PR UI.
-  const prFanout = await Promise.all(
-    members.map(async (r) => ({ repo: r, prs: (await listOpenPRs(r.path)).prs })),
-  );
-  for (const { repo, prs } of prFanout) {
-    if (!prs) continue;
-    for (const pr of prs) {
-      out.push({
-        kind: 'pr',
-        repoId: repo.id,
-        repoName: repo.name,
-        number: pr.number,
-        title: pr.title,
-        url: pr.url,
-        state: pr.state,
-        author: pr.author,
-        at: pr.updatedAt,
       });
     }
   }
@@ -1020,9 +1101,14 @@ export async function worksetWorktrees(
   const ws = worksets.find((w) => w.id === worksetId);
   if (!ws) return [];
   const members = reposFor(ws, repos);
-  return Promise.all(
-    members.map(async (r) => ({ repoId: r.id, worktrees: await listWorktrees(r.path) })),
-  );
+  // Bounded fan-out: `git worktree list` is fast individually, but a
+  // 20-member workset firing all 20 at once still pegs CPU. 5-wide
+  // is plenty for this cheap op without crowding the other workset
+  // IPCs (status, PRs, activity) that fire in parallel.
+  return pool(members, 5, async (r) => ({
+    repoId: r.id,
+    worktrees: await listWorktrees(r.path),
+  }));
 }
 
 export async function worksetListPRs(
@@ -1033,10 +1119,15 @@ export async function worksetListPRs(
   const ws = worksets.find((w) => w.id === worksetId);
   if (!ws) return [];
   const members = reposFor(ws, repos);
-  return Promise.all(
-    members.map(async (r): Promise<RepoPRs> => {
-      const result = await listOpenPRs(r.path);
-      return { repoId: r.id, prs: result.prs, error: result.error };
-    }),
-  );
+  // gh is the slow part of opening a workset — bound concurrency so a
+  // 20-repo workset doesn't fire 20 simultaneous network/auth probes.
+  // Skip repos with no GitHub remote entirely; gh would just return
+  // "not a GitHub repository" after a network round-trip.
+  return pool(members, 3, async (r): Promise<RepoPRs> => {
+    if (!(await hasGitHubRemote(r.path))) {
+      return { repoId: r.id, prs: null };
+    }
+    const result = await listOpenPRs(r.path);
+    return { repoId: r.id, prs: result.prs, error: result.error };
+  });
 }
