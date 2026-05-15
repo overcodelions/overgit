@@ -109,10 +109,17 @@ export interface Workset {
   /// set is done — committed and pushed across all repos — put it away
   /// without losing it."
   archived?: boolean;
-  /// ISO timestamp captured at creation. Used to order the archived
-  /// section newest-first. Optional because worksets created before
-  /// this field existed won't have one — those sort as oldest.
+  /// ISO timestamp captured at creation. Used to order the active
+  /// sidebar list newest-first, and as a fallback sort key for the
+  /// archived section. Optional because worksets created before this
+  /// field existed won't have one — those sort as oldest.
   createdAt?: string;
+  /// ISO timestamp captured when the workset was last archived.
+  /// Used to order the archived section by most-recently-archived.
+  /// Cleared on reactivate so re-archiving bumps it back to the top.
+  /// Optional for worksets archived before this field existed —
+  /// those fall back to `createdAt`, then to oldest.
+  archivedAt?: string;
 }
 
 export interface RepoStatus {
