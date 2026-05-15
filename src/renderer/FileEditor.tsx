@@ -1,8 +1,7 @@
 import { useCallback, useEffect } from 'react';
-import hljs from 'highlight.js/lib/common';
-import 'highlight.js/styles/github-dark.css';
 import { useStore } from './store';
 import { FileTree } from './FileTree';
+import { CodeMirrorEditor } from './CodeMirrorEditor';
 import type { UUID } from '@shared/types';
 
 /// Files tab body — left pane is the repo's file tree, right pane is the
@@ -111,13 +110,13 @@ function EditorBody(): JSX.Element {
           ✕
         </button>
       </div>
-      <div className="flex-1 min-h-0 overflow-auto">
+      <div className="flex-1 min-h-0 overflow-hidden">
         {loading ? (
           <div className="p-4 text-xs text-ink-faint">Loading…</div>
         ) : error ? (
           <div className="p-4 text-xs text-red-300">{error}</div>
         ) : (
-          <Editor
+          <CodeMirrorEditor
             content={content}
             onChange={setContent}
             language={detectLanguage(file.path)}
@@ -128,122 +127,48 @@ function EditorBody(): JSX.Element {
   );
 }
 
-/// Two-layer editor: a textarea takes input on top, a syntax-highlighted
-/// `<pre>` mirrors the same text underneath. Caret renders from the
-/// textarea while colors render from the pre. Same trick overcli uses.
-function Editor({
-  content,
-  onChange,
-  language,
-}: {
-  content: string;
-  onChange: (v: string) => void;
-  language: string | null;
-}): JSX.Element {
-  const lines = content.split('\n');
-  // Pin font metrics shared by gutter / highlight pre / textarea so the
-  // selection rectangle the textarea draws lines up exactly with the
-  // glyphs from the pre underneath. Browsers default textareas to
-  // `line-height: normal` (~1.2) which doesn't match the pre's inherited
-  // 1.5, so without explicit values selections drift by ~1px per line and
-  // diverge into the multi-line rectangle the user reported.
-  const FONT_SIZE = 12;
-  const LINE_HEIGHT = 18; // 1.5× font-size — keeps the math simple.
-  const PAD_TOP = 8; // matches Tailwind `pt-2` (0.5rem @ 16px base).
-  const PAD_X = 8;
-  const sharedTypography: React.CSSProperties = {
-    fontSize: FONT_SIZE,
-    lineHeight: `${LINE_HEIGHT}px`,
-    fontFamily:
-      'ui-monospace, SFMono-Regular, Menlo, Monaco, "Cascadia Code", "Roboto Mono", monospace',
-    tabSize: 4,
-  };
-  return (
-    <div className="flex">
-      <div
-        className="select-none text-right text-ink-faint sticky left-0 bg-surface-muted"
-        style={{
-          ...sharedTypography,
-          paddingTop: PAD_TOP,
-          paddingRight: PAD_X,
-          minWidth: '3.5em',
-        }}
-      >
-        {lines.map((_, i) => (
-          <div key={i + 1} style={{ height: LINE_HEIGHT, lineHeight: `${LINE_HEIGHT}px` }}>
-            {i + 1}
-          </div>
-        ))}
-      </div>
-      <div className="flex-1 relative">
-        <pre
-          aria-hidden
-          className="absolute inset-0 m-0 pointer-events-none whitespace-pre overflow-visible"
-          style={{
-            ...sharedTypography,
-            paddingTop: PAD_TOP,
-            paddingLeft: PAD_X,
-            paddingRight: PAD_X,
-          }}
-          dangerouslySetInnerHTML={{ __html: highlight(content, language) }}
-        />
-        <textarea
-          value={content}
-          onChange={(e) => onChange(e.target.value)}
-          spellCheck={false}
-          className="relative w-full min-h-full bg-transparent text-transparent caret-ink select-text outline-none whitespace-pre resize-none border-0"
-          style={{
-            ...sharedTypography,
-            paddingTop: PAD_TOP,
-            paddingLeft: PAD_X,
-            paddingRight: PAD_X,
-            minHeight: Math.max(lines.length, 8) * LINE_HEIGHT + PAD_TOP * 2,
-          }}
-        />
-      </div>
-    </div>
-  );
-}
-
-function highlight(content: string, language: string | null): string {
-  try {
-    if (language && hljs.getLanguage(language)) {
-      return hljs.highlight(content, { language, ignoreIllegals: true }).value;
-    }
-    return hljs.highlightAuto(content).value;
-  } catch {
-    return escapeHtml(content);
-  }
-}
-
-function escapeHtml(s: string): string {
-  return s.replace(/[&<>]/g, (c) =>
-    c === '&' ? '&amp;' : c === '<' ? '&lt;' : '&gt;',
-  );
-}
-
+/// Extension → CodeMirror language id. Mirrors the map in
+/// CodeMirrorEditor.tsx; anything not in the map falls through to "no
+/// language" (still rendered, just not colored).
 const LANGUAGE_BY_EXT: Record<string, string> = {
-  ts: 'typescript', tsx: 'typescript',
+  // JS / TS family
+  ts: 'typescript', tsx: 'typescript', cts: 'typescript', mts: 'typescript',
   js: 'javascript', jsx: 'javascript', mjs: 'javascript', cjs: 'javascript',
-  rs: 'rust', go: 'go',
-  c: 'c', h: 'c', cpp: 'cpp', hpp: 'cpp',
-  py: 'python', rb: 'ruby', php: 'php',
-  sh: 'bash', bash: 'bash', zsh: 'bash',
-  json: 'json', yaml: 'yaml', yml: 'yaml',
-  toml: 'ini', ini: 'ini',
-  xml: 'xml', html: 'xml', svg: 'xml',
-  css: 'css', scss: 'scss',
-  md: 'markdown', mdx: 'markdown',
-  sql: 'sql', graphql: 'graphql',
-  swift: 'swift', kt: 'kotlin',
-  java: 'java',
-  // hljs/lib/common bundles a curated subset; missing types fall through
-  // to highlightAuto, which still picks something reasonable.
+  // Systems
+  rs: 'rust', go: 'go', c: 'c', h: 'c', cpp: 'cpp', hpp: 'cpp', cc: 'cpp', hh: 'cpp',
+  cs: 'csharp',
+  swift: 'swift', kt: 'kotlin', kts: 'kotlin', scala: 'scala',
+  java: 'java', groovy: 'groovy',
+  // Scripting
+  py: 'python', rb: 'ruby', php: 'php', pl: 'perl', lua: 'lua',
+  sh: 'bash', bash: 'bash', zsh: 'bash', fish: 'bash',
+  ps1: 'powershell', psm1: 'powershell',
+  // Config / data
+  json: 'json', yaml: 'yaml', yml: 'yaml', toml: 'toml', ini: 'ini',
+  properties: 'ini', conf: 'ini', cfg: 'ini',
+  xml: 'xml', svg: 'xml', plist: 'xml',
+  env: 'ini',
+  // Web
+  html: 'html', htm: 'html', css: 'css', scss: 'scss', sass: 'scss', less: 'less',
+  vue: 'vue', svelte: 'vue',
+  // Docs
+  md: 'markdown', mdx: 'markdown', markdown: 'markdown',
+  // DB / data query
+  sql: 'sql',
+  // Build / infra
+  dockerfile: 'dockerfile',
+  makefile: 'makefile', mk: 'makefile', cmake: 'cmake',
+  // Misc
+  r: 'r', erl: 'erlang',
+  hs: 'haskell', clj: 'clojure', cljs: 'clojure',
+  proto: 'protobuf',
 };
 
 function detectLanguage(p: string): string | null {
-  const name = p.split('/').pop()?.toLowerCase() ?? '';
+  const name = p.split(/[/\\]/).pop()?.toLowerCase() ?? '';
   if (name === 'dockerfile') return 'dockerfile';
+  if (name === 'makefile') return 'makefile';
+  if (name === 'cmakelists.txt') return 'cmake';
   const ext = name.includes('.') ? name.split('.').pop()! : '';
   return LANGUAGE_BY_EXT[ext] ?? null;
 }

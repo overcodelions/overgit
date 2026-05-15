@@ -655,21 +655,32 @@ function Sidebar(): JSX.Element {
     [worksets, query],
   );
 
+  // Active worksets are shown newest-first by creation date so a
+  // freshly-created workset lands at the top of the list instead of
+  // being buried under older ones. Worksets created before `createdAt`
+  // was tracked have no date — those sort as oldest, with stable sort
+  // preserving their relative order.
   const activeWorksets = useMemo(
-    () => visibleWorksets.filter((w) => !w.archived),
-    [visibleWorksets],
-  );
-  // Archived list is shown newest-first by creation date. Worksets
-  // archived before `createdAt` was tracked have no date — those sort
-  // as oldest, with stable sort preserving their relative order so the
-  // section doesn't reshuffle on each render.
-  const archivedWorksets = useMemo(
     () =>
-      [...visibleWorksets.filter((w) => w.archived)].sort((a, b) => {
+      [...visibleWorksets.filter((w) => !w.archived)].sort((a, b) => {
         const ad = a.createdAt ?? '';
         const bd = b.createdAt ?? '';
         if (ad === bd) return 0;
         return bd.localeCompare(ad);
+      }),
+    [visibleWorksets],
+  );
+  // Archived list is shown most-recently-archived first. Falls back to
+  // creation date for worksets archived before `archivedAt` existed,
+  // and then to oldest. Stable sort preserves relative order so the
+  // section doesn't reshuffle on each render.
+  const archivedWorksets = useMemo(
+    () =>
+      [...visibleWorksets.filter((w) => w.archived)].sort((a, b) => {
+        const ak = a.archivedAt ?? a.createdAt ?? '';
+        const bk = b.archivedAt ?? b.createdAt ?? '';
+        if (ak === bk) return 0;
+        return bk.localeCompare(ak);
       }),
     [visibleWorksets],
   );

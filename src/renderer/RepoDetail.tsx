@@ -2100,7 +2100,7 @@ function FileGroup({
             return (
               <li
                 key={`${title}:${f.path}`}
-                className={`group flex items-center gap-2 px-3 py-1 border-b border-card last:border-0 ${
+                className={`group relative flex items-center gap-2 px-3 py-1 border-b border-card last:border-0 ${
                   active ? 'bg-accent text-white' : 'hover:bg-card'
                 }`}
               >
@@ -2120,9 +2120,19 @@ function FileGroup({
                 >
                   <PathLabel path={f.path} origPath={f.origPath} active={active} />
                 </button>
+                {/* Action cluster: floats over the right edge of the row
+                    instead of consuming a flex slot, so the filename +
+                    dimmed directory tail get the full row width. The
+                    backdrop-blur + gradient sit ONLY under the buttons
+                    so the rest of the path stays sharp — `pl-4` keeps
+                    the fade compact and the gradient holds the row
+                    color solid for most of the cluster's width, with
+                    just a short feather on the left edge. */}
                 <div
-                  className={`flex gap-1 transition-opacity ${
-                    active ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 focus-within:opacity-100'
+                  className={`absolute right-0 inset-y-0 flex items-center gap-1 pr-3 pl-4 transition-opacity backdrop-blur-sm ${
+                    active
+                      ? 'opacity-100 bg-gradient-to-l from-accent from-75% to-transparent'
+                      : 'opacity-0 group-hover:opacity-100 focus-within:opacity-100 bg-gradient-to-l from-card from-75% to-transparent'
                   }`}
                 >
                   {onView && f.indexStatus !== 'D' && f.worktreeStatus !== 'D' && (
