@@ -1942,8 +1942,9 @@ export const useStore = create<UiState>((set, get) => ({
   },
 
   archiveWorkset: async (id) => {
+    const archivedAt = new Date().toISOString();
     const worksets = get().worksets.map((w) =>
-      w.id === id ? { ...w, archived: true } : w,
+      w.id === id ? { ...w, archived: true, archivedAt } : w,
     );
     const patch: Partial<UiState> = { worksets };
     if (get().selectedWorksetId === id) patch.selectedWorksetId = null;
@@ -1953,7 +1954,7 @@ export const useStore = create<UiState>((set, get) => ({
 
   unarchiveWorkset: async (id) => {
     const worksets = get().worksets.map((w) =>
-      w.id === id ? { ...w, archived: false } : w,
+      w.id === id ? { ...w, archived: false, archivedAt: undefined } : w,
     );
     set({ worksets });
     await window.overgit.invoke('store:saveWorksets', worksets);
