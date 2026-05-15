@@ -2107,7 +2107,12 @@ export async function commitAll(
 /// a space, then the path; renames consume an extra record for the orig.
 export async function changes(repoPath: string): Promise<RepoChanges> {
   if (!looksLikeRepo(repoPath)) return { staged: [], unstaged: [] };
-  const res = await run(repoPath, ['status', '--porcelain=v1', '-z']);
+  // `-uall` expands untracked directories into individual file records.
+  // Without it, git collapses an untracked dir into one entry (with a
+  // trailing slash), which both hides the per-file changes and breaks
+  // "View" — clicking the entry tried to read a directory as a file
+  // and surfaced raw EISDIR in the editor pane.
+  const res = await run(repoPath, ['status', '--porcelain=v1', '-uall', '-z']);
   if (!res.ok) return { staged: [], unstaged: [] };
 
   const records = res.stdout.split('\0').filter((r) => r.length > 0);

@@ -568,6 +568,10 @@ export interface AppSettings {
   /// usually wider than the app sidebar (it carries the lane rail +
   /// ref badges + subject + meta on one row).
   historyAsideWidth: number;
+  /// Width of the Changes tab's file-list aside. Same persistence idea
+  /// as `historyAsideWidth`. Independent so a user who wants a wide
+  /// commit list isn't forced into a wide changes list and vice versa.
+  changesAsideWidth: number;
   /// Per-workset "last seen" timestamps (ISO 8601). Used by the
   /// activity feed to mark commits / PRs that arrived since the user
   /// last opened the workset pane. Wiped when a workset is
@@ -613,6 +617,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   sidebarVisible: true,
   sidebarWidth: 288,
   historyAsideWidth: 480,
+  changesAsideWidth: 360,
   worksetLastSeen: {},
   stagingMode: 'simple',
   explainMode: true,
@@ -622,6 +627,8 @@ export const SIDEBAR_MIN_WIDTH = 200;
 export const SIDEBAR_MAX_WIDTH = 520;
 export const HISTORY_ASIDE_MIN_WIDTH = 320;
 export const HISTORY_ASIDE_MAX_WIDTH = 900;
+export const CHANGES_ASIDE_MIN_WIDTH = 260;
+export const CHANGES_ASIDE_MAX_WIDTH = 900;
 
 /// Typed contract for ipcRenderer.invoke channels. Each entry is the
 /// signature the main-process handler implements; the preload exposes
