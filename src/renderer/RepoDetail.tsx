@@ -17,7 +17,12 @@ import type {
   UUID,
   Worktree,
 } from '@shared/types';
-import { HISTORY_ASIDE_MAX_WIDTH, HISTORY_ASIDE_MIN_WIDTH } from '@shared/types';
+import {
+  CHANGES_ASIDE_MAX_WIDTH,
+  CHANGES_ASIDE_MIN_WIDTH,
+  HISTORY_ASIDE_MAX_WIDTH,
+  HISTORY_ASIDE_MIN_WIDTH,
+} from '@shared/types';
 
 // Stable fallback for the history-tab log selector. See App.tsx for the
 // rationale — a fresh `[]` per render breaks Zustand's snapshot
@@ -999,14 +1004,46 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
     if (selected?.path === file.path) setSelected(null);
   };
 
+  // Drag-to-resize for the file list. Mirrors the History-tab pattern:
+  // an in-memory width on the settings store, a 1-px column between
+  // aside and diff that picks up the col-resize cursor, and a
+  // double-click reset back to the default.
+  const asideWidth = useStore((s) => s.settings.changesAsideWidth ?? 360);
+  const setAsideWidth = useStore((s) => s.setChangesAsideWidth);
+  const onAsideDragStart = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = asideWidth;
+    const onMove = (ev: MouseEvent) => {
+      const next = Math.max(
+        CHANGES_ASIDE_MIN_WIDTH,
+        Math.min(CHANGES_ASIDE_MAX_WIDTH, startW + (ev.clientX - startX)),
+      );
+      void setAsideWidth(next);
+    };
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  };
+
   return (
-    <div className="grid grid-cols-[360px_1fr] grid-rows-[auto_1fr] overflow-hidden">
+    <div
+      className="grid grid-rows-[auto_1fr] overflow-hidden"
+      style={{ gridTemplateColumns: `${asideWidth}px 4px 1fr` }}
+    >
       {repoStatus?.inProgress && (
-        <div className="col-span-2 row-start-1">
+        <div className="col-span-3 row-start-1">
           <ConflictBanner repoId={repoId} status={repoStatus} />
         </div>
       )}
-      <aside className="border-r border-card overflow-y-auto flex flex-col col-start-1 row-start-2">
+      <aside className="border-r border-card overflow-y-auto flex flex-col col-start-1 row-start-2 min-w-0">
         <div className="flex items-center gap-1 px-3 py-2 border-b border-card flex-wrap">
           {stagingMode === 'advanced' ? (
             <>
@@ -1310,7 +1347,22 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
         </div>
       </aside>
 
-      <section className="overflow-y-auto col-start-2 row-start-2">
+      {/* Drag handle between the file list and the diff pane. Sits in
+          its own grid column so the file list and the diff get the
+          remaining width naturally — same shape as the History tab. */}
+      <div
+        role="separator"
+        aria-label="Resize changes list"
+        aria-valuenow={asideWidth}
+        aria-valuemin={CHANGES_ASIDE_MIN_WIDTH}
+        aria-valuemax={CHANGES_ASIDE_MAX_WIDTH}
+        onMouseDown={onAsideDragStart}
+        onDoubleClick={() => void setAsideWidth(360)}
+        title="Drag to resize · Double-click to reset"
+        className="col-start-2 row-start-2 cursor-col-resize hover:bg-accent/40 active:bg-accent/60 transition-colors"
+      />
+
+      <section className="overflow-y-auto col-start-3 row-start-2 min-w-0">
         {selected ? (
           <ChangesDiffPane
             repoId={repoId}
@@ -2211,10 +2263,14 @@ function PathLabel({
   const name = slash === -1 ? path : path.slice(slash + 1);
   return (
     <>
-      <span className={`font-mono text-[12px] truncate ${active ? '' : ''}`}>{name}</span>
+      {/* Filename never shrinks — it's the part the user actually reads.
+          The dim directory tail absorbs all truncation instead. */}
+      <span className="font-mono text-[12px] whitespace-nowrap flex-shrink-0">
+        {name}
+      </span>
       {(dir || origPath) && (
         <span
-          className={`font-mono text-[10px] truncate ${
+          className={`font-mono text-[10px] truncate min-w-0 ${
             active ? 'text-white/60' : 'text-ink-faint'
           }`}
         >
