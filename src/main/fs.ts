@@ -188,6 +188,9 @@ export function readFileUnderRoot(
   }
   try {
     const stat = fs.statSync(resolved);
+    if (stat.isDirectory()) {
+      return { ok: false, error: 'Not a file — this path is a directory.' };
+    }
     if (stat.size > MAX_READ_BYTES) {
       return {
         ok: false,
