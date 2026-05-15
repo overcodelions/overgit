@@ -854,13 +854,28 @@ export async function worksetPushAll(
   if (!ws) return [];
   const members = reposFor(ws, repos);
   const out: WorksetPushOutcome[] = [];
-  for (const r of members) {
-    const st = await gitStatus(r.id, r.path, r.defaultBranch);
+
+  // Preflight in parallel: `gitStatus` and `hasUpstream` are read-only
+  // and don't prompt for credentials, so there's no reason to serialize
+  // them. The actual `gitPush` call below stays serial because that one
+  // can prompt (ssh-agent, gpg) and interleaving prompts is unworkable.
+  // On a 19-repo workset this turns ~38 sequential git invocations into
+  // one batch, which is the difference between "instant" and "several
+  // seconds of stuck Pushing… spinner" when nothing actually needs to
+  // be pushed.
+  const preflight = await Promise.all(
+    members.map(async (r) => {
+      const st = await gitStatus(r.id, r.path, r.defaultBranch);
+      const upstreamSet = st.branch === null ? false : await hasUpstream(r.path);
+      return { repo: r, st, upstreamSet };
+    }),
+  );
+
+  for (const { repo: r, st, upstreamSet } of preflight) {
     if (st.branch === null) {
       out.push({ repoId: r.id, result: 'detached', message: 'Detached HEAD — skipped' });
       continue;
     }
-    const upstreamSet = await hasUpstream(r.path);
     // Already in sync: skip the push round-trip entirely. We treat
     // ahead === null as "unknown — try anyway" since `status` returns
     // null when there's no upstream tracking; that case is covered by

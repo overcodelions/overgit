@@ -88,9 +88,16 @@ export function BranchPicker({ repoId, anchorRef, initialMode, onClose }: Props)
     };
   }, [onClose, mode, anchorRef]);
 
+  // Re-focus when mode flips, and also once anchorRect first becomes
+  // available — the picker returns null until it has a measured rect,
+  // so on the initial mount the input doesn't exist yet and a focus()
+  // here would no-op. Depending on `anchorRect != null` ensures we
+  // catch the first paint where the input actually mounts.
+  const anchored = anchorRect != null;
   useEffect(() => {
+    if (!anchored) return;
     inputRef.current?.focus();
-  }, [mode]);
+  }, [mode, anchored]);
 
   const grouped = useMemo(() => groupBranches(summaries ?? [], status?.branch ?? null, search), [
     summaries,
