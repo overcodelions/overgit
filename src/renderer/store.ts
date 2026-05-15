@@ -405,6 +405,7 @@ interface UiState {
   toggleSidebar: () => void;
   setSidebarWidth: (px: number) => Promise<void>;
   setHistoryAsideWidth: (px: number) => Promise<void>;
+  setChangesAsideWidth: (px: number) => Promise<void>;
   setSheet: (sheet: Sheet | null) => void;
   togglePalette: (open?: boolean) => void;
 
@@ -503,6 +504,7 @@ export const useStore = create<UiState>((set, get) => ({
     sidebarVisible: true,
     sidebarWidth: 288,
     historyAsideWidth: 480,
+    changesAsideWidth: 360,
     stagingMode: 'simple',
     explainMode: true,
   },
@@ -1880,6 +1882,14 @@ export const useStore = create<UiState>((set, get) => ({
     const cur = get().settings;
     if (cur.historyAsideWidth === px) return;
     const next = { ...cur, historyAsideWidth: px };
+    set({ settings: next });
+    await window.overgit.invoke('store:saveSettings', next);
+  },
+
+  setChangesAsideWidth: async (px) => {
+    const cur = get().settings;
+    if (cur.changesAsideWidth === px) return;
+    const next = { ...cur, changesAsideWidth: px };
     set({ settings: next });
     await window.overgit.invoke('store:saveSettings', next);
   },
