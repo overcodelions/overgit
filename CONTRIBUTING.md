@@ -4,7 +4,7 @@ Thanks for your interest. overgit is small and opinionated; the bar for new beha
 
 ## Development
 
-Requires Node 18 or newer.
+Requires Node 20 or newer.
 
 ```bash
 npm install
