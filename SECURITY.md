@@ -9,7 +9,7 @@ If you find a security issue in overgit, please report it privately:
 
 Please include enough detail to reproduce — overgit is a desktop client that shells out to `git`, `gh`, and (optionally) `claude` / `codex` / `gemini`, so reports about command-injection, path-escape, or credential exfiltration are especially welcome.
 
-I aim to acknowledge new reports within a few business days. Coordinated disclosure is appreciated; please give me a reasonable window to ship a fix before publishing details.
+We aim to acknowledge new reports within a few business days. Coordinated disclosure is appreciated; please give us a reasonable window to ship a fix before publishing details.
 
 ## Scope
 
