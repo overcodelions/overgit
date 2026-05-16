@@ -6,6 +6,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- File editor now uses CodeMirror for syntax highlighting (replaces `highlight.js`).
+
 ## [0.1.0] - 2026-05-09
 
 Initial public release. Building in the open from here.
