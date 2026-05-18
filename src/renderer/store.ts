@@ -663,8 +663,15 @@ export const useStore = create<UiState>((set, get) => ({
       ws.preferredBranch = preferredBranch.trim();
     }
     const worksets = [...get().worksets, ws];
-    set({ worksets, selectedWorksetId: ws.id, selectedRepoId: null });
+    set({
+      worksets,
+      selectedWorksetId: ws.id,
+      selectedRepoId: null,
+      selectedWorkspaceId: null,
+    });
     await window.overgit.invoke('store:saveWorksets', worksets);
+    void get().refreshWorksetStatus(ws.id);
+    void get().refreshWorksetPRs(ws.id);
   },
 
   selectWorkset: (id) => {
