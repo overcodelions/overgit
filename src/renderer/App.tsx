@@ -38,7 +38,8 @@ const EMPTY_WORKTREES: Worktree[] = [];
 const EMPTY_ACTIVITY: WorksetActivity[] = [];
 
 export function App(): JSX.Element {
-  const { loaded, hydrate } = useStore();
+  const loaded = useStore((s) => s.loaded);
+  const hydrate = useStore((s) => s.hydrate);
   const sidebarVisible = useStore((s) => s.settings.sidebarVisible);
 
   useEffect(() => {
