@@ -851,6 +851,8 @@ function CherryPickMode({
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const pushToast = useStore((s) => s.pushToast);
+  const dismissToast = useStore((s) => s.dismissToast);
 
   useEffect(() => {
     let cancelled = false;
@@ -878,6 +880,11 @@ function CherryPickMode({
     if (picked.size === 0) return;
     setBusy(true);
     setError(null);
+    const progressId = pushToast({
+      kind: 'info',
+      sticky: true,
+      message: `Cherry-picking ${picked.size} ${picked.size === 1 ? 'commit' : 'commits'}…`,
+    });
     try {
       // Apply in oldest-to-newest order so the resulting history reads
       // chronologically and conflicts arise in the same order they would
@@ -898,8 +905,13 @@ function CherryPickMode({
         );
         return;
       }
+      pushToast({
+        kind: 'success',
+        message: `Cherry-picked ${ordered.length} ${ordered.length === 1 ? 'commit' : 'commits'}.`,
+      });
       onClose();
     } finally {
+      dismissToast(progressId);
       setBusy(false);
     }
   };
