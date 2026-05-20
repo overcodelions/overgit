@@ -910,13 +910,44 @@ export const useStore = create<UiState>((set, get) => ({
   },
 
   checkoutWorksetBranch: async (id, branch, createIfMissing) => {
-    const outcomes = await window.overgit.invoke('workset:checkoutBranch', {
-      worksetId: id,
-      branch,
-      createIfMissing,
+    const ws = get().worksets.find((w) => w.id === id);
+    const repoCount = ws ? ws.repoIds.length : 0;
+    const progressId = get().pushToast({
+      kind: 'info',
+      sticky: true,
+      message: `Switching to ${branch} across ${repoCount} ${repoCount === 1 ? 'repo' : 'repos'}…`,
     });
-    set({ lastCheckout: { worksetId: id, branch, outcomes } });
-    await get().refreshWorksetStatus(id, true);
+    try {
+      const outcomes = await window.overgit.invoke('workset:checkoutBranch', {
+        worksetId: id,
+        branch,
+        createIfMissing,
+      });
+      set({ lastCheckout: { worksetId: id, branch, outcomes } });
+      await get().refreshWorksetStatus(id, true);
+      const problems = outcomes.filter(
+        (o) => o.result !== 'switched' && o.result !== 'already-on-branch',
+      );
+      if (problems.length === 0) {
+        get().pushToast({
+          kind: 'success',
+          message: `Switched ${outcomes.length} ${outcomes.length === 1 ? 'repo' : 'repos'} to ${branch}.`,
+        });
+      } else {
+        get().pushToast({
+          kind: 'warn',
+          message: `${outcomes.length - problems.length} switched, ${problems.length} need attention.`,
+        });
+      }
+    } catch (err) {
+      get().pushToast({
+        kind: 'error',
+        message: `Switch failed: ${err instanceof Error ? err.message : String(err)}`,
+        sticky: true,
+      });
+    } finally {
+      get().dismissToast(progressId);
+    }
   },
 
   resumeWorksetBranch: async (id, branch) => {
@@ -969,11 +1000,22 @@ export const useStore = create<UiState>((set, get) => ({
   },
 
   fetchWorkset: async (id) => {
-    await window.overgit.invoke('workset:fetchAll', id);
-    await Promise.all([
-      get().refreshWorksetStatus(id, true),
-      get().refreshWorksetPRs(id, true),
-    ]);
+    const ws = get().worksets.find((w) => w.id === id);
+    const repoCount = ws ? ws.repoIds.length : 0;
+    const progressId = get().pushToast({
+      kind: 'info',
+      sticky: true,
+      message: `Fetching ${repoCount} ${repoCount === 1 ? 'repo' : 'repos'} from remote…`,
+    });
+    try {
+      await window.overgit.invoke('workset:fetchAll', id);
+      await Promise.all([
+        get().refreshWorksetStatus(id, true),
+        get().refreshWorksetPRs(id, true),
+      ]);
+    } finally {
+      get().dismissToast(progressId);
+    }
   },
 
   refreshRepoDiff: async (id, sha) => {
@@ -1312,10 +1354,17 @@ export const useStore = create<UiState>((set, get) => ({
     // at the end so we don't fire N status calls during the fan-out.
     // `repo:fetch` already passes a network timeout so a stalled remote
     // can't pin this forever.
+    const FETCH_CONCURRENCY = 3;
+    let next = 0;
+    const worker = async () => {
+      while (true) {
+        const i = next++;
+        if (i >= ids.length) return;
+        await window.overgit.invoke('repo:fetch', ids[i]).catch(() => undefined);
+      }
+    };
     await Promise.all(
-      ids.map((id) =>
-        window.overgit.invoke('repo:fetch', id).catch(() => undefined),
-      ),
+      Array.from({ length: Math.min(FETCH_CONCURRENCY, ids.length) }, worker),
     );
     await get().refreshAllRepoStatuses();
   },

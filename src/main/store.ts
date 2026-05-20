@@ -64,16 +64,46 @@ function current(): StoreSnapshot {
   return cached;
 }
 
-function save(): void {
+const SAVE_DEBOUNCE_MS = 250;
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingSave = false;
+
+function writeNow(): void {
   if (!cached) return;
   const p = storePath();
   fs.mkdirSync(path.dirname(p), { recursive: true });
   // Atomic write: tmp + rename so a crash mid-write doesn't leave a
   // half-written JSON that refuses to decode on next launch.
   const tmp = `${p}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(cached, null, 2), 'utf-8');
+  fs.writeFileSync(tmp, JSON.stringify(cached), 'utf-8');
   fs.renameSync(tmp, p);
+  pendingSave = false;
 }
+
+// Coalesce bursts (a sidebar/aside resize drag fires saveSettings on every
+// mousemove) into a single trailing disk write so we don't block the main
+// process with dozens of synchronous whole-snapshot writes per second.
+function save(): void {
+  if (!cached) return;
+  pendingSave = true;
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    writeNow();
+  }, SAVE_DEBOUNCE_MS);
+}
+
+// Flush any pending debounced write synchronously on process exit so the
+// last change isn't lost when the app quits during the debounce window.
+process.once('exit', () => {
+  if (pendingSave) {
+    try {
+      writeNow();
+    } catch {
+      /* best-effort flush on exit */
+    }
+  }
+});
 
 export const Store = {
   load(): StoreSnapshot {
