@@ -1147,7 +1147,25 @@ export async function rawDiff(
     if (!res.ok) {
       return { ok: false, text: '', error: res.stderr.trim() || `git exited ${res.code}` };
     }
-    return { ok: true, text: res.stdout };
+    let text = res.stdout;
+    // `git diff HEAD` only covers tracked content, so untracked files
+    // among the selected paths produce nothing. Synthesize an "add" diff
+    // for each via `--no-index /dev/null <path>` (the same trick diffFile
+    // uses) so a brand-new file still shows up — otherwise selecting only
+    // untracked files reads as "no changes vs HEAD".
+    const others = await run(repoPath, [
+      'ls-files', '--others', '--exclude-standard', '-z', '--', ...paths,
+    ]);
+    if (others.ok) {
+      for (const p of others.stdout.split('\0').filter(Boolean)) {
+        const add = await run(repoPath, [
+          'diff', '--no-index', '--no-color', '--', '/dev/null', p,
+        ]);
+        // --no-index exits 1 when a diff exists (the normal case here).
+        if (add.code === 0 || add.code === 1) text += add.stdout;
+      }
+    }
+    return { ok: true, text };
   }
   const args = scope === 'staged'
     ? ['diff', '--cached', '--no-color']
