@@ -37,6 +37,12 @@ const EMPTY_PRS: RepoPRs[] = [];
 const EMPTY_WORKTREES: Worktree[] = [];
 const EMPTY_ACTIVITY: WorksetActivity[] = [];
 
+// Alphabetical repo ordering for workspace member lists (sidebar,
+// keyboard nav, and the detail table all share this so they stay in
+// sync). Persisted `repoIds` order is left untouched.
+const byRepoName = (a: Repo, b: Repo): number =>
+  a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+
 export function App(): JSX.Element {
   const loaded = useStore((s) => s.loaded);
   const hydrate = useStore((s) => s.hydrate);
@@ -713,9 +719,11 @@ function Sidebar(): JSX.Element {
     for (const w of visibleWorkspaces) {
       rows.push({ kind: 'workspace', id: w.id });
       if (!w.collapsed) {
-        for (const repoId of w.repoIds) {
-          if (repoById.has(repoId)) rows.push({ kind: 'repo', id: repoId });
-        }
+        const members = w.repoIds
+          .map((id) => repoById.get(id))
+          .filter((r): r is Repo => Boolean(r))
+          .sort(byRepoName);
+        for (const r of members) rows.push({ kind: 'repo', id: r.id });
       }
     }
     for (const g of repoGroups) {
@@ -866,6 +874,7 @@ function Sidebar(): JSX.Element {
                     w.repoIds
                       .map((id) => repoById.get(id))
                       .filter((r): r is Repo => Boolean(r))
+                      .sort(byRepoName)
                       .map((r) => {
                         const ridx = rowIndex.get(`repo:${r.id}`) ?? -1;
                         return (
@@ -1733,7 +1742,8 @@ function WorkspaceDetail({ workspaceId }: { workspaceId: UUID }): JSX.Element {
     const byId = new Map(repos.map((r) => [r.id, r] as const));
     return workspace.repoIds
       .map((id) => byId.get(id))
-      .filter((r): r is Repo => Boolean(r));
+      .filter((r): r is Repo => Boolean(r))
+      .sort(byRepoName);
   }, [workspace, repos]);
 
   const aggregate = useMemo(() => {
