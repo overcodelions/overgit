@@ -116,7 +116,7 @@
     "typescript": "^5.7.2",
     "vite": "^6.0.3",
     "vitest": "^4.1.4",
-    "wait-on": "^8.0.1"
+    "wait-on": "^9.0.10"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.2",
