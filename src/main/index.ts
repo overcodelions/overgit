@@ -58,6 +58,9 @@ import {
   removeRemote,
   removeWorktree,
   initRepo,
+  cloneRepo,
+  cancelClone,
+  validateCloneUrl,
   headCommit,
   looksLikeRepo,
   markResolved,
@@ -278,6 +281,95 @@ function registerIpc(): void {
       return { ok: true as const, repo };
     },
   );
+
+  ipcMain.handle('repo:pickCloneParent', async () => {
+    if (!mainWindow) return { ok: false as const, cancelled: true as const };
+    const last = Store.load().settings.lastClonedParent;
+    const result = await dialog.showOpenDialog(mainWindow, {
+      properties: ['openDirectory', 'createDirectory'],
+      title: 'Clone into…',
+      buttonLabel: 'Choose',
+      defaultPath: last && fs.existsSync(last) ? last : undefined,
+    });
+    if (result.canceled || result.filePaths.length === 0) {
+      return { ok: false as const, cancelled: true as const };
+    }
+    return { ok: true as const, path: result.filePaths[0] };
+  });
+
+  ipcMain.handle(
+    'repo:clone',
+    async (
+      _e,
+      args: {
+        cloneId: string;
+        url: string;
+        parent: string;
+        folder: string;
+        branch?: string;
+        depth?: number;
+      },
+    ) => {
+      const urlCheck = validateCloneUrl(args.url);
+      if (!urlCheck.ok) return { ok: false as const, error: urlCheck.error };
+
+      const folder = args.folder.trim();
+      if (!folder) return { ok: false as const, error: 'Folder name is required' };
+      // Reject path separators and traversal so the clone lands exactly
+      // inside `parent`. `git clone` would happily accept `../foo` here.
+      if (/[\\/]/.test(folder) || folder === '.' || folder === '..') {
+        return { ok: false as const, error: 'Folder name cannot contain slashes' };
+      }
+
+      const parent = args.parent;
+      if (!parent || !fs.existsSync(parent)) {
+        return { ok: false as const, error: 'Parent folder does not exist' };
+      }
+      const dest = path.join(parent, folder);
+      if (fs.existsSync(dest)) {
+        return { ok: false as const, error: `"${folder}" already exists in that folder` };
+      }
+
+      const send = (line: string) => {
+        mainWindow?.webContents.send('main:event', {
+          kind: 'repo:cloneProgress',
+          cloneId: args.cloneId,
+          line,
+        });
+      };
+
+      const res = await cloneRepo(
+        args.url,
+        dest,
+        { cloneId: args.cloneId, branch: args.branch, depth: args.depth },
+        send,
+      );
+      if (!res.ok) {
+        // Clean up the partial directory git left behind on failure so a
+        // retry with the same folder name doesn't trip the "already exists"
+        // check above. Best-effort; ignore errors.
+        try {
+          fs.rmSync(dest, { recursive: true, force: true });
+        } catch {
+          /* ignore */
+        }
+        return { ok: false as const, error: res.error ?? 'Clone failed', cancelled: res.cancelled };
+      }
+
+      // Persist the parent dir so the next clone prefills it.
+      const state = Store.load();
+      if (state.settings.lastClonedParent !== parent) {
+        Store.saveSettings({ ...state.settings, lastClonedParent: parent });
+      }
+
+      const repo = await addRepoFromPath(dest);
+      return { ok: true as const, repo };
+    },
+  );
+
+  ipcMain.handle('repo:cancelClone', (_e, cloneId: string) => {
+    return { ok: cancelClone(cloneId) };
+  });
 
   ipcMain.handle('repo:pickAndAdd', async () => {
     if (!mainWindow) return { ok: false, error: 'No window' };
