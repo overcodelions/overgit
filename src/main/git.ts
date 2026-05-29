@@ -503,6 +503,132 @@ export function looksLikeRepo(repoPath: string): boolean {
   }
 }
 
+/// Whitelist of URL schemes overgit will hand to `git clone`. Local-disk
+/// paths skip this entirely; for anything that looks like a URL, only
+/// these schemes are allowed. Keeps a malicious paste from invoking an
+/// arbitrary git transport helper (`ext::sh -c …` etc.).
+const ALLOWED_CLONE_SCHEMES = new Set(['https', 'http', 'ssh', 'git', 'file']);
+/// `git@github.com:org/repo.git` — scp-like syntax that doesn't parse as
+/// a URL but is the most common SSH form. Validated separately.
+const SCP_LIKE_URL_RE = /^[a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+:[^\s]+$/;
+
+export function validateCloneUrl(raw: string): { ok: true } | { ok: false; error: string } {
+  const url = raw.trim();
+  if (!url) return { ok: false, error: 'URL is required' };
+  if (SCP_LIKE_URL_RE.test(url)) return { ok: true };
+  try {
+    const parsed = new URL(url);
+    const scheme = parsed.protocol.replace(/:$/, '');
+    if (!ALLOWED_CLONE_SCHEMES.has(scheme)) {
+      return { ok: false, error: `Unsupported URL scheme "${scheme}"` };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, error: 'Not a valid URL (expected https://, ssh://, or git@host:path)' };
+  }
+}
+
+/// Default folder name `git clone` would pick when you don't pass one.
+/// Used to prefill the form so the user only types when they want
+/// something different from the conventional name.
+export function defaultCloneFolderName(url: string): string {
+  const trimmed = url.trim();
+  // scp-like → take the part after the colon
+  let tail = trimmed;
+  if (SCP_LIKE_URL_RE.test(trimmed)) {
+    tail = trimmed.split(':').slice(1).join(':');
+  } else {
+    try {
+      tail = new URL(trimmed).pathname;
+    } catch {
+      tail = trimmed;
+    }
+  }
+  const last = tail.replace(/[/\\]+$/, '').split(/[/\\]/).pop() ?? '';
+  return last.replace(/\.git$/i, '');
+}
+
+interface ClonePending {
+  child: ReturnType<typeof spawn>;
+  cancelled: boolean;
+}
+const clonesInFlight = new Map<string, ClonePending>();
+
+/// Spawn `git clone --progress <url> <dest>` and stream stderr lines to
+/// `onProgress`. Resolves with `{ ok, error?, cancelled? }`. Doesn't go
+/// through the per-repo `withRepoLock` queue because the destination
+/// isn't a repo yet; concurrency is bounded by the renderer instead.
+export function cloneRepo(
+  url: string,
+  dest: string,
+  opts: { cloneId: string; branch?: string; depth?: number },
+  onProgress: (line: string) => void,
+): Promise<{ ok: boolean; error?: string; cancelled?: boolean }> {
+  const args = ['clone', '--progress'];
+  if (opts.branch && opts.branch.trim()) args.push('--branch', opts.branch.trim());
+  if (opts.depth && opts.depth > 0) args.push('--depth', String(Math.floor(opts.depth)));
+  args.push('--', url, dest);
+
+  return new Promise((resolve) => {
+    const child = spawn('git', args, { env: { ...process.env, ...NETWORK_ENV } });
+    const pending: ClonePending = { child, cancelled: false };
+    clonesInFlight.set(opts.cloneId, pending);
+
+    let stderrTail = '';
+    let buffer = '';
+    const emitLines = (chunk: string) => {
+      buffer += chunk;
+      // git's --progress uses \r to update; treat both \r and \n as line breaks.
+      let m: RegExpMatchArray | null;
+      while ((m = buffer.match(/[\r\n]/))) {
+        const idx = m.index ?? 0;
+        const line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 1);
+        if (line) onProgress(line);
+      }
+    };
+    child.stderr.on('data', (b: Buffer) => {
+      const s = b.toString('utf8');
+      stderrTail = (stderrTail + s).slice(-4096);
+      emitLines(s);
+    });
+    child.stdout.on('data', (b: Buffer) => {
+      // git clone is mostly silent on stdout but emit anything that does come.
+      emitLines(b.toString('utf8'));
+    });
+    child.on('error', (err) => {
+      clonesInFlight.delete(opts.cloneId);
+      resolve({ ok: false, error: String(err) });
+    });
+    child.on('close', (code) => {
+      clonesInFlight.delete(opts.cloneId);
+      if (buffer) onProgress(buffer);
+      if (pending.cancelled) {
+        resolve({ ok: false, cancelled: true, error: 'Clone cancelled' });
+        return;
+      }
+      if (code === 0) {
+        resolve({ ok: true });
+        return;
+      }
+      const tail = stderrTail.trim().split(/\r?\n/).filter(Boolean).pop();
+      resolve({ ok: false, error: tail || `git clone exited ${code}` });
+    });
+  });
+}
+
+export function cancelClone(cloneId: string): boolean {
+  const pending = clonesInFlight.get(cloneId);
+  if (!pending) return false;
+  pending.cancelled = true;
+  try {
+    pending.child.kill('SIGTERM');
+  } catch {
+    /* ignore */
+  }
+  return true;
+}
+
 export async function initRepo(
   repoPath: string,
   opts: { initialBranch?: string },
