@@ -55,6 +55,7 @@ export type Sheet =
   | { kind: 'manageRepo'; repoId: UUID; tab: 'tags' | 'remotes' | 'submodules' | 'identity' }
   | { kind: 'pullConflict'; repoId: UUID; conflicts: string[]; rawError: string }
   | { kind: 'initRepo'; path: string; reason: string }
+  | { kind: 'cloneRepo' }
   | { kind: 'resolveConflict'; repoId: UUID; path: string }
   | { kind: 'abandonLocal'; repoId: UUID };
 

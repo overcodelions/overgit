@@ -617,6 +617,11 @@ export interface AppSettings {
   /// Missing entries default to 'graph' so the existing behavior
   /// is preserved on upgrade.
   historyMode?: Record<UUID, 'graph' | 'list'>;
+  /// Last parent directory the user chose for "Clone repo". Prefilled
+  /// next time so they don't have to navigate to ~/code on every clone.
+  /// Validated on use — if the directory no longer exists we fall back
+  /// to the picker with no default.
+  lastClonedParent?: string;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -654,6 +659,30 @@ export interface IPCInvokeMap {
   'repo:init': (args: { path: string; initialBranch?: string }) =>
     | { ok: true; repo: Repo }
     | { ok: false; error: string };
+  /// Open a folder picker for the "clone into" parent directory. Returns
+  /// the chosen folder (or cancelled). Kept separate from `repo:clone`
+  /// so the picker can be re-opened without resubmitting the form.
+  'repo:pickCloneParent': () =>
+    | { ok: true; path: string }
+    | { ok: false; cancelled: true };
+  /// Run `git clone --progress <url> <parent>/<folder>`, streaming
+  /// progress lines via `main:event` (`repo:cloneProgress`, keyed by
+  /// `cloneId`). The IPC promise resolves once the child exits — on
+  /// success the new path is registered as a repo, same as `repo:add`.
+  /// `branch` and `depth` map to `--branch` and `--depth` if set.
+  'repo:clone': (args: {
+    cloneId: string;
+    url: string;
+    parent: string;
+    folder: string;
+    branch?: string;
+    depth?: number;
+  }) =>
+    | { ok: true; repo: Repo }
+    | { ok: false; error: string; cancelled?: boolean };
+  /// Cancel an in-flight clone. SIGTERMs the child; the corresponding
+  /// `repo:clone` promise resolves with `{ ok: false, cancelled: true }`.
+  'repo:cancelClone': (cloneId: string) => { ok: boolean };
   /// Open a folder picker (multi-select enabled) and add every git repo
   /// found among the chosen paths. A chosen path that isn't itself a
   /// repo is scanned one level deep — picking a parent like ~/code adds
@@ -1313,4 +1342,12 @@ export interface StoreSnapshot {
 /// status updates (e.g. progress during a workset fetch).
 export type MainToRendererEvent =
   | { kind: 'repo:statusUpdated'; status: RepoStatus }
-  | { kind: 'workset:checkoutProgress'; worksetId: UUID; outcome: CheckoutOutcome };
+  | { kind: 'workset:checkoutProgress'; worksetId: UUID; outcome: CheckoutOutcome }
+  | {
+      kind: 'repo:cloneProgress';
+      cloneId: string;
+      /// One stderr line from `git clone --progress`. Includes the
+      /// trailing carriage-return progress updates ("Receiving objects:
+      /// 42% …") that git emits on its own line.
+      line: string;
+    };
