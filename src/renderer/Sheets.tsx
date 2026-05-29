@@ -139,6 +139,7 @@ export function SheetHost(): JSX.Element | null {
         {sheet.kind === 'initRepo' && (
           <InitRepoSheet path={sheet.path} reason={sheet.reason} />
         )}
+        {sheet.kind === 'cloneRepo' && <CloneRepoSheet />}
         {sheet.kind === 'resolveConflict' && (
           <ResolveConflictSheet repoId={sheet.repoId} path={sheet.path} />
         )}
@@ -247,6 +248,353 @@ function InitRepoSheet({ path, reason }: { path: string; reason: string }): JSX.
           className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
         >
           {busy ? 'Initializing…' : 'Initialize and add'}
+        </button>
+      </div>
+    </>
+  );
+}
+
+/// Pull the repo URL out of a pasted `git clone …` command. Lets the
+/// user paste straight from a README / forge "Clone" button without
+/// hand-trimming. Returns the input unchanged when no recognisable
+/// shape is found, so plain URLs still flow through.
+function extractCloneUrl(raw: string): string {
+  const collapsed = raw.replace(/\s+/g, ' ').trim();
+  if (!collapsed) return raw;
+  const m = collapsed.match(/\bgit\s+clone\b\s+(.*)$/i);
+  const tail = m ? m[1] : collapsed;
+  // Walk tokens, skipping flags (`--depth 1`, `--branch=foo`, `-b foo`)
+  // and quotes, and return the first thing that looks like a URL.
+  const tokens = tail.match(/(?:"[^"]*"|'[^']*'|\S)+/g) ?? [];
+  for (let i = 0; i < tokens.length; i++) {
+    let t = tokens[i].replace(/^['"]|['"]$/g, '');
+    if (t.startsWith('--')) {
+      // `--depth=1` is self-contained; `--depth 1` consumes the next token.
+      if (!t.includes('=')) i += 1;
+      continue;
+    }
+    if (t.startsWith('-') && t.length > 1) {
+      i += 1;
+      continue;
+    }
+    if (
+      /^(https?|ssh|git|file):\/\//i.test(t) ||
+      /^[a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+:[^\s]+$/.test(t)
+    ) {
+      return t;
+    }
+  }
+  return raw;
+}
+
+function defaultFolderFromUrl(url: string): string {
+  const trimmed = url.trim();
+  if (!trimmed) return '';
+  const scpLike = /^[a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+:[^\s]+$/.test(trimmed);
+  let tail = trimmed;
+  if (scpLike) {
+    tail = trimmed.split(':').slice(1).join(':');
+  } else {
+    try {
+      tail = new URL(trimmed).pathname;
+    } catch {
+      tail = trimmed;
+    }
+  }
+  const last = tail.replace(/[/\\]+$/, '').split(/[/\\]/).pop() ?? '';
+  return last.replace(/\.git$/i, '');
+}
+
+function CloneRepoSheet(): JSX.Element {
+  const setSheet = useStore((s) => s.setSheet);
+  const settings = useStore((s) => s.settings);
+  const pushToast = useStore((s) => s.pushToast);
+  const selectRepo = useStore((s) => s.selectRepo);
+  const repos = useStore((s) => s.repos);
+  const refreshAllRepoStatuses = useStore((s) => s.refreshAllRepoStatuses);
+
+  const [url, setUrl] = useState('');
+  const [parent, setParent] = useState(settings.lastClonedParent ?? '');
+  const [folder, setFolder] = useState('');
+  const [folderTouched, setFolderTouched] = useState(false);
+  const [branch, setBranch] = useState('');
+  const [depth, setDepth] = useState('');
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [progressLines, setProgressLines] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const cloneIdRef = useRef<string | null>(null);
+  const progressEndRef = useRef<HTMLDivElement | null>(null);
+
+  // Auto-fill folder name from URL until the user starts typing their own.
+  useEffect(() => {
+    if (folderTouched) return;
+    setFolder(defaultFolderFromUrl(url));
+  }, [url, folderTouched]);
+
+  // Subscribe to clone progress events for *this* clone only.
+  useEffect(() => {
+    const off = window.overgit.onMainEvent((evt) => {
+      if (evt.kind !== 'repo:cloneProgress') return;
+      if (evt.cloneId !== cloneIdRef.current) return;
+      setProgressLines((prev) => {
+        // git --progress emits the same "Receiving objects: N%" line many
+        // times with rising N. Replace the last line when the new one
+        // shares its prefix, so the panel scrolls smoothly instead of
+        // accumulating 800 near-identical entries.
+        const next = [...prev];
+        const last = next[next.length - 1];
+        const headOf = (s: string) => s.split(':')[0];
+        if (last && headOf(last) === headOf(evt.line) && /\d+%/.test(evt.line)) {
+          next[next.length - 1] = evt.line;
+        } else {
+          next.push(evt.line);
+        }
+        return next;
+      });
+    });
+    return off;
+  }, []);
+
+  useEffect(() => {
+    progressEndRef.current?.scrollIntoView({ block: 'end' });
+  }, [progressLines]);
+
+  const urlError = useMemo(() => {
+    const trimmed = url.trim();
+    if (!trimmed) return null;
+    const scpLike = /^[a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+:[^\s]+$/.test(trimmed);
+    if (scpLike) return null;
+    try {
+      const u = new URL(trimmed);
+      const scheme = u.protocol.replace(/:$/, '');
+      if (!['https', 'http', 'ssh', 'git', 'file'].includes(scheme)) {
+        return `Unsupported scheme "${scheme}"`;
+      }
+      return null;
+    } catch {
+      return 'Expected https://, ssh://, or git@host:path';
+    }
+  }, [url]);
+
+  const folderError = useMemo(() => {
+    if (!folder.trim()) return null;
+    if (/[\\/]/.test(folder)) return 'No slashes';
+    if (folder === '.' || folder === '..') return 'Pick a real folder name';
+    return null;
+  }, [folder]);
+
+  const canSubmit =
+    !busy &&
+    url.trim().length > 0 &&
+    !urlError &&
+    parent.trim().length > 0 &&
+    folder.trim().length > 0 &&
+    !folderError;
+
+  const onPickParent = async () => {
+    const res = await window.overgit.invoke('repo:pickCloneParent');
+    if (!res.ok) return;
+    setParent(res.path);
+  };
+
+  const onCancel = async () => {
+    if (busy && cloneIdRef.current) {
+      await window.overgit.invoke('repo:cancelClone', cloneIdRef.current);
+      return;
+    }
+    setSheet(null);
+  };
+
+  const onClone = async () => {
+    if (!canSubmit) return;
+    const cloneId =
+      typeof crypto !== 'undefined' && 'randomUUID' in crypto
+        ? crypto.randomUUID()
+        : `clone-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    cloneIdRef.current = cloneId;
+    setBusy(true);
+    setError(null);
+    setProgressLines([]);
+
+    const depthNum = depth.trim() ? Number(depth) : undefined;
+    const res = await window.overgit.invoke('repo:clone', {
+      cloneId,
+      url: url.trim(),
+      parent: parent.trim(),
+      folder: folder.trim(),
+      branch: showAdvanced && branch.trim() ? branch.trim() : undefined,
+      depth: depthNum && Number.isFinite(depthNum) && depthNum > 0 ? depthNum : undefined,
+    });
+
+    cloneIdRef.current = null;
+    setBusy(false);
+
+    if (!res.ok) {
+      if (res.cancelled) {
+        pushToast({ kind: 'warn', message: 'Clone cancelled.' });
+        setSheet(null);
+      } else {
+        setError(res.error);
+      }
+      return;
+    }
+
+    // Merge: drop any existing entry with the same id, append the new one.
+    const merged = [...repos.filter((r) => r.id !== res.repo.id), res.repo];
+    useStore.setState({ repos: merged });
+    await window.overgit.invoke('store:saveRepos', merged);
+    pushToast({ kind: 'success', message: `Cloned ${res.repo.name}.` });
+    selectRepo(res.repo.id);
+    void refreshAllRepoStatuses();
+    setSheet(null);
+  };
+
+  return (
+    <>
+      <SheetHeader title="Clone a repo" onClose={() => setSheet(null)} />
+      <div className="flex-1 min-h-0 p-5 flex flex-col gap-4 text-sm overflow-y-auto">
+        <label className="flex flex-col gap-1">
+          <span className="text-[10px] uppercase tracking-wide text-ink-faint">URL</span>
+          <input
+            autoFocus
+            value={url}
+            onChange={(e) => setUrl(extractCloneUrl(e.target.value))}
+            onPaste={(e) => {
+              const pasted = e.clipboardData.getData('text');
+              const cleaned = extractCloneUrl(pasted);
+              if (cleaned !== pasted) {
+                e.preventDefault();
+                setUrl(cleaned);
+              }
+            }}
+            disabled={busy}
+            placeholder="https://github.com/user/repo.git  ·  git@github.com:user/repo.git  ·  paste `git clone …`"
+            className="field px-2 py-1.5 text-sm font-mono"
+          />
+          {urlError ? (
+            <span className="text-[11px] text-red-400">{urlError}</span>
+          ) : (
+            <span className="text-[11px] text-ink-faint">
+              https, ssh, or scp-style. Auth comes from your shell env.
+            </span>
+          )}
+        </label>
+
+        <label className="flex flex-col gap-1">
+          <span className="text-[10px] uppercase tracking-wide text-ink-faint">Clone into</span>
+          <div className="flex gap-2">
+            <input
+              value={parent}
+              onChange={(e) => setParent(e.target.value)}
+              disabled={busy}
+              placeholder="~/code"
+              className="field px-2 py-1.5 text-sm font-mono flex-1"
+            />
+            <button
+              type="button"
+              onClick={onPickParent}
+              disabled={busy}
+              className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+            >
+              Choose…
+            </button>
+          </div>
+          {settings.lastClonedParent && parent === settings.lastClonedParent ? (
+            <span className="text-[11px] text-ink-faint">Last used.</span>
+          ) : null}
+        </label>
+
+        <label className="flex flex-col gap-1">
+          <span className="text-[10px] uppercase tracking-wide text-ink-faint">Folder name</span>
+          <input
+            value={folder}
+            onChange={(e) => {
+              setFolderTouched(true);
+              setFolder(e.target.value);
+            }}
+            disabled={busy}
+            placeholder="repo"
+            className="field px-2 py-1.5 text-sm font-mono"
+          />
+          {folderError ? (
+            <span className="text-[11px] text-red-400">{folderError}</span>
+          ) : (
+            <span className="text-[11px] text-ink-faint break-all">
+              {parent && folder ? `Will create ${parent.replace(/\/$/, '')}/${folder}` : ''}
+            </span>
+          )}
+        </label>
+
+        <button
+          type="button"
+          onClick={() => setShowAdvanced((v) => !v)}
+          className="text-[11px] text-ink-faint hover:text-ink self-start"
+        >
+          {showAdvanced ? '− Hide advanced' : '+ Advanced (branch, depth)'}
+        </button>
+
+        {showAdvanced && (
+          <div className="grid grid-cols-[1fr_140px] gap-3">
+            <label className="flex flex-col gap-1">
+              <span className="text-[10px] uppercase tracking-wide text-ink-faint">
+                Branch (--branch)
+              </span>
+              <input
+                value={branch}
+                onChange={(e) => setBranch(e.target.value)}
+                disabled={busy}
+                placeholder="leave blank for default"
+                className="field px-2 py-1.5 text-sm font-mono"
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-[10px] uppercase tracking-wide text-ink-faint">
+                Depth (--depth)
+              </span>
+              <input
+                value={depth}
+                onChange={(e) => setDepth(e.target.value.replace(/[^\d]/g, ''))}
+                disabled={busy}
+                placeholder="full"
+                className="field px-2 py-1.5 text-sm font-mono"
+              />
+            </label>
+          </div>
+        )}
+
+        {(busy || progressLines.length > 0 || error) && (
+          <div className="flex flex-col gap-1.5">
+            <span className="text-[10px] uppercase tracking-wide text-ink-faint">Progress</span>
+            <div className="rounded border border-card bg-surface px-2.5 py-2 max-h-44 overflow-y-auto text-[11px] font-mono leading-relaxed">
+              {progressLines.length === 0 && busy ? (
+                <div className="text-ink-faint">Starting…</div>
+              ) : (
+                progressLines.map((line, i) => (
+                  <div key={i} className="whitespace-pre-wrap break-all text-ink-muted">
+                    {line}
+                  </div>
+                ))
+              )}
+              <div ref={progressEndRef} />
+            </div>
+            {error && <span className="text-[11px] text-red-400 break-all">{error}</span>}
+          </div>
+        )}
+      </div>
+      <div className="flex-shrink-0 flex items-center justify-end gap-2 border-t border-card px-5 py-3">
+        <button
+          onClick={onCancel}
+          className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
+        >
+          {busy ? 'Cancel clone' : 'Cancel'}
+        </button>
+        <button
+          onClick={onClone}
+          disabled={!canSubmit}
+          className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+        >
+          {busy ? 'Cloning…' : 'Clone'}
         </button>
       </div>
     </>
