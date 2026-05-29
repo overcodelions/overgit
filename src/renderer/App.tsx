@@ -1072,6 +1072,12 @@ function Sidebar(): JSX.Element {
           + Add repo
         </button>
         <button
+          onClick={() => setSheet({ kind: 'cloneRepo' })}
+          className="text-xs text-ink-muted hover:text-ink py-1 px-2 rounded hover:bg-card text-left"
+        >
+          + Clone repo
+        </button>
+        <button
           onClick={() => setSheet({ kind: 'newWorkspace' })}
           disabled={repos.length === 0}
           className="text-xs text-ink-muted hover:text-ink py-1 px-2 rounded hover:bg-card text-left disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-ink-muted"
