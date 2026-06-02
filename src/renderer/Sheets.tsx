@@ -7603,8 +7603,6 @@ function ResolveConflictSheet({
   const repo = useStore((s) => s.repos.find((r) => r.id === repoId));
   const markResolved = useStore((s) => s.markResolved);
   const pushToast = useStore((s) => s.pushToast);
-  const refreshStatus = useStore((s) => s.refreshRepoStatus);
-  const refreshChanges = useStore((s) => s.refreshRepoChanges);
   const cli = useStore((s) => s.cliPresence);
 
   const aiTool: LlmTool | null = useMemo(() => {
@@ -7775,7 +7773,9 @@ function ResolveConflictSheet({
         pushToast({ kind: 'error', message: addRes.error ?? 'git add failed' });
         return;
       }
-      await Promise.all([refreshStatus(repoId), refreshChanges(repoId)]);
+      // `markResolved` already refreshes status + changes for this repo;
+      // re-running them here just doubled the git subprocess cost on every
+      // save (TTL=0 cache only dedupes in-flight calls, not sequential ones).
       pushToast({ kind: 'success', message: `Resolved ${path}.` });
       setSheet(null);
     } finally {
