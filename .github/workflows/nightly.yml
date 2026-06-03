@@ -1,0 +1,164 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    name: Check for recent commits
+    runs-on: ubuntu-latest
+    outputs:
+      should-build: ${{ steps.decide.outputs.should-build }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - id: decide
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual trigger — building."
+            echo "should-build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -n "$(git log --since='24 hours ago' --oneline)" ]; then
+            echo "Commits found in last 24h — building."
+            echo "should-build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No commits in last 24h — skipping nightly."
+            echo "should-build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build (${{ matrix.os }})
+    needs: check
+    if: needs.check.outputs.should-build == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            dist_script: dist:mac
+          - os: windows-latest
+            dist_script: dist:win
+          - os: ubuntu-latest
+            dist_script: dist:linux
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Stamp nightly version
+        shell: bash
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y%m%d)
+          node -e "
+            const fs = require('fs');
+            const p = require('./package.json');
+            const base = p.version.split('-')[0];
+            p.version = base + '-nightly.' + '${DATE}' + '.' + '${SHA}';
+            fs.writeFileSync('package.json', JSON.stringify(p, null, 2) + '\n');
+            console.log('version =', p.version);
+          "
+
+      # Code signing / notarization is intentionally not configured (matches
+      # release.yml) — macOS users will need to right-click → Open the first time.
+      - name: Build distributables
+        run: npm run ${{ matrix.dist_script }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      - name: Upload artifacts (workflow run)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: overgit-nightly-${{ matrix.os }}
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/*.exe
+            release/*.AppImage
+            release/*.deb
+          if-no-files-found: ignore
+          retention-days: 1
+
+  release:
+    name: Publish nightly release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create stable-named copies
+        shell: bash
+        run: |
+          mkdir -p stable
+          shopt -s nullglob
+          cd artifacts
+          for f in *; do
+            case "$f" in
+              *arm64*.zip)      cp "$f" "../stable/Overgit-nightly-mac-arm64.zip" ;;
+              *.zip)            cp "$f" "../stable/Overgit-nightly-mac-x64.zip" ;;
+              *arm64*.dmg)      cp "$f" "../stable/Overgit-nightly-mac-arm64.dmg" ;;
+              *.dmg)            cp "$f" "../stable/Overgit-nightly-mac-x64.dmg" ;;
+              *arm64*.exe)      cp "$f" "../stable/Overgit-nightly-win-arm64.exe" ;;
+              *.exe)            cp "$f" "../stable/Overgit-nightly-win-x64.exe" ;;
+              *arm64.AppImage)  cp "$f" "../stable/Overgit-nightly-linux-arm64.AppImage" ;;
+              *.AppImage)       cp "$f" "../stable/Overgit-nightly-linux-x64.AppImage" ;;
+              *arm64.deb)       cp "$f" "../stable/Overgit-nightly-linux-arm64.deb" ;;
+              *amd64.deb)       cp "$f" "../stable/Overgit-nightly-linux-x64.deb" ;;
+            esac
+          done
+          echo "Stable copies:"
+          ls -la ../stable
+
+      - name: Move nightly tag to current commit
+        run: |
+          git tag -f nightly
+          git push origin nightly --force
+
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: nightly
+          name: Nightly
+          prerelease: true
+          fail_on_unmatched_files: false
+          body: |
+            Auto-built nightly from commit `${{ github.sha }}`.
+
+            **Stable download links** (always point at the latest nightly):
+            - macOS (Apple Silicon): [`Overgit-nightly-mac-arm64.dmg`](https://github.com/${{ github.repository }}/releases/download/nightly/Overgit-nightly-mac-arm64.dmg)
+            - macOS (Intel): [`Overgit-nightly-mac-x64.dmg`](https://github.com/${{ github.repository }}/releases/download/nightly/Overgit-nightly-mac-x64.dmg)
+            - Windows (x64): [`Overgit-nightly-win-x64.exe`](https://github.com/${{ github.repository }}/releases/download/nightly/Overgit-nightly-win-x64.exe)
+            - Windows (ARM64): [`Overgit-nightly-win-arm64.exe`](https://github.com/${{ github.repository }}/releases/download/nightly/Overgit-nightly-win-arm64.exe)
+            - Linux (x64 AppImage): [`Overgit-nightly-linux-x64.AppImage`](https://github.com/${{ github.repository }}/releases/download/nightly/Overgit-nightly-linux-x64.AppImage)
+            - Linux (ARM64 AppImage): [`Overgit-nightly-linux-arm64.AppImage`](https://github.com/${{ github.repository }}/releases/download/nightly/Overgit-nightly-linux-arm64.AppImage)
+
+            > Pre-release. Not signed or notarized on macOS — Gatekeeper will warn on
+            > first launch (right-click → Open).
+          files: |
+            artifacts/*
+            stable/*
