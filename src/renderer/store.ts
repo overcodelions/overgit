@@ -581,7 +581,7 @@ export const useStore = create<UiState>((set, get) => ({
     // the foreground IPCs and everything feels glued. The TTL cache
     // on `refreshAllRepoStatuses` keeps repeat triggers cheap.
     window.setTimeout(() => {
-      void get().refreshAllRepoStatuses();
+      void get().refreshAllRepoStatuses(true);
     }, 600);
   },
 
@@ -636,7 +636,7 @@ export const useStore = create<UiState>((set, get) => ({
     if (result.repos[0]) get().selectRepo(result.repos[0].id);
     // Pick up sidebar dirty/upstream markers for the freshly added
     // repos without waiting for the next launch.
-    void get().refreshAllRepoStatuses();
+    void get().refreshAllRepoStatuses(true);
   },
 
   initAndAddRepo: async (path, initialBranch) => {
@@ -654,7 +654,7 @@ export const useStore = create<UiState>((set, get) => ({
     await window.overgit.invoke('store:saveRepos', merged);
     get().pushToast({ kind: 'success', message: `Initialized ${res.repo.name}.` });
     get().selectRepo(res.repo.id);
-    void get().refreshAllRepoStatuses();
+    void get().refreshAllRepoStatuses(true);
     return { ok: true };
   },
 
@@ -1157,7 +1157,7 @@ export const useStore = create<UiState>((set, get) => ({
           sticky: true,
         });
       }
-      void get().refreshAllRepoStatuses();
+      void get().refreshAllRepoStatuses(true);
     } catch (err) {
       get().dismissToast(progressId);
       get().pushToast({
@@ -1367,7 +1367,7 @@ export const useStore = create<UiState>((set, get) => ({
     await Promise.all(
       Array.from({ length: Math.min(FETCH_CONCURRENCY, ids.length) }, worker),
     );
-    await get().refreshAllRepoStatuses();
+    await get().refreshAllRepoStatuses(true);
   },
 
   refreshRepoBranchSummaries: async (id, force = false) => {

@@ -446,7 +446,7 @@ function CloneRepoSheet(): JSX.Element {
     await window.overgit.invoke('store:saveRepos', merged);
     pushToast({ kind: 'success', message: `Cloned ${res.repo.name}.` });
     selectRepo(res.repo.id);
-    void refreshAllRepoStatuses();
+    void refreshAllRepoStatuses(true);
     setSheet(null);
   };
 
@@ -3057,7 +3057,7 @@ function ResetWorkspaceProgressSheet({
     Promise.all(Array.from({ length: concurrency }, worker)).then(() => {
       if (cancelledRef.current) return;
       setAllDone(true);
-      void refreshAllRepoStatuses();
+      void refreshAllRepoStatuses(true);
       // Background mode: the React effect-tied toast won't fire
       // because the component is unmounted. Push from here directly
       // via the store so the user still gets notified.
@@ -3843,7 +3843,7 @@ function FetchWorkspaceProgressSheet({
     Promise.all(Array.from({ length: concurrency }, worker)).then(() => {
       if (cancelledRef.current) return;
       setAllDone(true);
-      void refreshAllRepoStatuses();
+      void refreshAllRepoStatuses(true);
       if (backgroundRef.current) {
         const failed = outcomes.filter((o) => !o.ok);
         const store = useStore.getState();
@@ -4142,7 +4142,7 @@ function SyncBehindProgressSheet({
     Promise.all(Array.from({ length: concurrency }, worker)).then(() => {
       if (cancelledRef.current) return;
       setAllDone(true);
-      void refreshAllRepoStatuses();
+      void refreshAllRepoStatuses(true);
       if (backgroundRef.current) {
         const failed = outcomes.filter((o) => !o.ok);
         const store = useStore.getState();
