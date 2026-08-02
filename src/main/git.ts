@@ -528,6 +528,21 @@ export function validateCloneUrl(raw: string): { ok: true } | { ok: false; error
   }
 }
 
+/// Branch / tag / remote names land in *positional* slots in the git
+/// command lines below, and git reads anything starting with `-` in
+/// those slots as an option. That's not just a typo problem: plumbing
+/// (`git update-ref refs/heads/--upload-pack=/tmp/x`) will happily
+/// create such a ref, so cloning a hostile repo can seed our branch
+/// lists with one, and a single "check out" would hand `git fetch` /
+/// `git ls-remote` an `--upload-pack=` that executes a local binary.
+/// No legitimate branch, tag, or remote name starts with `-`, so every
+/// entry point that takes a name — from the UI or from ref output —
+/// runs it past this first.
+export function isSafeRefArg(name: string): boolean {
+  const trimmed = name.trim();
+  return trimmed.length > 0 && !trimmed.startsWith('-');
+}
+
 /// Default folder name `git clone` would pick when you don't pass one.
 /// Used to prefill the form so the user only types when they want
 /// something different from the conventional name.
@@ -1003,6 +1018,9 @@ export async function checkoutBranch(
   if (!looksLikeRepo(repoPath)) {
     return { repoId, result: 'error', branch, message: 'Not a git repo' };
   }
+  if (!isSafeRefArg(branch)) {
+    return { repoId, result: 'error', branch, message: `Refusing branch name "${branch}"` };
+  }
 
   let target = branch;
   const head = await run(repoPath, ['rev-parse', '--abbrev-ref', 'HEAD']);
@@ -1029,7 +1047,9 @@ export async function checkoutBranch(
   // without making git's case-sensitive ref model leak into the UI.
   if (!localExists.ok && !remoteExists.ok) {
     const resolved = await resolveBranchCase(repoPath, target);
-    if (resolved && resolved !== target) {
+    // The rebind target comes from the repo's own refs, which is exactly
+    // where a hostile `-`-leading name would live — re-check it.
+    if (resolved && resolved !== target && isSafeRefArg(resolved)) {
       target = resolved;
       if (head.ok && head.stdout.trim() === target) {
         return { repoId, result: 'already-on-branch', branch: target };
@@ -1117,6 +1137,9 @@ export async function adoptWorktreeBranch(
 > {
   if (!looksLikeRepo(repoPath)) {
     return { ok: false, step: 'precheck', error: 'Not a git repo' };
+  }
+  if (!isSafeRefArg(branch)) {
+    return { ok: false, step: 'precheck', error: `Refusing branch name "${branch}"` };
   }
   // Refuse to clobber the main checkout. The user's `git status` output
   // is a better place to see what they need to commit/stash than this
@@ -1960,7 +1983,7 @@ export async function mergeBranch(
   mode: 'merge' | 'ff-only' | 'squash',
 ): Promise<{ ok: boolean; error?: string; output?: string; alreadyUpToDate?: boolean }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
-  if (!branch || /[\s;|`$]/.test(branch)) {
+  if (!branch || /[\s;|`$]/.test(branch) || !isSafeRefArg(branch)) {
     return { ok: false, error: `Refusing to merge "${branch}"` };
   }
   const flag =
@@ -2427,6 +2450,11 @@ export async function pullFastForward(
     return { ok: false, error: 'Detached HEAD — no upstream to sync.' };
   }
   const branch = head.stdout.trim();
+  // HEAD can point at an attacker-named ref in a cloned repo, and this
+  // one goes straight into a network command.
+  if (!isSafeRefArg(branch)) {
+    return { ok: false, error: `Refusing branch name "${branch}"` };
+  }
   // 2. Refresh origin's view of this branch. Targeted fetch — no
   // --all — so FETCH_HEAD ends up with at most one entry and the
   // remote-tracking ref we're about to merge against is fresh.
@@ -2627,6 +2655,7 @@ export async function createBranch(
 ): Promise<{ ok: boolean; error?: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
   if (!name.trim()) return { ok: false, error: 'Branch name required' };
+  if (!isSafeRefArg(name)) return { ok: false, error: `Refusing branch name "${name}"` };
   // Optional starting ref. We allow only sha-like values here; a
   // branch name would also be a valid git ref, but this codepath is
   // currently only called from the history "Branch from here" flow,
@@ -2997,6 +3026,7 @@ export async function deleteBranch(
 ): Promise<{ ok: boolean; error?: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
   if (!name.trim()) return { ok: false, error: 'Branch name required' };
+  if (!isSafeRefArg(name)) return { ok: false, error: `Refusing branch name "${name}"` };
   const flag = force ? '-D' : '-d';
   const res = await run(repoPath, ['branch', flag, name.trim()]);
   if (res.ok) return { ok: true };
@@ -3440,6 +3470,10 @@ export async function renameBranch(
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
   const target = newName.trim();
   if (!target) return { ok: false, error: 'New branch name required' };
+  if (!isSafeRefArg(target)) return { ok: false, error: `Refusing branch name "${target}"` };
+  if (from && from.trim() && !isSafeRefArg(from)) {
+    return { ok: false, error: `Refusing branch name "${from}"` };
+  }
   const flag = force ? '-M' : '-m';
   const args = ['branch', flag];
   if (from && from.trim()) args.push(from.trim());
@@ -3809,6 +3843,10 @@ export async function createTag(
 ): Promise<{ ok: boolean; error?: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
   if (!args.name.trim()) return { ok: false, error: 'Tag name required' };
+  if (!isSafeRefArg(args.name)) return { ok: false, error: `Refusing tag name "${args.name}"` };
+  if (args.ref && !isSafeRefArg(args.ref)) {
+    return { ok: false, error: `Refusing start point "${args.ref}"` };
+  }
   const argv = ['tag'];
   if (args.message && args.message.trim().length > 0) {
     // Annotated tag: -a + -m. Wrapping the message in -m ensures git
@@ -3828,6 +3866,7 @@ export async function deleteTag(
   name: string,
 ): Promise<{ ok: boolean; error?: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  if (!isSafeRefArg(name)) return { ok: false, error: `Refusing tag name "${name}"` };
   const res = await run(repoPath, ['tag', '-d', name]);
   if (res.ok) return { ok: true };
   return { ok: false, error: res.stderr.trim() || `git tag -d exited ${res.code}` };
@@ -3839,6 +3878,10 @@ export async function pushTag(
   remote: string,
 ): Promise<{ ok: boolean; error?: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  // `git push --exec=<cmd> …` runs a binary, so the remote name matters
+  // as much as the tag name here.
+  if (!isSafeRefArg(name)) return { ok: false, error: `Refusing tag name "${name}"` };
+  if (!isSafeRefArg(remote)) return { ok: false, error: `Refusing remote name "${remote}"` };
   const res = await run(repoPath, ['push', remote, `refs/tags/${name}`], undefined, NETWORK_TIMEOUT_MS);
   if (res.ok) return { ok: true };
   return { ok: false, error: res.stderr.trim() || `git push exited ${res.code}` };
@@ -3871,6 +3914,8 @@ export async function addRemote(
   url: string,
 ): Promise<{ ok: boolean; error?: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  if (!isSafeRefArg(name)) return { ok: false, error: `Refusing remote name "${name}"` };
+  if (!isSafeRefArg(url)) return { ok: false, error: `Refusing remote URL "${url}"` };
   const res = await run(repoPath, ['remote', 'add', name, url]);
   if (res.ok) return { ok: true };
   return { ok: false, error: res.stderr.trim() || `git remote add exited ${res.code}` };
@@ -3881,6 +3926,7 @@ export async function removeRemote(
   name: string,
 ): Promise<{ ok: boolean; error?: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  if (!isSafeRefArg(name)) return { ok: false, error: `Refusing remote name "${name}"` };
   const res = await run(repoPath, ['remote', 'remove', name]);
   if (res.ok) return { ok: true };
   return { ok: false, error: res.stderr.trim() || `git remote remove exited ${res.code}` };
@@ -3893,6 +3939,8 @@ export async function setRemoteUrl(
   kind: 'fetch' | 'push',
 ): Promise<{ ok: boolean; error?: string }> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  if (!isSafeRefArg(name)) return { ok: false, error: `Refusing remote name "${name}"` };
+  if (!isSafeRefArg(url)) return { ok: false, error: `Refusing remote URL "${url}"` };
   const argv = ['remote', 'set-url'];
   if (kind === 'push') argv.push('--push');
   argv.push(name, url);

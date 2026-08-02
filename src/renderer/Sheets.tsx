@@ -6,6 +6,8 @@ import type {
   BlameLine,
   CommitAllOutcome,
   FileLogCommit,
+  ForgeKind,
+  ForgeRepo,
   Identity,
   LfsStatus,
   LlmTool,
@@ -305,6 +307,52 @@ function defaultFolderFromUrl(url: string): string {
   return last.replace(/\.git$/i, '');
 }
 
+/// Where the clone URL comes from. 'url' is the original paste-a-URL
+/// flow; the forge tabs list the repos you can already reach with the
+/// credentials on this machine (gh's login, your git credential helper).
+type CloneSource = 'url' | ForgeKind;
+
+const FORGE_LABELS: Record<ForgeKind, string> = {
+  github: 'GitHub',
+  gitlab: 'GitLab',
+  bitbucket: 'Bitbucket',
+};
+
+const CLONE_SOURCES: { id: CloneSource; label: string }[] = [
+  { id: 'url', label: 'Paste URL' },
+  { id: 'github', label: FORGE_LABELS.github },
+  { id: 'gitlab', label: FORGE_LABELS.gitlab },
+  { id: 'bitbucket', label: FORGE_LABELS.bitbucket },
+];
+
+interface ForgeState {
+  status: 'loading' | 'ready' | 'error';
+  repos: ForgeRepo[];
+  truncated: boolean;
+  warnings?: string[];
+  error?: string;
+  hint?: string;
+}
+
+/// Rows actually rendered. Accounts with thousands of repos would
+/// otherwise put thousands of nodes in the sheet; the filter box is the
+/// way through, and the list says so when it clips.
+const FORGE_ROW_CAP = 200;
+
+/// Preferred remote form for a picked repo, falling back to the other
+/// protocol when the forge doesn't advertise the requested one.
+function cloneUrlForRepo(repo: ForgeRepo, protocol: 'https' | 'ssh'): string {
+  return protocol === 'ssh' ? repo.sshUrl || repo.httpsUrl : repo.httpsUrl || repo.sshUrl;
+}
+
+/// Match every whitespace-separated term against "owner/name description"
+/// so "zift admin" finds ziftsolutions/zift-ecm-admin.
+function matchesForgeFilter(repo: ForgeRepo, terms: string[]): boolean {
+  if (terms.length === 0) return true;
+  const hay = `${repo.fullName} ${repo.description ?? ''}`.toLowerCase();
+  return terms.every((t) => hay.includes(t));
+}
+
 function CloneRepoSheet(): JSX.Element {
   const setSheet = useStore((s) => s.setSheet);
   const settings = useStore((s) => s.settings);
@@ -326,11 +374,75 @@ function CloneRepoSheet(): JSX.Element {
   const cloneIdRef = useRef<string | null>(null);
   const progressEndRef = useRef<HTMLDivElement | null>(null);
 
+  const [source, setSource] = useState<CloneSource>('url');
+  const [forgeByProvider, setForgeByProvider] = useState<Partial<Record<ForgeKind, ForgeState>>>({});
+  const [forgeFilter, setForgeFilter] = useState('');
+  const [pickedFullName, setPickedFullName] = useState<string | null>(null);
+  const protocol = settings.clonePreferredProtocol ?? 'https';
+
   // Auto-fill folder name from URL until the user starts typing their own.
   useEffect(() => {
     if (folderTouched) return;
     setFolder(defaultFolderFromUrl(url));
   }, [url, folderTouched]);
+
+  const loadForge = async (provider: ForgeKind, refresh: boolean) => {
+    setForgeByProvider((prev) => ({
+      ...prev,
+      [provider]: { status: 'loading', repos: prev[provider]?.repos ?? [], truncated: false },
+    }));
+    const res = await window.overgit.invoke('forge:listRepos', { provider, refresh });
+    setForgeByProvider((prev) => ({
+      ...prev,
+      [provider]: res.ok
+        ? {
+            status: 'ready',
+            repos: res.repos,
+            truncated: res.truncated,
+            warnings: res.warnings,
+          }
+        : {
+            status: 'error',
+            repos: [],
+            truncated: false,
+            error: res.error,
+            hint: res.hint,
+          },
+    }));
+  };
+
+  // Fetch a forge's repo list the first time its tab is opened. Main
+  // caches for a few minutes, so re-opening the sheet is usually instant.
+  useEffect(() => {
+    if (source === 'url') return;
+    if (forgeByProvider[source]) return;
+    void loadForge(source, false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [source]);
+
+  const forge = source === 'url' ? undefined : forgeByProvider[source];
+  const filteredForgeRepos = useMemo(() => {
+    if (!forge) return [];
+    const terms = forgeFilter.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    return forge.repos.filter((r) => matchesForgeFilter(r, terms));
+  }, [forge, forgeFilter]);
+  const pickedRepo = useMemo(
+    () => forge?.repos.find((r) => r.fullName === pickedFullName) ?? null,
+    [forge, pickedFullName],
+  );
+
+  const onPickForgeRepo = (repo: ForgeRepo) => {
+    setPickedFullName(repo.fullName);
+    setUrl(cloneUrlForRepo(repo, protocol));
+  };
+
+  const onChangeProtocol = async (next: 'https' | 'ssh') => {
+    if (next === protocol) return;
+    const nextSettings: AppSettings = { ...settings, clonePreferredProtocol: next };
+    useStore.setState({ settings: nextSettings });
+    if (pickedRepo) setUrl(cloneUrlForRepo(pickedRepo, next));
+    await window.overgit.invoke('store:saveSettings', nextSettings);
+  };
 
   // Subscribe to clone progress events for *this* clone only.
   useEffect(() => {
@@ -454,32 +566,67 @@ function CloneRepoSheet(): JSX.Element {
     <>
       <SheetHeader title="Clone a repo" onClose={() => setSheet(null)} />
       <div className="flex-1 min-h-0 p-5 flex flex-col gap-4 text-sm overflow-y-auto">
-        <label className="flex flex-col gap-1">
-          <span className="text-[10px] uppercase tracking-wide text-ink-faint">URL</span>
-          <input
-            autoFocus
-            value={url}
-            onChange={(e) => setUrl(extractCloneUrl(e.target.value))}
-            onPaste={(e) => {
-              const pasted = e.clipboardData.getData('text');
-              const cleaned = extractCloneUrl(pasted);
-              if (cleaned !== pasted) {
-                e.preventDefault();
-                setUrl(cleaned);
-              }
-            }}
+        <div className="flex items-center gap-1 p-0.5 rounded-md border border-card bg-card/30 self-start">
+          {CLONE_SOURCES.map((s) => (
+            <button
+              key={s.id}
+              type="button"
+              onClick={() => setSource(s.id)}
+              disabled={busy}
+              className={`text-[11px] px-3 py-1 rounded disabled:opacity-50 ${
+                source === s.id
+                  ? 'bg-accent text-white'
+                  : 'text-ink-muted hover:text-ink hover:bg-card'
+              }`}
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
+
+        {source === 'url' ? (
+          <label className="flex flex-col gap-1">
+            <span className="text-[10px] uppercase tracking-wide text-ink-faint">URL</span>
+            <input
+              autoFocus
+              value={url}
+              onChange={(e) => setUrl(extractCloneUrl(e.target.value))}
+              onPaste={(e) => {
+                const pasted = e.clipboardData.getData('text');
+                const cleaned = extractCloneUrl(pasted);
+                if (cleaned !== pasted) {
+                  e.preventDefault();
+                  setUrl(cleaned);
+                }
+              }}
+              disabled={busy}
+              placeholder="https://github.com/user/repo.git  ·  git@github.com:user/repo.git  ·  paste `git clone …`"
+              className="field px-2 py-1.5 text-sm font-mono"
+            />
+            {urlError ? (
+              <span className="text-[11px] text-red-400">{urlError}</span>
+            ) : (
+              <span className="text-[11px] text-ink-faint">
+                https, ssh, or scp-style. Auth comes from your shell env.
+              </span>
+            )}
+          </label>
+        ) : (
+          <ForgeRepoPicker
+            provider={source}
+            state={forge}
+            repos={filteredForgeRepos}
+            filter={forgeFilter}
+            onFilter={setForgeFilter}
+            picked={pickedRepo}
+            onPick={onPickForgeRepo}
+            protocol={protocol}
+            onProtocol={onChangeProtocol}
+            onRefresh={() => void loadForge(source, true)}
             disabled={busy}
-            placeholder="https://github.com/user/repo.git  ·  git@github.com:user/repo.git  ·  paste `git clone …`"
-            className="field px-2 py-1.5 text-sm font-mono"
+            url={url}
           />
-          {urlError ? (
-            <span className="text-[11px] text-red-400">{urlError}</span>
-          ) : (
-            <span className="text-[11px] text-ink-faint">
-              https, ssh, or scp-style. Auth comes from your shell env.
-            </span>
-          )}
-        </label>
+        )}
 
         <label className="flex flex-col gap-1">
           <span className="text-[10px] uppercase tracking-wide text-ink-faint">Clone into</span>
@@ -598,6 +745,183 @@ function CloneRepoSheet(): JSX.Element {
         </button>
       </div>
     </>
+  );
+}
+
+/// Repo browser for one forge. Presentational: the sheet owns fetching,
+/// selection, and the resulting clone URL, so this component only has to
+/// render a filterable list and report clicks.
+function ForgeRepoPicker({
+  provider,
+  state,
+  repos,
+  filter,
+  onFilter,
+  picked,
+  onPick,
+  protocol,
+  onProtocol,
+  onRefresh,
+  disabled,
+  url,
+}: {
+  provider: ForgeKind;
+  state: ForgeState | undefined;
+  /// Already filtered by the parent.
+  repos: ForgeRepo[];
+  filter: string;
+  onFilter: (v: string) => void;
+  picked: ForgeRepo | null;
+  onPick: (repo: ForgeRepo) => void;
+  protocol: 'https' | 'ssh';
+  onProtocol: (p: 'https' | 'ssh') => void;
+  onRefresh: () => void;
+  disabled: boolean;
+  url: string;
+}): JSX.Element {
+  const label = FORGE_LABELS[provider];
+  const loading = !state || state.status === 'loading';
+  const shown = repos.slice(0, FORGE_ROW_CAP);
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[10px] uppercase tracking-wide text-ink-faint">
+          {label} repositories
+        </span>
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-0.5 p-0.5 rounded border border-card">
+            {(['https', 'ssh'] as const).map((p) => (
+              <button
+                key={p}
+                type="button"
+                onClick={() => onProtocol(p)}
+                disabled={disabled}
+                className={`text-[10px] px-2 py-0.5 rounded uppercase tracking-wide disabled:opacity-50 ${
+                  protocol === p ? 'bg-accent text-white' : 'text-ink-faint hover:text-ink'
+                }`}
+              >
+                {p}
+              </button>
+            ))}
+          </div>
+          <button
+            type="button"
+            onClick={onRefresh}
+            disabled={disabled || loading}
+            className="text-[11px] px-2 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
+          >
+            {loading ? 'Loading…' : 'Refresh'}
+          </button>
+        </div>
+      </div>
+
+      <input
+        autoFocus
+        value={filter}
+        onChange={(e) => onFilter(e.target.value)}
+        onKeyDown={(e) => {
+          // Enter takes the top hit — the common case is typing three
+          // letters of a repo name and cloning it.
+          if (e.key === 'Enter' && shown.length > 0) {
+            e.preventDefault();
+            onPick(shown[0]);
+          }
+        }}
+        disabled={disabled}
+        placeholder={`Filter ${label} repos…`}
+        className="field px-2 py-1.5 text-sm"
+      />
+
+      {state?.status === 'error' ? (
+        <div className="rounded border border-card bg-card/40 px-3 py-2.5 flex flex-col gap-1.5">
+          <span className="text-[11px] text-red-400">{state.error}</span>
+          {state.hint && <span className="text-[11px] text-ink-faint">{state.hint}</span>}
+          <button
+            type="button"
+            onClick={onRefresh}
+            disabled={disabled}
+            className="self-start text-[11px] px-2 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
+          >
+            Try again
+          </button>
+        </div>
+      ) : (
+        <div className="rounded border border-card bg-surface max-h-56 overflow-y-auto">
+          {loading ? (
+            <div className="px-3 py-3 text-[11px] text-ink-faint">
+              Asking {label} what you have access to…
+            </div>
+          ) : shown.length === 0 ? (
+            <div className="px-3 py-3 text-[11px] text-ink-faint">
+              {state && state.repos.length === 0
+                ? `No repos came back from ${label}.`
+                : 'No repo matches that filter.'}
+            </div>
+          ) : (
+            <ul className="flex flex-col">
+              {shown.map((r) => {
+                const isPicked = picked?.fullName === r.fullName;
+                return (
+                  <li key={r.fullName}>
+                    <button
+                      type="button"
+                      onClick={() => onPick(r)}
+                      disabled={disabled}
+                      className={`w-full text-left px-3 py-1.5 border-b border-card/60 last:border-b-0 disabled:opacity-50 ${
+                        isPicked ? 'bg-accent/15' : 'hover:bg-card'
+                      }`}
+                    >
+                      <div className="flex items-baseline gap-2">
+                        <span className="text-[12px] font-mono truncate">
+                          <span className="text-ink-faint">{r.owner}/</span>
+                          <span className={isPicked ? 'text-ink font-semibold' : 'text-ink'}>
+                            {r.name}
+                          </span>
+                        </span>
+                        {r.isPrivate && (
+                          <span className="text-[9px] uppercase tracking-wide text-ink-faint border border-card rounded px-1">
+                            private
+                          </span>
+                        )}
+                        <span className="ml-auto text-[10px] text-ink-faint flex-shrink-0">
+                          {formatDateShort(r.updatedAt ?? '')}
+                        </span>
+                      </div>
+                      {r.description && (
+                        <div className="text-[11px] text-ink-faint truncate">{r.description}</div>
+                      )}
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {state?.status === 'ready' && (
+        <span className="text-[11px] text-ink-faint">
+          {repos.length} of {state.repos.length} repos
+          {shown.length < repos.length ? ` · showing first ${shown.length}, keep typing to narrow` : ''}
+          {state.truncated ? ' · account has more than overgit fetched — paste a URL for anything missing' : ''}
+        </span>
+      )}
+      {state?.warnings?.map((w) => (
+        <span key={w} className="text-[11px] text-amber-400 break-all">
+          {w}
+        </span>
+      ))}
+      {/* Always show the URL the form will submit, even when it came
+          from the other tab — otherwise switching tabs after picking
+          hides what Clone is actually about to do. */}
+      {url && (
+        <span className="text-[11px] text-ink-muted font-mono break-all">
+          <span className="font-sans text-ink-faint">Will clone </span>
+          {url}
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -848,6 +1172,7 @@ function SettingsReposPanel(): JSX.Element {
 function SettingsIdentityPanel(): JSX.Element {
   const settings = useStore((s) => s.settings);
   const repos = useStore((s) => s.repos);
+  const refreshAllRepoIdentities = useStore((s) => s.refreshAllRepoIdentities);
 
   const current = settings.defaultIdentity;
   const [name, setName] = useState(current?.name ?? '');
@@ -873,6 +1198,9 @@ function SettingsIdentityPanel(): JSX.Element {
       };
       useStore.setState({ settings: next });
       await window.overgit.invoke('store:saveSettings', next);
+      // The default sits in the middle of the precedence chain, so every
+      // repo without a per-repo override may now resolve differently.
+      await refreshAllRepoIdentities();
     } finally {
       setSavingDefault(false);
     }
@@ -886,6 +1214,7 @@ function SettingsIdentityPanel(): JSX.Element {
       await window.overgit.invoke('store:saveSettings', next);
       setName('');
       setEmail('');
+      await refreshAllRepoIdentities();
     } finally {
       setSavingDefault(false);
     }
@@ -966,16 +1295,14 @@ function IdentityBulkTable(): JSX.Element {
   const repos = useStore((s) => s.repos);
   const settings = useStore((s) => s.settings);
   const pushToast = useStore((s) => s.pushToast);
-  const [resolved, setResolved] = useState<Record<UUID, ResolvedIdentity>>({});
+  // Store-backed so a row saved here also moves the Changes-tab
+  // "Committing as" banner (and vice versa) without a reselect.
+  const resolved = useStore((s) => s.repoIdentity);
+  const refreshResolved = useStore((s) => s.refreshAllRepoIdentities);
   const [drafts, setDrafts] = useState<Record<UUID, RowDraft>>({});
   const [checked, setChecked] = useState<Set<UUID>>(new Set());
   const [busy, setBusy] = useState<Set<UUID>>(new Set());
   const [filter, setFilter] = useState('');
-
-  const refreshResolved = async () => {
-    const map = await window.overgit.invoke('repo:resolveAllIdentities');
-    setResolved(map);
-  };
 
   useEffect(() => {
     void refreshResolved();
@@ -6823,19 +7150,19 @@ function ManageRepoSheet({
 function IdentityPane({ repoId }: { repoId: UUID }): JSX.Element {
   const repo = useStore((s) => s.repos.find((r) => r.id === repoId))!;
   const pushToast = useStore((s) => s.pushToast);
-  const [resolved, setResolved] = useState<ResolvedIdentity | null>(null);
+  const resolved = useStore((s) => s.repoIdentity[repoId]) ?? null;
+  const refreshRepoIdentity = useStore((s) => s.refreshRepoIdentity);
   const [name, setName] = useState(repo.identity?.name ?? '');
   const [email, setEmail] = useState(repo.identity?.email ?? '');
   const [busy, setBusy] = useState(false);
 
-  const refresh = async () => {
-    const r = await window.overgit.invoke('repo:resolveIdentity', repoId);
-    setResolved(r);
-  };
+  // Shared with the Changes-tab "Committing as" banner, so a save here
+  // updates both. Forced: we only call it when the answer just changed.
+  const refresh = () => refreshRepoIdentity(repoId, true);
 
   useEffect(() => {
-    void refresh();
-  }, [repoId]);
+    void refreshRepoIdentity(repoId);
+  }, [repoId, refreshRepoIdentity]);
 
   // Re-sync the form when the underlying repo.identity changes (e.g.
   // we just saved or cleared).
