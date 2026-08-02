@@ -19,6 +19,7 @@ import type {
   RepoChanges,
   RepoPRs,
   RepoStatus,
+  ResolvedIdentity,
   SquashMergeLink,
   Stash,
   StoreSnapshot,
@@ -147,6 +148,13 @@ interface UiState {
   repoSquashLinks: Record<UUID, SquashMergeLink[]>;
   repoFileList: Record<UUID, Array<{ path: string; ignored: boolean }>>;
   repoStashes: Record<UUID, Stash[]>;
+  /// Resolved commit identity per repo — who a commit here would be
+  /// attributed to, and which layer of the precedence chain decided it.
+  /// Lives in the store rather than in each consumer's local state
+  /// because three surfaces render it (the Changes-tab banner, Manage →
+  /// Identity, Settings → Identity) and all three can change it: saving
+  /// an override in one has to move the banner in the other immediately.
+  repoIdentity: Record<UUID, ResolvedIdentity>;
   cliPresence: CliPresence | null;
 
   /// Currently open file in the in-app editor. Per-repo we'd allow many
@@ -242,6 +250,14 @@ interface UiState {
   refreshRepoChanges: (id: UUID) => Promise<void>;
   refreshRepoStatus: (id: UUID) => Promise<void>;
   refreshRepoHeadCommit: (id: UUID, force?: boolean) => Promise<void>;
+  /// Re-resolve one repo's commit identity. Call with `force` after
+  /// anything that can change the answer (per-repo override saved or
+  /// cleared, global default changed).
+  refreshRepoIdentity: (id: UUID, force?: boolean) => Promise<void>;
+  /// Re-resolve every repo's identity in one round trip. Used by the
+  /// Settings identity table and after changes with library-wide reach
+  /// (the global default identity).
+  refreshAllRepoIdentities: () => Promise<void>;
   /// Fan out `repo:status` for every known repo so the sidebar can flag
   /// dirty / ahead / behind state without the user having to click into
   /// each one. Failures on individual repos are swallowed — a single
@@ -526,6 +542,7 @@ export const useStore = create<UiState>((set, get) => ({
   repoSquashLinks: {},
   repoFileList: {},
   repoStashes: {},
+  repoIdentity: {},
   cliPresence: null,
   lastCheckout: null,
   learningHint: null,
@@ -1095,6 +1112,25 @@ export const useStore = create<UiState>((set, get) => ({
       },
       force,
     );
+  },
+
+  refreshRepoIdentity: async (id, force = false) => {
+    await cached(
+      `repoIdentity:${id}`,
+      5_000,
+      async () => {
+        const identity = await window.overgit.invoke('repo:resolveIdentity', id);
+        set({ repoIdentity: { ...get().repoIdentity, [id]: identity } });
+      },
+      force,
+    );
+  },
+
+  refreshAllRepoIdentities: async () => {
+    // Always forced: the callers are "something just changed" moments,
+    // and main fans the per-repo `git config` reads out in parallel.
+    const map = await window.overgit.invoke('repo:resolveAllIdentities');
+    set({ repoIdentity: map });
   },
 
   resetAllReposToDefault: async () => {
