@@ -1385,22 +1385,16 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
 /// result into the commit input on success.
 function IdentityIndicator({ repoId }: { repoId: UUID }): JSX.Element | null {
   const setSheet = useStore((s) => s.setSheet);
-  const [resolved, setResolved] = useState<ResolvedIdentity | null>(null);
+  // Read through the store so an override saved in Manage → Identity
+  // (or a default changed in Settings) moves this banner right away —
+  // it used to hold a local copy resolved once on mount, which left it
+  // showing the pre-change identity until the repo was reselected.
+  const resolved = useStore((s) => s.repoIdentity[repoId]) ?? null;
+  const refreshRepoIdentity = useStore((s) => s.refreshRepoIdentity);
 
-  // Re-resolve when the repo changes or after a commit lands (other
-  // commits may have changed local config). The store doesn't have a
-  // commit-finished pubsub yet, but refreshing on every status tick is
-  // overkill — keep it on mount + repoId. The user can also reopen the
-  // pane to refresh.
   useEffect(() => {
-    let cancelled = false;
-    void window.overgit.invoke('repo:resolveIdentity', repoId).then((r) => {
-      if (!cancelled) setResolved(r);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [repoId]);
+    void refreshRepoIdentity(repoId);
+  }, [repoId, refreshRepoIdentity]);
 
   if (!resolved) return null;
 

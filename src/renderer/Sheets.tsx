@@ -848,6 +848,7 @@ function SettingsReposPanel(): JSX.Element {
 function SettingsIdentityPanel(): JSX.Element {
   const settings = useStore((s) => s.settings);
   const repos = useStore((s) => s.repos);
+  const refreshAllRepoIdentities = useStore((s) => s.refreshAllRepoIdentities);
 
   const current = settings.defaultIdentity;
   const [name, setName] = useState(current?.name ?? '');
@@ -873,6 +874,9 @@ function SettingsIdentityPanel(): JSX.Element {
       };
       useStore.setState({ settings: next });
       await window.overgit.invoke('store:saveSettings', next);
+      // The default sits in the middle of the precedence chain, so every
+      // repo without a per-repo override may now resolve differently.
+      await refreshAllRepoIdentities();
     } finally {
       setSavingDefault(false);
     }
@@ -886,6 +890,7 @@ function SettingsIdentityPanel(): JSX.Element {
       await window.overgit.invoke('store:saveSettings', next);
       setName('');
       setEmail('');
+      await refreshAllRepoIdentities();
     } finally {
       setSavingDefault(false);
     }
@@ -966,16 +971,14 @@ function IdentityBulkTable(): JSX.Element {
   const repos = useStore((s) => s.repos);
   const settings = useStore((s) => s.settings);
   const pushToast = useStore((s) => s.pushToast);
-  const [resolved, setResolved] = useState<Record<UUID, ResolvedIdentity>>({});
+  // Store-backed so a row saved here also moves the Changes-tab
+  // "Committing as" banner (and vice versa) without a reselect.
+  const resolved = useStore((s) => s.repoIdentity);
+  const refreshResolved = useStore((s) => s.refreshAllRepoIdentities);
   const [drafts, setDrafts] = useState<Record<UUID, RowDraft>>({});
   const [checked, setChecked] = useState<Set<UUID>>(new Set());
   const [busy, setBusy] = useState<Set<UUID>>(new Set());
   const [filter, setFilter] = useState('');
-
-  const refreshResolved = async () => {
-    const map = await window.overgit.invoke('repo:resolveAllIdentities');
-    setResolved(map);
-  };
 
   useEffect(() => {
     void refreshResolved();
@@ -6823,19 +6826,19 @@ function ManageRepoSheet({
 function IdentityPane({ repoId }: { repoId: UUID }): JSX.Element {
   const repo = useStore((s) => s.repos.find((r) => r.id === repoId))!;
   const pushToast = useStore((s) => s.pushToast);
-  const [resolved, setResolved] = useState<ResolvedIdentity | null>(null);
+  const resolved = useStore((s) => s.repoIdentity[repoId]) ?? null;
+  const refreshRepoIdentity = useStore((s) => s.refreshRepoIdentity);
   const [name, setName] = useState(repo.identity?.name ?? '');
   const [email, setEmail] = useState(repo.identity?.email ?? '');
   const [busy, setBusy] = useState(false);
 
-  const refresh = async () => {
-    const r = await window.overgit.invoke('repo:resolveIdentity', repoId);
-    setResolved(r);
-  };
+  // Shared with the Changes-tab "Committing as" banner, so a save here
+  // updates both. Forced: we only call it when the answer just changed.
+  const refresh = () => refreshRepoIdentity(repoId, true);
 
   useEffect(() => {
-    void refresh();
-  }, [repoId]);
+    void refreshRepoIdentity(repoId);
+  }, [repoId, refreshRepoIdentity]);
 
   // Re-sync the form when the underlying repo.identity changes (e.g.
   // we just saved or cleared).
