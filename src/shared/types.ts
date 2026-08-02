@@ -561,6 +561,49 @@ export interface RepoPRs {
   error?: string;
 }
 
+/// Forges overgit can browse for clonable repos. Each one reuses an
+/// existing local credential rather than asking the user for a token:
+/// GitHub goes through the `gh` CLI's login, GitLab through `glab` (or
+/// the credential helper when glab isn't installed), and Bitbucket
+/// through whatever the credential helper holds for bitbucket.org.
+export type ForgeKind = 'github' | 'gitlab' | 'bitbucket';
+
+/// One repo the signed-in user can clone. Deliberately provider-agnostic
+/// so the clone picker renders both forges from one list shape.
+export interface ForgeRepo {
+  provider: ForgeKind;
+  /// "owner/name". Unique within a provider — used as the list key and
+  /// as the selection identity in the picker.
+  fullName: string;
+  /// Repo slug (the part git would use as the clone folder name).
+  name: string;
+  /// Owner / workspace slug.
+  owner: string;
+  description?: string;
+  isPrivate: boolean;
+  defaultBranch?: string;
+  /// ISO-8601. Drives the default "recently updated first" ordering.
+  updatedAt?: string;
+  httpsUrl: string;
+  /// Empty when the forge doesn't advertise an SSH remote for the repo.
+  sshUrl: string;
+}
+
+export type ForgeListResult =
+  | {
+      ok: true;
+      repos: ForgeRepo[];
+      /// True when the account has more repos than the page cap fetched.
+      /// The picker surfaces this so a missing repo doesn't look like a bug.
+      truncated: boolean;
+      /// ISO-8601 timestamp of the fetch these repos came from — may be
+      /// older than "now" when the result is served from the cache.
+      fetchedAt: string;
+      /// Non-fatal problems (e.g. one workspace of several failed).
+      warnings?: string[];
+    }
+  | { ok: false; error: string; hint?: string };
+
 export interface AppSettings {
   theme: 'light' | 'dark' | 'system';
   /// User-controlled visibility of the left sidebar. Persisted so the
@@ -622,6 +665,10 @@ export interface AppSettings {
   /// Validated on use — if the directory no longer exists we fall back
   /// to the picker with no default.
   lastClonedParent?: string;
+  /// Which remote URL the clone picker fills in when you choose a repo
+  /// from GitHub / Bitbucket. Defaults to https because that's the form
+  /// that works with the credential the browse step already used.
+  clonePreferredProtocol?: 'https' | 'ssh';
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -683,6 +730,12 @@ export interface IPCInvokeMap {
   /// Cancel an in-flight clone. SIGTERMs the child; the corresponding
   /// `repo:clone` promise resolves with `{ ok: false, cancelled: true }`.
   'repo:cancelClone': (cloneId: string) => { ok: boolean };
+  /// List the repos the user can already clone on a forge, so the clone
+  /// sheet can offer a picker instead of demanding a pasted URL. Uses
+  /// only credentials that already exist locally (gh's login, the git
+  /// credential helper) — overgit never asks for or stores a token.
+  /// Results are cached in main for a few minutes; `refresh` skips it.
+  'forge:listRepos': (args: { provider: ForgeKind; refresh?: boolean }) => ForgeListResult;
   /// Open a folder picker (multi-select enabled) and add every git repo
   /// found among the chosen paths. A chosen path that isn't itself a
   /// repo is scanned one level deep — picking a parent like ~/code adds
