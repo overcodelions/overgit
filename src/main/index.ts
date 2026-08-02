@@ -112,7 +112,8 @@ import {
   suggestBackupBranchName,
   suggestCommitMessage,
 } from './cli';
-import { Identity, Repo, ResolvedIdentity } from '../shared/types';
+import { listForgeRepos } from './forge';
+import { ForgeKind, Identity, Repo, ResolvedIdentity } from '../shared/types';
 
 /// Resolve which identity should be applied (via env override) when
 /// committing in this repo. Mirrors the precedence the renderer
@@ -370,6 +371,17 @@ function registerIpc(): void {
   ipcMain.handle('repo:cancelClone', (_e, cloneId: string) => {
     return { ok: cancelClone(cloneId) };
   });
+
+  ipcMain.handle(
+    'forge:listRepos',
+    async (_e, args: { provider: ForgeKind; refresh?: boolean }) => {
+      const known: ForgeKind[] = ['github', 'gitlab', 'bitbucket'];
+      if (!known.includes(args.provider)) {
+        return { ok: false as const, error: `Unknown forge "${String(args.provider)}"` };
+      }
+      return listForgeRepos(args.provider, { refresh: args.refresh });
+    },
+  );
 
   ipcMain.handle('repo:pickAndAdd', async () => {
     if (!mainWindow) return { ok: false, error: 'No window' };
