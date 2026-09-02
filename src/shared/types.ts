@@ -378,6 +378,50 @@ export interface WorksetResetOutcome {
   cleanedUpBranch?: boolean;
 }
 
+export type LandingResult = 'clean' | 'conflicts' | 'merged' | 'nothing-to-land' | 'on-default' | 'no-default-ref' | 'unsupported' | 'error';
+/// Per-repo answer to whether the current branch would merge onto its
+/// default ref. `merge-tree --write-tree` never changes the working
+/// tree, index, or refs; `treeOid` permits a read-only conflict preview.
+export interface LandingOutcome {
+  repoId: UUID;
+  result: LandingResult;
+  branch: string | null;
+  baseRef: string | null;
+  conflictFiles: string[];
+  treeOid: string | null;
+  aheadOfBase: number | null;
+  behindBase: number | null;
+  message?: string;
+}
+/// A merge-tree preflight between bound branches of active worksets sharing a repo.
+/// Branch order is preserved because it determines the ours/theirs preview labels.
+export interface WorksetCollision {
+  repoId: UUID;
+  aWorksetId: UUID;
+  aWorksetName: string;
+  aBranch: string;
+  /// The other branch. Several active worksets can be bound to the
+  /// same branch (a ticket re-opened as a second workset); they are
+  /// merged into one collision here, so the UI shows one row per
+  /// repo-and-branch rather than a duplicate per workset.
+  bBranch: string;
+  bWorksets: Array<{ id: UUID; name: string }>;
+  result: 'clean' | 'conflicts' | 'error';
+  conflictFiles: string[];
+  treeOid: string | null;
+  message?: string;
+}
+/// In-memory landing snapshot; `checkedAt` tells the renderer how fresh
+/// the fetched default refs were when the preflight ran.
+export interface WorksetLandingReport {
+  worksetId: UUID;
+  checkedAt: string;
+  gitVersion: string | null;
+  supported: boolean;
+  outcomes: LandingOutcome[];
+  collisions: WorksetCollision[];
+}
+
 /// Detected installed CLIs we can shell out to. The first three are
 /// review-host CLIs (PR/MR data). The rest are LLM CLIs that can review
 /// or comment on a diff in non-interactive mode. Discovered once at
@@ -908,6 +952,12 @@ export interface IPCInvokeMap {
     branch: string;
     mode: 'merge' | 'ff-only' | 'squash';
   }) => { ok: boolean; error?: string; output?: string; alreadyUpToDate?: boolean };
+  /// Read one file out of a merge-tree result tree
+  /// (`git show <treeOid>:<path>`) so a conflict can be previewed with
+  /// markers intact without checking anything out.
+  'repo:mergePreviewFile': (args: { repoId: UUID; treeOid: string; path: string }) =>
+    | { ok: true; content: string }
+    | { ok: false; binary?: boolean; error: string };
   'repo:abortMerge': (repoId: UUID) => { ok: boolean; error?: string };
   /// Resolve a conflict by taking one side wholesale. `ours` keeps the
   /// current branch's version, `theirs` takes the version from the
@@ -1027,6 +1077,13 @@ export interface IPCInvokeMap {
   }) => { ok: boolean; error?: string };
 
   'workset:status': (worksetId: UUID) => RepoStatus[];
+  /// Zero-mutation landing preflight for every member repo, plus the
+  /// collision matrix against other active worksets. Runs
+  /// `git merge-tree --write-tree`: it writes unreachable loose objects
+  /// into .git/objects (collected by git's own gc --auto) but never
+  /// touches the working tree, the index, or any ref. `force` bypasses
+  /// the SHA-pair memo — the explicit Re-check sets it.
+  'workset:landing': (args: { worksetId: UUID; force?: boolean }) => WorksetLandingReport;
   'workset:checkoutBranch': (args: {
     worksetId: UUID;
     branch: string;
