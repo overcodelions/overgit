@@ -6,6 +6,7 @@
 
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import {
   BlameLine,
@@ -42,6 +43,45 @@ interface RunResult {
 // we hit it, something pathological is happening (binary diff, runaway
 // patch-id stream) and killing the child is the right call.
 const MAX_GIT_OUTPUT_BYTES = 128 * 1024 * 1024;
+
+export interface GitVersion {
+  major: number;
+  minor: number;
+  patch: number;
+  /// "2.40.0" — for the "you have X" copy in the unsupported banner.
+  text: string;
+}
+
+/// Parse `git --version`. Vendor builds append suffixes we must
+/// tolerate: "git version 2.39.3 (Apple Git-145)",
+/// "git version 2.45.0.windows.1". Null when no <major>.<minor> is found.
+export function parseGitVersion(raw: string): GitVersion | null {
+  const m = raw.match(/git version\s+(\d+)\.(\d+)(?:\.(\d+))?/i);
+  if (!m) return null;
+  return {
+    major: Number(m[1]),
+    minor: Number(m[2]),
+    patch: Number(m[3] ?? 0),
+    text: `${m[1]}.${m[2]}.${m[3] ?? 0}`,
+  };
+}
+
+/// `merge-tree --write-tree` — the working-tree-free merge mode the
+/// landing check is built on — landed in git 2.38. Below that the flag
+/// doesn't exist and the whole feature degrades to `unsupported`.
+export function supportsMergeTree(v: GitVersion | null): boolean {
+  return !!v && (v.major > 2 || (v.major === 2 && v.minor >= 38));
+}
+
+/// One probe per process lifetime: nobody upgrades git mid-session, and
+/// every landing check would otherwise pay a spawn. `git --version`
+/// needs no repo, so the cwd is just somewhere that exists. Concurrent
+/// callers share the same in-flight promise.
+let gitVersionProbe: Promise<GitVersion | null> | null = null;
+export function gitVersion(): Promise<GitVersion | null> {
+  gitVersionProbe ??= run(os.tmpdir(), ['--version']).then((r) => parseGitVersion(r.stdout));
+  return gitVersionProbe;
+}
 
 // A crashed or SIGKILL'd git leaves behind `<path>.lock` files
 // (`.git/index.lock`, `.git/HEAD.lock`, `.git/refs/heads/<branch>.lock`)
@@ -543,6 +583,113 @@ export function isSafeRefArg(name: string): boolean {
   return trimmed.length > 0 && !trimmed.startsWith('-');
 }
 
+/// Which ref a feature branch is measured against: prefer
+/// `origin/<default>` (post-fetch truth), fall back to the local
+/// default, null when neither exists. Extracted from status() so the
+/// landing check and the ahead/behind pill can never disagree about
+/// what "the default" means. The two probes stay parallel — this sits
+/// on the sidebar-refresh hot path.
+export async function resolveDefaultRef(
+  repoPath: string,
+  defaultBranch: string,
+): Promise<string | null> {
+  const [remoteExists, localExists] = await Promise.all([
+    run(repoPath, ['show-ref', '--verify', '--quiet', `refs/remotes/origin/${defaultBranch}`]),
+    run(repoPath, ['show-ref', '--verify', '--quiet', `refs/heads/${defaultBranch}`]),
+  ]);
+  return remoteExists.ok ? `origin/${defaultBranch}` : localExists.ok ? defaultBranch : null;
+}
+
+export interface MergePreflight {
+  status: 'clean' | 'conflicts' | 'error';
+  /// Tree merge-tree wrote. Set on clean and conflicts; lets a
+  /// conflicted file be read back (`showTreeFile`) without a checkout.
+  treeOid: string | null;
+  conflictFiles: string[];
+  message?: string;
+}
+
+/// Rename detection on a very large tree can take seconds; anything
+/// beyond this is reported as an error rather than pinning the repo's
+/// lock queue.
+const MERGE_TREE_TIMEOUT_MS = 30_000;
+/// Mirrors fs.ts MAX_READ_BYTES — same ceiling the editor applies.
+const MAX_PREVIEW_BYTES = 5 * 1024 * 1024;
+
+/// Simulate `ours` merging with `theirs` using `merge-tree --write-tree`
+/// (git >= 2.38). It never touches the working tree, the index, or any
+/// ref. It does write the merged tree and any conflicted blobs as
+/// *unreachable* loose objects, which `git gc --auto` collects; the
+/// SHA-pair memo in workset.ts keeps re-runs near zero so that churn
+/// stays negligible.
+///
+/// Classification reads stdout shape only, never the exit code and
+/// never stderr text: exit 1 covers both "real conflicts" and "bad
+/// ref", and unrelated histories exit 128 — so the code alone can't
+/// discriminate, and stderr is locale-dependent. With `--name-only -z`
+/// stdout is `<tree-oid>\0` when clean, or
+/// `<tree-oid>\0<path>\0…\0\0<informational messages>` on conflicts.
+/// No leading tree OID means git didn't produce a merge at all.
+///
+/// Argument order matters: git labels the hunks `<<<<<<< ours` …
+/// `>>>>>>> theirs`, so callers pass (feature branch, base ref).
+export async function mergePreflight(
+  repoPath: string,
+  ours: string,
+  theirs: string,
+): Promise<MergePreflight> {
+  // Both refs land in positional slots — same option-injection defence
+  // every other ref-taking helper in this file applies.
+  if (!looksLikeRepo(repoPath) || !isSafeRefArg(ours) || !isSafeRefArg(theirs)) {
+    return { status: 'error', treeOid: null, conflictFiles: [], message: 'Invalid repository or ref' };
+  }
+  const r = await run(
+    repoPath,
+    ['merge-tree', '--write-tree', '--name-only', '-z', ours, theirs],
+    undefined,
+    MERGE_TREE_TIMEOUT_MS,
+  );
+  const tokens = r.stdout.split('\0');
+  const treeOid = tokens[0] ?? '';
+  if (!/^[0-9a-f]{40,64}$/i.test(treeOid)) {
+    return {
+      status: 'error',
+      treeOid: null,
+      conflictFiles: [],
+      message: r.stderr.trim() || `git merge-tree exited ${r.code}`,
+    };
+  }
+  // Conflicted paths run from token 1 up to the empty token that
+  // separates them from the informational section.
+  const end = tokens.indexOf('', 1);
+  const files = tokens.slice(1, end < 0 ? undefined : end).filter(Boolean);
+  return { status: files.length ? 'conflicts' : 'clean', treeOid, conflictFiles: files };
+}
+
+/// Read one file out of a merge-tree result (`git show <tree>:<path>`)
+/// so a conflict can be previewed with its markers intact and nothing
+/// checked out. No filesystem sandbox is needed: git resolves the path
+/// inside the tree object, never on disk. The combined argument always
+/// starts with a hex digit, so it can never be read as an option.
+export async function showTreeFile(
+  repoPath: string,
+  treeOid: string,
+  filePath: string,
+): Promise<{ ok: true; content: string } | { ok: false; binary?: boolean; error: string }> {
+  if (!/^[0-9a-f]{4,64}$/i.test(treeOid)) return { ok: false, error: 'Invalid tree id' };
+  if (!filePath || !isSafeRefArg(filePath)) return { ok: false, error: 'Invalid file path' };
+  const r = await run(repoPath, ['show', '--no-color', `${treeOid}:${filePath}`]);
+  // Also the path taken when a memoized tree was pruned by `git gc`;
+  // the renderer turns it into a "re-check" prompt and the workset
+  // layer evicts the stale memo entry.
+  if (!r.ok) return { ok: false, error: r.stderr.trim() || 'File not found in merge result' };
+  if (r.stdout.includes('\0')) return { ok: false, binary: true, error: 'Binary file — no preview' };
+  if (Buffer.byteLength(r.stdout) > MAX_PREVIEW_BYTES) {
+    return { ok: false, error: 'File too large to preview' };
+  }
+  return { ok: true, content: r.stdout };
+}
+
 /// Default folder name `git clone` would pick when you don't pass one.
 /// Used to prefill the form so the user only types when they want
 /// something different from the conventional name.
@@ -771,17 +918,7 @@ export async function status(
   let behindDefault: number | null = null;
   let defaultRef: string | null = null;
   if (defaultBranch && branch && branch !== defaultBranch) {
-    const remoteRef = `refs/remotes/origin/${defaultBranch}`;
-    const localRef = `refs/heads/${defaultBranch}`;
-    const [remoteExists, localExists] = await Promise.all([
-      run(repoPath, ['show-ref', '--verify', '--quiet', remoteRef]),
-      run(repoPath, ['show-ref', '--verify', '--quiet', localRef]),
-    ]);
-    const ref = remoteExists.ok
-      ? `origin/${defaultBranch}`
-      : localExists.ok
-        ? defaultBranch
-        : null;
+    const ref = await resolveDefaultRef(repoPath, defaultBranch);
     if (ref) {
       const cmp = await run(repoPath, [
         'rev-list',

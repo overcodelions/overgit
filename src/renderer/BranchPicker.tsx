@@ -1065,7 +1065,7 @@ function useAnchorRect(ref: React.RefObject<HTMLElement>) {
   return rect;
 }
 
-function relativeTime(iso: string): string {
+export function relativeTime(iso: string): string {
   if (!iso) return '';
   try {
     const d = new Date(iso);

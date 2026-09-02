@@ -67,7 +67,7 @@ export function SheetHost(): JSX.Element | null {
                 ? 'w-[1080px] max-w-[95vw] h-[80vh]'
                 : sheet.kind === 'pullConflict'
                   ? 'w-[680px] max-w-[92vw] max-h-[80vh]'
-                  : sheet.kind === 'resolveConflict'
+                  : sheet.kind === 'resolveConflict' || sheet.kind === 'landingPreview'
                     ? 'w-[1100px] max-w-[96vw] h-[85vh]'
                   : sheet.kind === 'abandonLocal'
                     ? 'w-[720px] max-w-[92vw] max-h-[85vh]'
@@ -145,6 +145,7 @@ export function SheetHost(): JSX.Element | null {
         {sheet.kind === 'resolveConflict' && (
           <ResolveConflictSheet repoId={sheet.repoId} path={sheet.path} />
         )}
+        {sheet.kind === 'landingPreview' && <LandingPreviewSheet {...sheet} />}
         {sheet.kind === 'abandonLocal' && (
           <AbandonLocalSheet repoId={sheet.repoId} />
         )}
@@ -7812,7 +7813,7 @@ interface ParsedConflict {
   hunkIndexes: number[];
 }
 
-function parseConflicts(text: string): ParsedConflict {
+export function parseConflicts(text: string): ParsedConflict {
   const segments: Array<string | ConflictHunk> = [];
   const hunkIndexes: number[] = [];
   const lines = text.split('\n');
@@ -8419,18 +8420,95 @@ function ContextSegment({
   );
 }
 
+/// Read-only view of one conflicted file out of a merge-tree result.
+/// The content comes from `git show <treeOid>:<path>` — the simulated
+/// merge, markers intact — so it renders through the same parser and
+/// hunk blocks as the real Resolve sheet, minus every control.
+function LandingPreviewSheet({
+  repoId,
+  treeOid,
+  path,
+  oursLabel,
+  theirsLabel,
+}: {
+  repoId: UUID;
+  treeOid: string;
+  path: string;
+  oursLabel: string;
+  theirsLabel: string;
+}): JSX.Element {
+  const setSheet = useStore((s) => s.setSheet);
+  const [state, setState] = useState<{ content?: string; error?: string; binary?: boolean }>({});
+  useEffect(() => {
+    let live = true;
+    window.overgit
+      .invoke('repo:mergePreviewFile', { repoId, treeOid, path })
+      .then((r) => {
+        if (!live) return;
+        setState(r.ok ? { content: r.content } : { error: r.error, binary: r.binary });
+      })
+      .catch((err) => {
+        if (live) setState({ error: String(err) });
+      });
+    return () => {
+      live = false;
+    };
+  }, [repoId, treeOid, path]);
+  const parsed = useMemo(
+    () => (state.content === undefined ? null : parseConflicts(state.content)),
+    [state.content],
+  );
+  return (
+    <>
+      <SheetHeader title={path} onClose={() => setSheet(null)} />
+      <div className="px-5 py-2 text-xs text-ink-faint border-b border-card">
+        <span className="font-mono">{oursLabel}</span> ↔{' '}
+        <span className="font-mono">{theirsLabel}</span> · Read-only preview of a simulated
+        merge. Nothing on disk has changed.
+      </div>
+      <div className="flex-1 overflow-auto p-4 text-xs">
+        {parsed ? (
+          parsed.segments.map((seg, i) =>
+            typeof seg === 'string' ? (
+              <pre key={i} className="whitespace-pre-wrap font-mono text-[11px]">
+                {seg}
+              </pre>
+            ) : (
+              <ConflictHunkBlock key={i} hunk={seg} readOnly />
+            ),
+          )
+        ) : state.error ? (
+          <div className="text-ink-muted">
+            {state.binary ? 'Binary file — no preview' : state.error}
+            {!state.binary && (
+              <p className="mt-2">
+                The simulated merge result may have been garbage-collected. Re-check landing to
+                regenerate it.
+              </p>
+            )}
+          </div>
+        ) : (
+          <div className="text-ink-muted">Loading preview…</div>
+        )}
+      </div>
+    </>
+  );
+}
+
 function ConflictHunkBlock({
   hunk,
   hunkRef,
   onChoice,
   onEdit,
   onSwapBoth,
+  readOnly = false,
 }: {
   hunk: ConflictHunk;
   hunkRef?: React.Ref<HTMLDivElement>;
-  onChoice: (c: ConflictHunk['choice']) => void;
-  onEdit: (t: string) => void;
-  onSwapBoth: () => void;
+  onChoice?: (c: ConflictHunk['choice']) => void;
+  onEdit?: (t: string) => void;
+  onSwapBoth?: () => void;
+  readOnly?: boolean;
 }): JSX.Element {
   const oursActive = hunk.choice === 'ours';
   const theirsActive = hunk.choice === 'theirs';
@@ -8456,29 +8534,32 @@ function ConflictHunkBlock({
         <span className="text-[10px] uppercase tracking-wide text-amber-300 font-sans font-semibold">
           Conflict
         </span>
-        <div className="ml-auto flex items-center gap-1">
-          <button onClick={() => onChoice('ours')} className={cls(oursActive)}>
+        {/* Read-only (landing preview): no choices, just the two sides. */}
+        {!readOnly && (
+          <div className="ml-auto flex items-center gap-1">
+          <button onClick={() => onChoice?.('ours')} className={cls(oursActive)}>
             Take ours
           </button>
-          <button onClick={() => onChoice('theirs')} className={cls(theirsActive)}>
+          <button onClick={() => onChoice?.('theirs')} className={cls(theirsActive)}>
             Take theirs
           </button>
           <button
-            onClick={() => onChoice('both')}
+            onClick={() => onChoice?.('both')}
             className={cls(bothActive)}
             title="Keep both sides — concatenated in the chosen order"
           >
             Keep both
           </button>
-          <button onClick={() => onChoice('edit')} className={cls(editActive)}>
+          <button onClick={() => onChoice?.('edit')} className={cls(editActive)}>
             Edit
           </button>
-        </div>
+          </div>
+        )}
       </div>
-      {editActive ? (
+      {editActive && !readOnly ? (
         <textarea
           value={hunk.editText}
-          onChange={(e) => onEdit(e.target.value)}
+          onChange={(e) => onEdit?.(e.target.value)}
           rows={Math.max(3, Math.min(20, (hunk.editText.match(/\n/g)?.length ?? 0) + 1))}
           className="w-full bg-surface-elevated px-3 py-2 outline-none resize-y font-mono text-[11px]"
           placeholder="Edit the resolved text…"
@@ -8490,7 +8571,7 @@ function ConflictHunkBlock({
               way the visual order matches the file order. The numbered
               badges hammer it home for users skimming. */}
           <div className="grid grid-cols-2 divide-x divide-amber-500/20">
-            {(oursFirst || !bothActive
+            {(readOnly || oursFirst || !bothActive
               ? (['ours', 'theirs'] as const)
               : (['theirs', 'ours'] as const)
             ).map((side) => {

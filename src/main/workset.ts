@@ -9,6 +9,7 @@ import {
   CheckoutOutcome,
   CommitAllOutcome,
   Identity,
+  LandingOutcome,
   Repo,
   RepoPRs,
   RepoStatus,
@@ -20,6 +21,8 @@ import {
   WorksetOpenPROutcome,
   WorksetPushOutcome,
   WorksetResetOutcome,
+  WorksetCollision,
+  WorksetLandingReport,
   Worktree,
 } from '../shared/types';
 import {
@@ -43,6 +46,12 @@ import {
   run,
   diffStat,
   status as gitStatus,
+  gitVersion,
+  supportsMergeTree,
+  mergePreflight,
+  resolveDefaultRef,
+  isSafeRefArg,
+  type MergePreflight,
 } from './git';
 
 /// Detect the "FETCH_HEAD doesn't have what we want to merge" family
@@ -208,6 +217,268 @@ export async function worksetStatus(
   // user's branch-tab click). 3 wide × 4 sub = 12 concurrent gits,
   // which keeps wall time low without saturating.
   return pool(members, 3, (r) => gitStatus(r.id, r.path, r.defaultBranch));
+}
+
+/// merge-tree is pure with respect to (repo, oursSha, theirsSha): if
+/// neither tip moved, the answer cannot have changed. Memoize so the
+/// ambient 5-minute re-check costs zero merge-tree subprocesses on a
+/// quiet repo, and so the unreachable objects merge-tree writes are
+/// created once, not once per poll. Ref *names* are deliberately not
+/// in the key — the output depends only on the two commits. LRU by
+/// re-insertion: Map preserves insertion order, so evicting
+/// keys().next() is a true least-recently-used eviction.
+const PREFLIGHT_MEMO_MAX = 500;
+/// A repo shared by many active worksets could otherwise fan out into
+/// dozens of pairwise merges; nobody has that many parallel tickets on
+/// one repo, so cap it rather than budget for it.
+const MAX_COLLISION_PAIRS_PER_REPO = 10;
+const preflightMemo = new Map<string, MergePreflight>();
+
+function preflightKey(repoPath: string, oursSha: string, theirsSha: string): string {
+  return `${repoPath}\0${oursSha}\0${theirsSha}`;
+}
+
+async function memoizedPreflight(
+  repoPath: string,
+  oursRef: string,
+  theirsRef: string,
+  oursSha: string,
+  theirsSha: string,
+  force = false,
+): Promise<MergePreflight> {
+  const key = preflightKey(repoPath, oursSha, theirsSha);
+  if (!force) {
+    const hit = preflightMemo.get(key);
+    if (hit) {
+      preflightMemo.delete(key);
+      preflightMemo.set(key, hit);
+      return hit;
+    }
+  }
+  const value = await mergePreflight(repoPath, oursRef, theirsRef);
+  // Only real answers are memoized. An `error` is usually transient —
+  // a 30s timeout on a huge tree, a stale-lock retry that ran out —
+  // and caching it would pin "Landing check failed" on the row until
+  // the next commit moved a SHA.
+  if (value.status !== 'error') {
+    preflightMemo.set(key, value);
+    while (preflightMemo.size > PREFLIGHT_MEMO_MAX) {
+      preflightMemo.delete(preflightMemo.keys().next().value!);
+    }
+  }
+  return value;
+}
+
+/// Drop every memoized preflight that produced `treeOid`. Called when
+/// a preview read fails: `git gc --prune` has collected the unreachable
+/// merge tree, so the cached answer's treeOid is dead and the next
+/// check must run merge-tree again to regenerate it.
+export function evictPreflightTree(repoPath: string, treeOid: string): void {
+  for (const [key, value] of preflightMemo) {
+    if (value.treeOid === treeOid && key.startsWith(`${repoPath}\0`)) preflightMemo.delete(key);
+  }
+}
+
+function landingBase(
+  repoId: UUID,
+  result: LandingOutcome['result'],
+  branch: string | null = null,
+  baseRef: string | null = null,
+): LandingOutcome {
+  return {
+    repoId,
+    result,
+    branch,
+    baseRef,
+    conflictFiles: [],
+    treeOid: null,
+    aheadOfBase: null,
+    behindBase: null,
+  };
+}
+
+/// One member repo's landing answer. Typical cost is six spawns
+/// (branch name, two ref probes, left-right count, batched rev-parse,
+/// merge-tree) and five on a memo hit. No `git status` here on
+/// purpose — uncommitted-file counts come from the renderer's status
+/// cache, and merge-tree only sees committed work anyway.
+async function landingOutcomeFor(repo: Repo, force: boolean): Promise<LandingOutcome> {
+  // `--abbrev-ref HEAD` prints the branch name, or the literal "HEAD"
+  // when detached. It can't be batched with the SHA read below:
+  // --abbrev-ref applies to every following arg.
+  const br = await run(repo.path, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  const branch = br.stdout.trim();
+  if (!br.ok) {
+    return { ...landingBase(repo.id, 'error'), message: br.stderr.trim() || 'No commits yet' };
+  }
+  if (!branch || branch === 'HEAD') {
+    return { ...landingBase(repo.id, 'error'), message: 'Detached HEAD — nothing to land' };
+  }
+  const def = repo.defaultBranch ?? (await detectDefaultBranch(repo.path));
+  if (!def) return landingBase(repo.id, 'no-default-ref', branch);
+  if (branch === def) return landingBase(repo.id, 'on-default', branch, def);
+  const baseRef = await resolveDefaultRef(repo.path, def);
+  if (!baseRef) {
+    return {
+      ...landingBase(repo.id, 'no-default-ref', branch),
+      message: `origin/${def} and ${def} both missing`,
+    };
+  }
+  // `<behind>\t<ahead>` in one call — the same idiom status() uses.
+  // Replaces both a merge-base --is-ancestor probe and a rev-list
+  // --count.
+  const count = await run(repo.path, ['rev-list', '--left-right', '--count', `${baseRef}...HEAD`]);
+  const [behind, ahead] = count.stdout.trim().split(/\s+/).map(Number);
+  if (!count.ok || !Number.isFinite(ahead) || !Number.isFinite(behind)) {
+    return {
+      ...landingBase(repo.id, 'error', branch, baseRef),
+      message: count.stderr.trim() || 'Could not compare refs',
+    };
+  }
+  const common = { aheadOfBase: ahead, behindBase: behind };
+  // Nothing of ours is missing from base: either the tips are identical
+  // or every commit already landed. Both read as "nothing left to land".
+  if (ahead === 0) {
+    return { ...landingBase(repo.id, behind ? 'merged' : 'nothing-to-land', branch, baseRef), ...common };
+  }
+  // Both SHAs in one call, one per line.
+  const shas = await run(repo.path, ['rev-parse', 'HEAD', baseRef]);
+  const [oursSha, theirsSha] = shas.stdout.trim().split(/\s+/);
+  if (!shas.ok || !oursSha || !theirsSha) {
+    return {
+      ...landingBase(repo.id, 'error', branch, baseRef),
+      ...common,
+      message: shas.stderr.trim() || 'Could not resolve refs',
+    };
+  }
+  const p = await memoizedPreflight(repo.path, branch, baseRef, oursSha, theirsSha, force);
+  return {
+    ...landingBase(repo.id, p.status, branch, baseRef),
+    ...common,
+    conflictFiles: p.conflictFiles,
+    treeOid: p.treeOid,
+    message: p.message,
+  };
+}
+
+/// Pairwise preflight between this workset's bound branch and every
+/// other *active* workset's bound branch, for each repo they share —
+/// the "human branch and agent branch will merge cleanly into a broken
+/// build" case, surfaced before either is pushed. A pair (A,B) is
+/// computed once from A's view and again from B's; with the SHA memo
+/// the second is pure Map lookups, and per-workset scoping is what
+/// lets the section render the moment a workset opens.
+async function landingCollisionsFor(
+  ws: Workset,
+  members: Repo[],
+  worksets: Workset[],
+  force: boolean,
+): Promise<WorksetCollision[]> {
+  const aBranch = ws.preferredBranch;
+  if (!aBranch || !isSafeRefArg(aBranch)) return [];
+  const others = worksets.filter(
+    (w) =>
+      w.id !== ws.id &&
+      !w.archived &&
+      !!w.preferredBranch &&
+      w.preferredBranch !== aBranch &&
+      isSafeRefArg(w.preferredBranch),
+  );
+  if (others.length === 0) return [];
+
+  // `rev-parse --verify --quiet refs/heads/<b>` is an existence check
+  // (exit 1, empty stdout when missing) and a SHA read in one spawn.
+  // Hoist the A side once per repo; a repo without the branch locally
+  // has no pairs to check.
+  const ours = await pool(members, 3, async (repo) => {
+    try {
+      const ref = await run(repo.path, ['rev-parse', '--verify', '--quiet', `refs/heads/${aBranch}`]);
+      const sha = ref.stdout.trim();
+      return ref.ok && sha ? { repo, sha } : null;
+    } catch {
+      return null;
+    }
+  });
+  // One pair per (repo, other branch). Two worksets bound to the same
+  // branch would otherwise produce identical rows — and identical
+  // merge-tree work — so collapse them and carry every workset name.
+  const pairs = ours.flatMap((entry) => {
+    if (!entry) return [];
+    const byBranch = new Map<string, Array<{ id: UUID; name: string }>>();
+    for (const other of others) {
+      if (!other.repoIds.includes(entry.repo.id)) continue;
+      const bBranch = other.preferredBranch!;
+      const list = byBranch.get(bBranch) ?? [];
+      list.push({ id: other.id, name: other.name });
+      byBranch.set(bBranch, list);
+    }
+    return [...byBranch.entries()]
+      .slice(0, MAX_COLLISION_PAIRS_PER_REPO)
+      .map(([bBranch, bWorksets]) => ({ ...entry, bBranch, bWorksets }));
+  });
+  const checked = await pool(
+    pairs,
+    3,
+    async ({ repo, sha, bBranch, bWorksets }): Promise<WorksetCollision | null> => {
+      const base = {
+        repoId: repo.id,
+        aWorksetId: ws.id,
+        aWorksetName: ws.name,
+        aBranch,
+        bBranch,
+        bWorksets,
+      };
+      try {
+        const b = await run(repo.path, ['rev-parse', '--verify', '--quiet', `refs/heads/${bBranch}`]);
+        const bSha = b.stdout.trim();
+        if (!b.ok || !bSha) return null;
+        const p = await memoizedPreflight(repo.path, aBranch, bBranch, sha, bSha, force);
+        return { ...base, result: p.status, conflictFiles: p.conflictFiles, treeOid: p.treeOid, message: p.message };
+      } catch (err) {
+        return { ...base, result: 'error', conflictFiles: [], treeOid: null, message: String(err) };
+      }
+    },
+  );
+  return checked.filter((c): c is WorksetCollision => c !== null);
+}
+
+/// Zero-mutation "will this workset land?" report. Every member gets a
+/// typed outcome and a single repo's failure never aborts the batch —
+/// the same discipline as every other fan-out in this file. `force`
+/// bypasses the SHA memo; the explicit Re-check passes it so a pruned
+/// merge tree or a one-off error is always recomputed on demand.
+export async function worksetLanding(
+  worksetId: UUID,
+  worksets: Workset[],
+  repos: Repo[],
+  force = false,
+): Promise<WorksetLandingReport> {
+  const ws = worksets.find((w) => w.id === worksetId);
+  const checkedAt = new Date().toISOString();
+  if (!ws) return { worksetId, checkedAt, gitVersion: null, supported: false, outcomes: [], collisions: [] };
+  const ver = await gitVersion();
+  const supported = supportsMergeTree(ver);
+  const members = reposFor(ws, repos);
+  if (!supported) {
+    return {
+      worksetId,
+      checkedAt,
+      gitVersion: ver?.text ?? null,
+      supported,
+      outcomes: members.map((r) => landingBase(r.id, 'unsupported')),
+      collisions: [],
+    };
+  }
+  // Width 3 — the same budget worksetStatus documents.
+  const outcomes = await pool(members, 3, async (repo): Promise<LandingOutcome> => {
+    try {
+      return await landingOutcomeFor(repo, force);
+    } catch (err) {
+      return { ...landingBase(repo.id, 'error'), message: String(err) };
+    }
+  });
+  const collisions = await landingCollisionsFor(ws, members, worksets, force);
+  return { worksetId, checkedAt, gitVersion: ver?.text ?? null, supported, outcomes, collisions };
 }
 
 export async function worksetCheckout(
