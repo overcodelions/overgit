@@ -25,6 +25,7 @@ import type {
   StoreSnapshot,
   UUID,
   Workset,
+  WorksetLandingReport,
   WorksetActivity,
   WorksetOpenPROutcome,
   WorksetPushOutcome,
@@ -58,6 +59,7 @@ export type Sheet =
   | { kind: 'initRepo'; path: string; reason: string }
   | { kind: 'cloneRepo' }
   | { kind: 'resolveConflict'; repoId: UUID; path: string }
+  | { kind: 'landingPreview'; repoId: UUID; treeOid: string; path: string; oursLabel: string; theirsLabel: string }
   | { kind: 'abandonLocal'; repoId: UUID };
 
 interface OpenFile {
@@ -121,6 +123,7 @@ interface UiState {
   /// about to update rather than stale-and-stuck.
   worksetRefreshing: Record<UUID, boolean>;
   worksetPRs: Record<UUID, RepoPRs[]>;
+  worksetLanding: Record<UUID, WorksetLandingReport>;
   /// Activity-feed cache per workset. Each refresh replaces the full
   /// list; we don't paginate or merge historical fetches because the
   /// "what's new since I last looked" model only needs the most recent
@@ -204,6 +207,8 @@ interface UiState {
   selectWorkspace: (id: UUID | null) => void;
   refreshWorksetStatus: (id: UUID, force?: boolean) => Promise<void>;
   refreshWorksetPRs: (id: UUID, force?: boolean) => Promise<void>;
+  refreshWorksetLanding: (id: UUID, force?: boolean) => Promise<void>;
+  runLandingCheck: (id: UUID) => Promise<void>;
   refreshWorksetWorktrees: (id: UUID, force?: boolean) => Promise<void>;
   refreshWorksetActivity: (id: UUID, force?: boolean) => Promise<void>;
   /// Stamp the workset's `lastSeen` to "now". Called when the user
@@ -510,6 +515,18 @@ function invalidateCache(prefix: string): void {
     if (key.startsWith(prefix)) _lastRefresh.delete(key);
   }
 }
+/// Any operation that moves a repo's HEAD or its base ref makes every
+/// workset's landing report stale, and the store doesn't track which
+/// worksets a repo belongs to — so invalidate them all.
+///
+/// This only clears the TTL; it does NOT refresh anything. The next
+/// caller of refreshWorksetLanding does the work: the Landing row
+/// actions call it explicitly, and the 60s focus tick refreshes the
+/// selected workset — so a rebase started from RepoDetail rather than
+/// from a Landing row self-heals within one tick.
+function invalidateLanding(): void {
+  invalidateCache('worksetLanding:');
+}
 
 export const useStore = create<UiState>((set, get) => ({
   loaded: false,
@@ -531,6 +548,7 @@ export const useStore = create<UiState>((set, get) => ({
   worksetStatuses: {},
   worksetRefreshing: {},
   worksetPRs: {},
+  worksetLanding: {},
   worksetActivity: {},
   worksetWorktrees: {},
   repoDiff: {},
@@ -803,6 +821,69 @@ export const useStore = create<UiState>((set, get) => ({
     );
   },
 
+  refreshWorksetLanding: async (id, force = false) => {
+    // 30s matches the PR fan-out's TTL: both are backed by a per-repo
+    // subprocess wave, and both are read-only. `force` here bypasses the
+    // renderer TTL only; the main-process SHA memo is bypassed by
+    // `runLandingCheck` (the explicit Re-check), not by every tick.
+    await cached(
+      `worksetLanding:${id}`,
+      30_000,
+      async () => {
+        const report = await window.overgit.invoke('workset:landing', { worksetId: id });
+        set({ worksetLanding: { ...get().worksetLanding, [id]: report } });
+      },
+      force,
+    );
+  },
+
+  runLandingCheck: async (id) => {
+    const progress = get().pushToast({
+      kind: 'info',
+      message: 'Fetching and checking landing across workset…',
+      sticky: true,
+    });
+    try {
+      // A failed fetch (offline, auth) still leaves a usable — if stale —
+      // origin/<default>, so keep going and let the preflight run.
+      await window.overgit.invoke('workset:fetchAll', id).catch(() => undefined);
+      // The fetch moved base refs: refresh status too so the Status
+      // section's behind counts and the Landing rows' dirty gating
+      // describe the same moment.
+      await get().refreshWorksetStatus(id, true);
+      // Bypass both caches: the user asked for a fresh answer, and this
+      // is how a pruned merge tree or a one-off error gets recomputed.
+      const report = await window.overgit.invoke('workset:landing', { worksetId: id, force: true });
+      set({ worksetLanding: { ...get().worksetLanding, [id]: report } });
+    } catch (err) {
+      get().pushToast({ kind: 'error', message: `Landing check failed: ${String(err)}` });
+      return;
+    } finally {
+      get().dismissToast(progress);
+    }
+    const r = get().worksetLanding[id];
+    if (!r) return;
+    if (!r.supported) {
+      get().pushToast({
+        kind: 'warn',
+        message: `Landing check needs Git 2.38+ (you have ${r.gitVersion ?? 'an unknown version'})`,
+      });
+      return;
+    }
+    const count = (result: string) => r.outcomes.filter((o) => o.result === result).length;
+    const clean = count('clean');
+    const conflicts = count('conflicts');
+    const merged = count('merged');
+    const collisions = r.collisions.filter((c) => c.result === 'conflicts').length;
+    get().pushToast({
+      kind: conflicts ? 'warn' : 'success',
+      message: `${clean} land clean · ${conflicts} conflict · ${merged} already merged`,
+      details: collisions
+        ? [`${collisions} collision${collisions === 1 ? '' : 's'} with other worksets`]
+        : undefined,
+    });
+  },
+
   refreshWorksetWorktrees: async (id, force = false) => {
     await cached(
       `worksetWorktrees:${id}`,
@@ -893,6 +974,7 @@ export const useStore = create<UiState>((set, get) => ({
     });
     // Refresh status so the dirty count drops on each row that committed.
     await get().refreshWorksetStatus(id, true);
+    invalidateLanding();
     return outcomes;
   },
 
@@ -903,6 +985,7 @@ export const useStore = create<UiState>((set, get) => ({
     // a single repo is also open, refresh its log + graph too so the
     // History tab's ref labels track the new upstream.
     await get().refreshWorksetStatus(id, true);
+    invalidateLanding();
     const selectedRepoId = get().selectedRepoId;
     if (selectedRepoId) {
       await Promise.all([
@@ -924,6 +1007,7 @@ export const useStore = create<UiState>((set, get) => ({
     // immediately. Refresh after the call so the user sees their work
     // reflected without a manual refresh click.
     await get().refreshWorksetPRs(id, true);
+    invalidateLanding();
     return outcomes;
   },
 
@@ -943,6 +1027,7 @@ export const useStore = create<UiState>((set, get) => ({
       });
       set({ lastCheckout: { worksetId: id, branch, outcomes } });
       await get().refreshWorksetStatus(id, true);
+      invalidateLanding();
       const problems = outcomes.filter(
         (o) => o.result !== 'switched' && o.result !== 'already-on-branch',
       );
@@ -1404,6 +1489,16 @@ export const useStore = create<UiState>((set, get) => ({
       Array.from({ length: Math.min(FETCH_CONCURRENCY, ids.length) }, worker),
     );
     await get().refreshAllRepoStatuses(true);
+    // Landing check is the lowest-priority consumer of a fetch:
+    // origin/<default> just moved, so every active workset's preflight
+    // is now the only stale thing left. Sequential on purpose —
+    // worksetLanding already fans out 3-wide internally, and this runs
+    // unattended in the background. One failing workset must not end
+    // the sweep for the rest.
+    for (const w of get().worksets) {
+      if (w.archived) continue;
+      await get().refreshWorksetLanding(w.id, true).catch(() => undefined);
+    }
   },
 
   refreshRepoBranchSummaries: async (id, force = false) => {
@@ -1744,6 +1839,7 @@ export const useStore = create<UiState>((set, get) => ({
       get().refreshRepoGraph(id),
       get().refreshRepoHeadCommit(id, true),
     ]);
+    invalidateLanding();
     return res;
   },
 
@@ -1753,6 +1849,7 @@ export const useStore = create<UiState>((set, get) => ({
       get().refreshRepoStatus(id),
       get().refreshRepoChanges(id),
     ]);
+    invalidateLanding();
     return res;
   },
 
@@ -1788,6 +1885,7 @@ export const useStore = create<UiState>((set, get) => ({
         get().refreshRepoHeadCommit(id, true),
       ]);
     }
+    invalidateLanding();
     return res;
   },
 
@@ -1799,6 +1897,7 @@ export const useStore = create<UiState>((set, get) => ({
       get().refreshRepoGraph(id),
       get().refreshRepoHeadCommit(id, true),
     ]);
+    invalidateLanding();
     return res;
   },
 
@@ -1808,6 +1907,7 @@ export const useStore = create<UiState>((set, get) => ({
       get().refreshRepoStatus(id),
       get().refreshRepoChanges(id),
     ]);
+    invalidateLanding();
     return res;
   },
 
@@ -1819,6 +1919,7 @@ export const useStore = create<UiState>((set, get) => ({
       get().refreshRepoGraph(id),
       get().refreshRepoHeadCommit(id, true),
     ]);
+    invalidateLanding();
     return res;
   },
 

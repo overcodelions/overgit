@@ -85,6 +85,7 @@ import {
   status as gitStatus,
   undoLastCommit,
   unstageFiles,
+  showTreeFile,
 } from './git';
 import { listFilesUnder, listRepoFiles, readFileUnderRoot, writeFileUnderRoot } from './fs';
 import {
@@ -101,6 +102,8 @@ import {
   worksetResetToDefault,
   worksetPushAll,
   worksetStatus,
+  worksetLanding,
+  evictPreflightTree,
   worksetSyncAndBranch,
   worksetSyncMemberToBranch,
   worksetWorktrees,
@@ -714,6 +717,20 @@ function registerIpc(): void {
     },
   );
 
+  ipcMain.handle(
+    'repo:mergePreviewFile',
+    async (_e, args: { repoId: string; treeOid: string; path: string }) => {
+      const repo = repoFromArg(args);
+      if (!repo) return { ok: false as const, error: 'Unknown repo' };
+      const res = await showTreeFile(repo.path, args.treeOid, args.path);
+      // A missing tree means gc pruned it; forget the memoized answer so
+      // the next landing check regenerates it instead of handing back
+      // the same dead OID.
+      if (!res.ok && !res.binary) evictPreflightTree(repo.path, args.treeOid);
+      return res;
+    },
+  );
+
   ipcMain.handle('repo:abortMerge', async (_e, repoId: string) => {
     const repo = repoFromArg(repoId);
     if (!repo) return { ok: false, error: 'Unknown repo' };
@@ -1124,6 +1141,13 @@ function registerIpc(): void {
     const { worksets, repos } = Store.load();
     return worksetStatus(worksetId, worksets, repos);
   });
+  ipcMain.handle(
+    'workset:landing',
+    async (_e, args: { worksetId: string; force?: boolean }) => {
+      const { worksets, repos } = Store.load();
+      return worksetLanding(args.worksetId, worksets, repos, args.force === true);
+    },
+  );
 
   ipcMain.handle(
     'workset:checkoutBranch',
