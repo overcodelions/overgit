@@ -662,6 +662,13 @@ function buildSections(args: BuildArgs): PaletteSection[] {
         },
       },
       {
+        id: 'landing-check-ws',
+        title: 'Check landing across workset',
+        hint: 'Fetch, then simulate the merge onto each repo’s default — nothing is modified',
+        glyph: '⚑',
+        perform: () => { void useStore.getState().runLandingCheck(selectedWsId); actions.close(); },
+      },
+      {
         id: 'open-prs-ws',
         title: 'Open PRs across workset',
         hint: cli?.gh ? 'Shared title and body · gh pr create per repo' : 'Install gh first',

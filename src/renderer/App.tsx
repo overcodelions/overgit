@@ -5,6 +5,7 @@ import { TitleBar } from './TitleBar';
 import { SheetHost, ReviewBody, formatBytes } from './Sheets';
 import { CommandPalette } from './CommandPalette';
 import { Explain } from './Explain';
+import { relativeTime } from './BranchPicker';
 import type {
   ChangedFile,
   CheckoutOutcome,
@@ -21,6 +22,7 @@ import type {
   Workset,
   WorksetActivity,
   WorksetDiffTruncation,
+  WorksetLandingReport,
   Workspace,
   Worktree,
 } from '@shared/types';
@@ -302,6 +304,7 @@ function SidebarWithResize(): JSX.Element {
 function useSidebarStatusRefresh(): void {
   const refreshAll = useStore((s) => s.refreshAllRepoStatuses);
   const refreshWsStatus = useStore((s) => s.refreshWorksetStatus);
+  const refreshWsLanding = useStore((s) => s.refreshWorksetLanding);
   const refreshRepoChanges = useStore((s) => s.refreshRepoChanges);
   const refreshRepoStatus = useStore((s) => s.refreshRepoStatus);
   const loaded = useStore((s) => s.loaded);
@@ -324,6 +327,10 @@ function useSidebarStatusRefresh(): void {
       // refresh whose whole purpose is to catch terminal-side changes
       // the cache can't predict.
       if (wsId) void refreshWsStatus(wsId, true);
+      // Not forced: the landing TTL (30s) is already shorter than this
+      // tick, and forcing would only defeat in-flight dedup against the
+      // workset view's own mount refresh.
+      if (wsId) void refreshWsLanding(wsId);
       /// Re-run the per-repo refresh fan-out for the already-open repo
       /// so RepoDetail picks up changes made in a terminal while
       /// overgit was backgrounded. Without this, the user has to
@@ -352,6 +359,7 @@ function useSidebarStatusRefresh(): void {
     loaded,
     refreshAll,
     refreshWsStatus,
+    refreshWsLanding,
     refreshRepoChanges,
     refreshRepoStatus,
   ]);
@@ -559,6 +567,7 @@ function useGlobalShortcuts(): void {
 function Sidebar(): JSX.Element {
   const repos = useStore((s) => s.repos);
   const worksets = useStore((s) => s.worksets);
+  const landingReports = useStore((s) => s.worksetLanding);
   const workspaces = useStore((s) => s.workspaces);
   const selectedWs = useStore((s) => s.selectedWorksetId);
   const selectedRepo = useStore((s) => s.selectedRepoId);
@@ -1004,12 +1013,21 @@ function Sidebar(): JSX.Element {
         ) : (
           activeWorksets.map((w) => {
             const idx = rowIndex.get(`workset:${w.id}`) ?? -1;
+            const report = landingReports[w.id];
+            const landingConflicts = report?.supported
+              ? {
+                  repos: report.outcomes.filter((o) => o.result === 'conflicts').length,
+                  collisions: report.collisions.filter((c) => c.result === 'conflicts').length,
+                  total: report.outcomes.length,
+                }
+              : undefined;
             return (
               <WorksetRow
                 key={w.id}
                 workset={w}
                 selected={selectedWs === w.id && !selectedRepo}
                 keyboardActive={idx === activeIdx}
+                landingConflicts={landingConflicts}
                 onSelect={() => selectWs(w.id)}
                 onEdit={() => setSheet({ kind: 'editWorkset', worksetId: w.id })}
                 onArchive={() => void archiveWorkset(w.id)}
@@ -1283,6 +1301,7 @@ function WorksetRow({
   onArchive,
   onReactivate,
   onRemove,
+  landingConflicts,
 }: {
   workset: Workset;
   selected: boolean;
@@ -1296,6 +1315,7 @@ function WorksetRow({
   onArchive?: () => void;
   onReactivate?: () => void;
   onRemove: () => void;
+  landingConflicts?: { repos: number; collisions: number; total: number };
 }): JSX.Element {
   const ref = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -1332,6 +1352,17 @@ function WorksetRow({
             </span>
           )}
         </div>
+        {landingConflicts && landingConflicts.repos + landingConflicts.collisions > 0 && (
+          <span
+            className="w-1.5 h-1.5 rounded-full bg-red-400 shrink-0"
+            title={
+              `${landingConflicts.repos} of ${landingConflicts.total} repos conflict with their default branch` +
+              (landingConflicts.collisions
+                ? ` · ${landingConflicts.collisions} workset collision${landingConflicts.collisions === 1 ? '' : 's'}`
+                : '')
+            }
+          />
+        )}
         <span className="shrink-0 text-[10px] tabular-nums text-ink-faint">
           {workset.repoIds.length}
         </span>
@@ -2041,6 +2072,7 @@ function WorksetView({ worksetId }: { worksetId: UUID }): JSX.Element {
   const statuses = useStore((s) => s.worksetStatuses[worksetId] ?? EMPTY_STATUSES);
   const refreshing = useStore((s) => s.worksetRefreshing[worksetId] ?? false);
   const prs = useStore((s) => s.worksetPRs[worksetId] ?? EMPTY_PRS);
+  const landing = useStore((s) => s.worksetLanding[worksetId] ?? null);
   const activity = useStore((s) => s.worksetActivity[worksetId] ?? EMPTY_ACTIVITY);
   const lastSeen = useStore(
     (s) => s.settings.worksetLastSeen?.[worksetId] ?? null,
@@ -2049,6 +2081,8 @@ function WorksetView({ worksetId }: { worksetId: UUID }): JSX.Element {
   const cli = useStore((s) => s.cliPresence);
   const refresh = useStore((s) => s.refreshWorksetStatus);
   const refreshPRs = useStore((s) => s.refreshWorksetPRs);
+  const refreshLanding = useStore((s) => s.refreshWorksetLanding);
+  const runLanding = useStore((s) => s.runLandingCheck);
   const refreshWorktrees = useStore((s) => s.refreshWorksetWorktrees);
   const refreshActivity = useStore((s) => s.refreshWorksetActivity);
   const markSeen = useStore((s) => s.markWorksetSeen);
@@ -2061,6 +2095,16 @@ function WorksetView({ worksetId }: { worksetId: UUID }): JSX.Element {
   const dismissToast = useStore((s) => s.dismissToast);
 
   const [busy, setBusy] = useState(false);
+  const [recheckBusy, setRecheckBusy] = useState(false);
+  const onRecheck = useCallback(async () => {
+    if (recheckBusy) return;
+    setRecheckBusy(true);
+    try {
+      await runLanding(worksetId);
+    } finally {
+      setRecheckBusy(false);
+    }
+  }, [recheckBusy, runLanding, worksetId]);
   const [view, setView] = useState<'overview' | 'commit'>('overview');
   const [showAllWorktrees, setShowAllWorktrees] = useState(false);
   /// `seenAtOpen` freezes the lastSeen value at mount so the "new
@@ -2081,9 +2125,10 @@ function WorksetView({ worksetId }: { worksetId: UUID }): JSX.Element {
     const t = window.setTimeout(() => {
       refreshPRs(worksetId);
       refreshActivity(worksetId);
+      refreshLanding(worksetId);
     }, 250);
     return () => window.clearTimeout(t);
-  }, [refresh, refreshPRs, refreshWorktrees, refreshActivity, worksetId]);
+  }, [refresh, refreshPRs, refreshWorktrees, refreshActivity, refreshLanding, worksetId]);
 
   // On unmount (or workset switch), advance lastSeen so the next
   // visit only highlights things that landed after this one.
@@ -2389,6 +2434,7 @@ function WorksetView({ worksetId }: { worksetId: UUID }): JSX.Element {
                 // bypass the TTL cache.
                 refresh(worksetId, true);
                 refreshPRs(worksetId, true);
+                refreshLanding(worksetId, true);
               }}
               className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
             >
@@ -2412,6 +2458,9 @@ function WorksetView({ worksetId }: { worksetId: UUID }): JSX.Element {
             : 0
         }
         summary={summary}
+        landingConflicts={
+          landing?.supported ? landing.outcomes.filter((o) => o.result === 'conflicts').length : 0
+        }
         onArchive={async () => {
           const memberCount = ws.repoIds.length;
           const ok = await requestConfirm({
@@ -2618,6 +2667,15 @@ function WorksetView({ worksetId }: { worksetId: UUID }): JSX.Element {
       {cli?.gh && prs.some((p) => p.prs !== null) && (
         <PRSection prs={prs} reposById={reposById} cli={cli} />
       )}
+
+      <LandingSection
+        worksetId={worksetId}
+        report={landing}
+        statuses={statuses}
+        reposById={reposById}
+        busy={recheckBusy}
+        onRecheck={onRecheck}
+      />
 
       <section className="mb-6">
         <div className="mb-2 flex items-center justify-between">
@@ -3524,11 +3582,13 @@ function LifecycleStepper({
   onBoundBranchCount,
   summary,
   onArchive,
+  landingConflicts,
 }: {
   boundBranch: string | null;
   onBoundBranchCount: number;
   summary: { dirty: number; ahead: number; needsFirstPush: number; loaded: number };
   onArchive: () => Promise<void> | void;
+  landingConflicts: number;
 }): JSX.Element {
   const [archiving, setArchiving] = useState(false);
   const branchMet =
@@ -3569,6 +3629,14 @@ function LifecycleStepper({
       <Step label="Commit" met={commitMet} hint={commitHint} />
       <StepConnector met={pushMet} />
       <Step label="Push" met={pushMet} hint={pushHint} />
+      {landingConflicts > 0 && (
+        <span
+          className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300"
+          title="From the Landing check below — a simulated merge onto each repo's default branch"
+        >
+          {landingConflicts} {landingConflicts === 1 ? 'repo' : 'repos'} will conflict on landing
+        </span>
+      )}
       <StepConnector met={canArchive} />
       <button
         onClick={async () => {
@@ -3861,6 +3929,440 @@ function CheckoutOutcomeRow({
         </div>
       )}
     </li>
+  );
+}
+
+type LandingOutcomeRow = WorksetLandingReport['outcomes'][number];
+type LandingCollisionRow = WorksetLandingReport['collisions'][number];
+
+function landingOutcomeCopy(o: LandingOutcomeRow): string {
+  switch (o.result) {
+    case 'clean':
+      return `lands clean on ${o.baseRef}`;
+    case 'merged':
+      return `already contained in ${o.baseRef}`;
+    case 'nothing-to-land':
+      return `identical to ${o.baseRef}`;
+    case 'on-default':
+      return `on ${o.branch}`;
+    case 'no-default-ref':
+      return `no default branch resolved${o.message ? ` — ${o.message}` : ''}`;
+    default:
+      return o.message ?? 'Landing check failed';
+  }
+}
+
+/// "Will this workset land?" — one row per member repo, computed with
+/// `git merge-tree --write-tree` in the main process (nothing is checked
+/// out or modified). Uncommitted-file counts come from the workset
+/// status cache: merge-tree only sees committed work, so the caveat and
+/// the Rebase/Merge gating both read `dirtyCount` from `statuses`
+/// rather than paying an extra `git status` per repo.
+function LandingSection({
+  worksetId,
+  report,
+  statuses,
+  reposById,
+  busy,
+  onRecheck,
+}: {
+  worksetId: UUID;
+  report: WorksetLandingReport | null;
+  statuses: RepoStatus[];
+  reposById: Map<UUID, Repo>;
+  busy: boolean;
+  onRecheck: () => void;
+}): JSX.Element | null {
+  // Nothing checked yet — don't flash an empty frame on open.
+  if (!report) return null;
+  if (!report.supported) {
+    return (
+      <section className="mb-6 p-3 rounded border border-amber-500/40 text-xs text-amber-300">
+        Landing check needs Git 2.38+ (you have {report.gitVersion ?? 'an unknown version'}).
+      </section>
+    );
+  }
+  const count = (result: LandingOutcomeRow['result']) =>
+    report.outcomes.filter((o) => o.result === result).length;
+  const chips: Array<[number, string]> = [
+    [count('clean'), 'lands clean'],
+    [count('conflicts'), 'conflicts'],
+    [count('merged'), 'already merged'],
+  ];
+  const caption = [
+    ...chips.filter(([n]) => n > 0).map(([n, label]) => `${n} ${label}`),
+    `as of ${relativeTime(report.checkedAt)} ago`,
+  ].join(' · ');
+  const dirtyMembers = report.outcomes.filter(
+    (o) => (statuses.find((s) => s.repoId === o.repoId)?.dirtyCount ?? 0) > 0,
+  );
+  return (
+    <section className="mb-6">
+      <div className="flex items-center gap-2 mb-2">
+        <h2 className="text-[10px] uppercase tracking-wide text-ink-faint">Landing</h2>
+        <span className="text-[11px] text-ink-muted">{caption}</span>
+        <Explain
+          command="git fetch && git merge-tree --write-tree --name-only <branch> origin/<default>"
+          plain="Fetch, then simulate each merge onto its default branch. Nothing is checked out and no files change."
+        >
+          <button
+            disabled={busy}
+            onClick={onRecheck}
+            className="ml-auto text-xs px-2 py-1 rounded border border-card hover:bg-card disabled:opacity-50"
+          >
+            Re-check
+          </button>
+        </Explain>
+      </div>
+      {statuses.length > 0 && dirtyMembers.length > 0 && (
+        <p className="text-[11px] text-ink-faint mb-2">
+          Committed work only — {dirtyMembers.length}{' '}
+          {dirtyMembers.length === 1 ? 'repo has' : 'repos have'} uncommitted files not included
+          in this check.
+        </p>
+      )}
+      <ul className="flex flex-col gap-1">
+        {report.outcomes.map((o) => (
+          <LandingRow
+            key={o.repoId}
+            worksetId={worksetId}
+            outcome={o}
+            status={statuses.find((s) => s.repoId === o.repoId)}
+            name={reposById.get(o.repoId)?.name ?? o.repoId}
+            busy={busy}
+          />
+        ))}
+      </ul>
+      {report.collisions.length > 0 && (
+        <CollisionsBlock collisions={report.collisions} reposById={reposById} />
+      )}
+    </section>
+  );
+}
+
+function LandingRow({
+  worksetId,
+  outcome: o,
+  status,
+  name,
+  busy,
+}: {
+  worksetId: UUID;
+  outcome: LandingOutcomeRow;
+  status: RepoStatus | undefined;
+  name: string;
+  busy: boolean;
+}): JSX.Element {
+  const setSheet = useStore((s) => s.setSheet);
+  const rebase = useStore((s) => s.rebaseOnto);
+  const merge = useStore((s) => s.mergeBranch);
+  const selectRepo = useStore((s) => s.selectRepo);
+  const refreshLanding = useStore((s) => s.refreshWorksetLanding);
+  const refreshStatus = useStore((s) => s.refreshWorksetStatus);
+  const requestConfirm = useStore((s) => s.requestConfirm);
+  const pushToast = useStore((s) => s.pushToast);
+
+  if (o.result !== 'conflicts') {
+    return (
+      <li className="text-xs p-2 rounded border border-card bg-card">
+        <b>{name}</b> · {landingOutcomeCopy(o)}
+      </li>
+    );
+  }
+
+  // Rebase/merge need a clean tree; git would refuse anyway, but a
+  // disabled button with the reason beats a stderr toast.
+  const dirty = status?.dirtyCount ?? 0;
+  const disabled = !status || dirty > 0 || busy;
+  const reason = !status
+    ? 'Repo status not loaded yet'
+    : dirty > 0
+      ? `Commit or stash ${dirty} file${dirty === 1 ? '' : 's'} first`
+      : undefined;
+
+  const openPreview = (file: string) => {
+    if (!o.treeOid) return;
+    setSheet({
+      kind: 'landingPreview',
+      repoId: o.repoId,
+      treeOid: o.treeOid,
+      path: file,
+      oursLabel: o.branch ?? 'HEAD',
+      theirsLabel: o.baseRef ?? 'default',
+    });
+  };
+
+  // After either action, RepoDetail's in-progress banner and the
+  // existing Resolve sheet own the actual conflict resolution — so
+  // navigate there. A hard failure (not a conflict) gets a toast, the
+  // same way RepoDetail's own merge/rebase buttons report it.
+  const runAction = async (kind: 'rebase' | 'merge') => {
+    if (!o.baseRef) return;
+    const ok = await requestConfirm(
+      kind === 'rebase'
+        ? {
+            title: `Rebase ${name}?`,
+            body: `Rebase ${o.branch ?? 'HEAD'} onto ${o.baseRef}.`,
+            confirmLabel: 'Rebase',
+          }
+        : {
+            title: `Merge into ${name}?`,
+            body: `Merge ${o.baseRef} into ${o.branch ?? 'HEAD'}.`,
+            confirmLabel: 'Merge',
+          },
+    );
+    if (!ok) return;
+    const res =
+      kind === 'rebase' ? await rebase(o.repoId, o.baseRef) : await merge(o.repoId, o.baseRef, 'merge');
+    if (!res.ok) {
+      pushToast({
+        kind: 'error',
+        message: res.error ?? (kind === 'rebase' ? 'Rebase failed' : 'Merge failed'),
+      });
+    }
+    selectRepo(o.repoId);
+    void refreshStatus(worksetId, true);
+    void refreshLanding(worksetId, true);
+  };
+
+  return (
+    <li className="text-xs p-2 rounded border border-card bg-card">
+      <b>{name}</b> · conflicts with {o.baseRef}:
+      {o.conflictFiles.map((f) => (
+        <button
+          key={f}
+          className="ml-1 font-mono text-accent hover:underline"
+          title="Preview the simulated conflict (read-only)"
+          onClick={() => openPreview(f)}
+        >
+          {f}
+        </button>
+      ))}
+      <Explain
+        command={`git rebase ${o.baseRef}`}
+        plain={`Rebase ${name} onto the default branch to resolve this landing conflict.`}
+      >
+        <button
+          title={reason}
+          disabled={disabled}
+          className="ml-2 text-accent disabled:opacity-40"
+          onClick={() => void runAction('rebase')}
+        >
+          Rebase
+        </button>
+      </Explain>
+      <Explain
+        command={`git merge ${o.baseRef}`}
+        plain={`Merge the default branch into ${name} to resolve this landing conflict.`}
+      >
+        <button
+          title={reason}
+          disabled={disabled}
+          className="ml-2 text-accent disabled:opacity-40"
+          onClick={() => void runAction('merge')}
+        >
+          Merge
+        </button>
+      </Explain>
+    </li>
+  );
+}
+
+/// Pairwise merge simulations against other active worksets' branches,
+/// grouped by repo: the repo is the thing you'd go rebase, so it's the
+/// card. Repos with any conflict (or an error) get a card with the
+/// conflicting branches as rows and that repo's clean branches folded
+/// behind one line; repos with nothing but clean pairs collapse into a
+/// single muted line so the signal isn't buried under "no overlap".
+function CollisionsBlock({
+  collisions,
+  reposById,
+}: {
+  collisions: LandingCollisionRow[];
+  reposById: Map<UUID, Repo>;
+}): JSX.Element {
+  const byRepo = new Map<UUID, LandingCollisionRow[]>();
+  for (const c of collisions) {
+    const list = byRepo.get(c.repoId) ?? [];
+    list.push(c);
+    byRepo.set(c.repoId, list);
+  }
+  const groups = [...byRepo.entries()].map(([repoId, rows]) => ({
+    repoId,
+    name: reposById.get(repoId)?.name ?? repoId,
+    aBranch: rows[0].aBranch,
+    attention: rows.filter((c) => c.result !== 'clean'),
+    clean: rows.filter((c) => c.result === 'clean'),
+  }));
+  const cards = groups.filter((g) => g.attention.length > 0);
+  const quiet = groups.filter((g) => g.attention.length === 0);
+  const conflicting = collisions.filter((c) => c.result === 'conflicts').length;
+  const clean = collisions.filter((c) => c.result === 'clean').length;
+  return (
+    <div className="mt-3 text-xs">
+      <div className="flex items-baseline gap-2 mb-1.5">
+        <h3 className="text-[10px] uppercase tracking-wide text-ink-faint">
+          Collisions with other worksets
+        </h3>
+        <span className="text-[11px] text-ink-muted">
+          {conflicting} conflicting {conflicting === 1 ? 'branch' : 'branches'} · {clean} with no
+          overlap
+        </span>
+      </div>
+      <div className="flex flex-col gap-1">
+        {cards.map((g) => (
+          <CollisionRepoCard key={g.repoId} group={g} />
+        ))}
+        {quiet.length > 0 && <QuietCollisionsLine groups={quiet} />}
+      </div>
+    </div>
+  );
+}
+
+interface CollisionGroup {
+  repoId: UUID;
+  name: string;
+  aBranch: string;
+  attention: LandingCollisionRow[];
+  clean: LandingCollisionRow[];
+}
+
+function collisionWorksetLabel(c: LandingCollisionRow): JSX.Element {
+  const [first, ...rest] = c.bWorksets;
+  return (
+    <span className="text-ink-muted">
+      {first?.name ?? c.bBranch}
+      {rest.length > 0 && (
+        <span className="text-ink-faint" title={c.bWorksets.map((w) => w.name).join(', ')}>
+          {' '}· {c.bWorksets.length} worksets
+        </span>
+      )}
+    </span>
+  );
+}
+
+function CollisionRepoCard({ group: g }: { group: CollisionGroup }): JSX.Element {
+  const setSheet = useStore((s) => s.setSheet);
+  const [showClean, setShowClean] = useState(false);
+  const preview = (c: LandingCollisionRow, file: string) => {
+    if (!c.treeOid) return;
+    setSheet({
+      kind: 'landingPreview',
+      repoId: c.repoId,
+      treeOid: c.treeOid,
+      path: file,
+      oursLabel: c.aBranch,
+      theirsLabel: c.bBranch,
+    });
+  };
+  const rowCls = 'flex items-center gap-2.5 px-2 py-1.5 border-t border-white/[0.06]';
+  return (
+    <div className="rounded border border-card bg-card overflow-hidden">
+      <div className="flex items-center gap-2 px-2 pt-2 pb-1.5">
+        <b>{g.name}</b>
+        <span className="font-mono text-ink-muted">{g.aBranch}</span>
+        <span className="text-ink-faint">against</span>
+      </div>
+      {g.attention.map((c) => (
+        <div key={c.bBranch} className={rowCls}>
+          <span
+            className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+              c.result === 'conflicts' ? 'bg-amber-300' : 'bg-red-400'
+            }`}
+          />
+          <span className="font-mono shrink-0 w-[260px] truncate" title={c.bBranch}>
+            {c.bBranch}
+          </span>
+          <span className="shrink-0 w-[200px] truncate">{collisionWorksetLabel(c)}</span>
+          {c.result === 'conflicts' ? (
+            <>
+              <span className="shrink-0 text-[10px] px-1.5 py-px rounded bg-amber-500/15 text-amber-300">
+                {c.conflictFiles.length} {c.conflictFiles.length === 1 ? 'file' : 'files'} conflict
+              </span>
+              <span className="min-w-0 truncate">
+                {c.conflictFiles.map((f) => (
+                  <button
+                    key={f}
+                    className="mr-2 font-mono text-accent hover:underline"
+                    title="Preview the simulated conflict (read-only)"
+                    onClick={() => preview(c, f)}
+                  >
+                    {f}
+                  </button>
+                ))}
+              </span>
+            </>
+          ) : (
+            <span className="text-red-400 truncate">{c.message ?? 'Collision check failed'}</span>
+          )}
+        </div>
+      ))}
+      {showClean &&
+        g.clean.map((c) => (
+          <div key={c.bBranch} className={`${rowCls} text-ink-faint`}>
+            <span className="w-1.5 h-1.5 rounded-full border border-ink-faint shrink-0" />
+            <span className="font-mono shrink-0 w-[260px] truncate" title={c.bBranch}>
+              {c.bBranch}
+            </span>
+            <span className="shrink-0 w-[200px] truncate">
+              {c.bWorksets.map((w) => w.name).join(' · ')}
+            </span>
+            <span>no overlap</span>
+          </div>
+        ))}
+      {g.clean.length > 0 && (
+        <div className={rowCls}>
+          <span className="w-1.5 shrink-0" />
+          <button
+            className="text-ink-faint hover:text-ink-muted"
+            onClick={() => setShowClean((v) => !v)}
+          >
+            {showClean
+              ? `Hide ${g.clean.length} ${g.clean.length === 1 ? 'branch' : 'branches'} with no overlap`
+              : `${g.clean.length} more ${g.clean.length === 1 ? 'branch' : 'branches'}: no overlap`}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function QuietCollisionsLine({ groups }: { groups: CollisionGroup[] }): JSX.Element {
+  const [open, setOpen] = useState(false);
+  const branchCount = groups.reduce((n, g) => n + g.clean.length, 0);
+  const names = groups.map((g) => g.name);
+  const nameList =
+    names.length === 1
+      ? names[0]
+      : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+  return (
+    <>
+      <div className="flex items-center gap-2 p-2 rounded border border-card text-ink-faint">
+        <span className="w-1.5 h-1.5 rounded-full border border-ink-faint shrink-0" />
+        <span className="min-w-0 truncate">
+          <span className="text-ink-muted font-medium">{nameList}</span> — no overlap with{' '}
+          {branchCount} other workset {branchCount === 1 ? 'branch' : 'branches'}
+        </span>
+        <button
+          className="ml-auto shrink-0 text-ink-faint hover:text-ink-muted"
+          onClick={() => setOpen((v) => !v)}
+        >
+          {open ? 'Hide' : 'Show'}
+        </button>
+      </div>
+      {open && (
+        <div className="flex flex-col gap-1 px-2 py-1.5 rounded border border-card text-ink-faint">
+          {groups.map((g) => (
+            <div key={g.repoId} className="flex gap-2.5">
+              <span className="w-[160px] shrink-0 text-ink-muted truncate">{g.name}</span>
+              <span className="font-mono min-w-0">
+                {g.clean.map((c) => c.bBranch).join(' · ')}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
   );
 }
 

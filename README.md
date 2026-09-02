@@ -34,6 +34,10 @@ A repo can belong to many workspaces (small shared libs are the common case) and
 
 ### Worksets (tickets across repos)
 
+### Landing check
+
+Landing Check continuously answers whether every committed workset branch will land on its default branch, identifies conflicted files, and flags collisions between active worksets sharing a repo. It refreshes after background fetches and exposes conflicts in the sidebar, workset page, and command palette. It uses Git 2.38+ `git merge-tree --write-tree`, which never changes the working tree, index, or refs. Git creates unreachable loose merge objects in `.git/objects`; its normal `gc --auto` collects them, and unchanged SHA pairs are memoized. Uncommitted work is intentionally excluded. On older Git versions it reports unsupported without changing other behavior.
+
 - **A workset is a ticket.** Name it ("rate-limiter rollout"), pick the repos it touches, optionally bind it to a feature branch (`feat/rate-limit`). Resume it any time — the sidebar surfaces active worksets above the workspace list.
 - **Workset-wide branching.** Sync each member repo to its default → pull → branch, all in one workflow. Per-repo outcomes if any of them fail.
 - **Archive when shipped.** Workset done — committed and pushed across all repos? Archive it. It vanishes from the active list into the collapsed "Archived" section. Repos on disk are unchanged. Reactivate any time.
@@ -83,7 +87,7 @@ If you want to use overgit on its own source tree, run `npm start` rather than `
 
 ## CLIs overgit shells out to
 
-- **`git`** — every operation. The whole point.
+- **`git`** — every operation. The whole point. Landing Check needs Git 2.38+ for `merge-tree --write-tree`.
 - **`gh`** — GitHub PR list, comments, reviews.
 - **`glab`**, **`jj`** — detected; integrations planned.
 - **`claude`** — `claude -p -` for review / suggest commit message.
