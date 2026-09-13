@@ -186,8 +186,12 @@ export function readFileUnderRoot(
   if (!resolved) {
     return { ok: false, error: 'Refused: path is outside the repo' };
   }
+  let fd: number | undefined;
   try {
-    const stat = fs.statSync(resolved);
+    // Stat and read through the same descriptor so the file can't be
+    // swapped between the size check and the read.
+    fd = fs.openSync(resolved, 'r');
+    const stat = fs.fstatSync(fd);
     if (stat.isDirectory()) {
       return { ok: false, error: 'Not a file — this path is a directory.' };
     }
@@ -197,13 +201,15 @@ export function readFileUnderRoot(
         error: `File is ${Math.round(stat.size / 1024 / 1024)} MB — editor opens files under 5 MB.`,
       };
     }
-    const content = fs.readFileSync(resolved, 'utf-8');
+    const content = fs.readFileSync(fd, 'utf-8');
     if (content.includes('\0')) {
       return { ok: false, error: 'Binary file — editor only opens text.' };
     }
     return { ok: true, content, resolvedPath: resolved };
   } catch (err: unknown) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
   }
 }
 

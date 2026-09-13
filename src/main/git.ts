@@ -984,15 +984,13 @@ function detectInProgress(repoPath: string): 'merge' | 'rebase' | 'cherry-pick' 
   const gitDir = path.join(repoPath, '.git');
   // .git can be a file in worktrees (`gitdir: <path>`); chase it.
   let resolvedGitDir = gitDir;
+  // Read directly instead of stat-then-read; a directory throws EISDIR.
   try {
-    const stat = fs.statSync(gitDir);
-    if (stat.isFile()) {
-      const ref = fs.readFileSync(gitDir, 'utf-8').trim();
-      const m = ref.match(/^gitdir:\s*(.+)$/);
-      if (m) resolvedGitDir = path.resolve(repoPath, m[1].trim());
-    }
-  } catch {
-    return null;
+    const ref = fs.readFileSync(gitDir, 'utf-8').trim();
+    const m = ref.match(/^gitdir:\s*(.+)$/);
+    if (m) resolvedGitDir = path.resolve(repoPath, m[1].trim());
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EISDIR') return null;
   }
   const exists = (rel: string) => {
     try {
