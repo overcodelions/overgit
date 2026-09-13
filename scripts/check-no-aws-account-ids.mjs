@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from 'node:child_process';
-import { lstatSync, readFileSync, readlinkSync } from 'node:fs';
+import { readFileSync, readlinkSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
 const ACCOUNT_ID = /(^|[^0-9])([0-9]{12})(?![0-9])/g;
@@ -37,6 +37,17 @@ function annotationProperty(value) {
     .replaceAll(',', '%2C');
 }
 
+// Scan a symlink's target path rather than following it. Trying readlink
+// first avoids a separate lstat check that could go stale before the read.
+function readLinkOrFile(file) {
+  try {
+    return readlinkSync(file);
+  } catch (error) {
+    if (error.code !== 'EINVAL') throw error;
+    return readFileSync(file);
+  }
+}
+
 function repositoryFiles() {
   const output = execFileSync(
     'git',
@@ -59,8 +70,7 @@ export function scanRepository() {
       );
     }
 
-    const stat = lstatSync(file);
-    const contents = stat.isSymbolicLink() ? readlinkSync(file) : readFileSync(file);
+    const contents = readLinkOrFile(file);
     for (const finding of findAwsAccountIds(contents)) {
       count += 1;
       console.error(
