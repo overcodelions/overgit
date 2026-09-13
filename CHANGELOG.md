@@ -6,6 +6,44 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-13
+
+### Added
+
+- Landing Check. For every workset, overgit answers "will this land on its
+  default branch?" per member repo using `git merge-tree --write-tree` (Git
+  2.38+), which never touches the working tree, index, or any ref. Each repo
+  gets an outcome (clean, conflicts with the files listed, already merged,
+  nothing to land, on the default branch, no default ref, unsupported, or
+  error). Conflicted files preview read-only from the merge-tree result, and
+  Rebase and Merge onto the default branch reuse the existing flows.
+- Collisions between worksets. For every repo shared by two or more active
+  worksets, the two bound branches are simulated against each other, grouped
+  by repo with conflicts first.
+- Landing results surface as a sidebar dot on workset rows, a Landing section
+  in the workset view, a badge on the Push step, a Re-check button, and a
+  command palette entry. They refresh after the background fetch and are
+  memoized per repo and commit pair.
+
+### Changed
+
+- macOS builds are signed with the Developer ID and notarized, so the app
+  opens without a Gatekeeper warning. Nightly builds are signed but not
+  notarized. The macOS release runner is pinned to `macos-15`.
+
+### Fixed
+
+- File-system check/use races flagged by CodeQL: files under a repo root are
+  read through a single descriptor, in-progress operations are detected by
+  reading `.git` directly, and the AWS account ID scanner reads links first.
+
+### Security
+
+- CI blocks AWS account IDs and private git identities in commits, commit
+  messages, and pull requests, with matching local hooks.
+- A customer organization name used as a search example in the clone sheet
+  was replaced.
+
 ## [0.2.0] - 2026-08-02
 
 ### Added
@@ -61,6 +99,7 @@ Initial public release. Building in the open from here.
 - Per-lane colored branch graph with ref labels.
 - Resizable sidebar, light / dark / system theme, keyboard shortcuts.
 
-[Unreleased]: https://github.com/overcodelions/overgit/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/overcodelions/overgit/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/overcodelions/overgit/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/overcodelions/overgit/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/overcodelions/overgit/releases/tag/v0.1.0
