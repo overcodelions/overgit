@@ -347,7 +347,7 @@ function cloneUrlForRepo(repo: ForgeRepo, protocol: 'https' | 'ssh'): string {
 }
 
 /// Match every whitespace-separated term against "owner/name description"
-/// so "acme admin" finds acme-corp/admin-console.
+/// so "acme admin" finds acme-corp/acme-web-admin.
 function matchesForgeFilter(repo: ForgeRepo, terms: string[]): boolean {
   if (terms.length === 0) return true;
   const hay = `${repo.fullName} ${repo.description ?? ''}`.toLowerCase();
