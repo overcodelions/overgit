@@ -17,7 +17,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          # Pinned rather than macos-latest, matching overcli: the macos-26
+          # image that rolled on 2026-08-31 fails signing at
+          # `security set-key-partition-list` (the temp keychain
+          # electron-builder creates no longer unlocks). Revisit when a later
+          # image or electron-builder release fixes it.
+          - os: macos-15
             dist_script: dist:mac
           - os: windows-latest
             dist_script: dist:win
@@ -36,14 +41,33 @@ jobs:
 
       # electron-builder picks GH_TOKEN up automatically and will attach
       # the produced artifacts to the GitHub Release for the pushed tag.
-      # Code signing / notarization is intentionally not configured —
-      # users on macOS will need to right-click → Open the first time.
+      # macOS builds are signed with the Developer ID and notarized when the
+      # Apple secrets are available (same setup as overcli).
       - name: Build distributables
-        run: npm run ${{ matrix.dist_script }}
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Disable electron-builder's macOS code signing attempts.
-          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          # Signing credentials. Read from org-level secrets shared with
+          # overcli (or repo-level ones, which take precedence). When they
+          # are absent the build still succeeds, unsigned, as before.
+          MAC_CSC_LINK: ${{ secrets.CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          MAC_APPLE_ID: ${{ secrets.APPLE_ID }}
+          MAC_APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          MAC_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ] && [ -n "$MAC_CSC_LINK" ]; then
+            echo "Apple credentials detected — building signed + notarized."
+            export CSC_LINK="$MAC_CSC_LINK"
+            export CSC_KEY_PASSWORD="$MAC_CSC_KEY_PASSWORD"
+            export APPLE_ID="$MAC_APPLE_ID"
+            export APPLE_APP_SPECIFIC_PASSWORD="$MAC_APPLE_APP_SPECIFIC_PASSWORD"
+            export APPLE_TEAM_ID="$MAC_APPLE_TEAM_ID"
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            echo "No Apple credentials in secrets — building unsigned."
+            export CSC_IDENTITY_AUTO_DISCOVERY=false
+          fi
+          npm run ${{ matrix.dist_script }}
 
       - name: Upload build artifacts (workflow run)
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
