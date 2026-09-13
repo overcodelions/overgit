@@ -8,11 +8,15 @@ Requires Node 20 or newer.
 
 ```bash
 npm install
+git config core.hooksPath .githooks
 npm run dev          # vite dev server + electron, with HMR
 # or
 npm start            # build once, run electron
 npm test             # vitest
 ```
+
+The repository hooks reject private maintainer identities before commit and
+scan reachable history again before push. CI enforces the same policy.
 
 If you're hacking on overgit *in* overgit, prefer `npm start` over `npm run dev`: Vite HMR otherwise reloads the renderer every time you save a file through overgit's editor.
 
