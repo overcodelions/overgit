@@ -6670,7 +6670,7 @@ function WorksetOpenPRsSheet({ worksetId }: { worksetId: UUID }): JSX.Element {
   }, [statuses, reposById]);
 
   // Default title = workset name. Reflects intent ("a coordinated
-  // change called RED-6148") rather than a single commit subject from
+  // change called ABC-1234") rather than a single commit subject from
   // one of the member repos — which often turned out to be an old merge
   // commit from another developer's history rather than the user's
   // actual work.
