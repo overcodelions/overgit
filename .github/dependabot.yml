@@ -34,3 +34,8 @@ updates:
       time: "09:00"
       timezone: America/Los_Angeles
     open-pull-requests-limit: 3
+    groups:
+      # init and analyze must run the same version, or CodeQL fails with a
+      # configuration error. Bump them together.
+      codeql-action:
+        patterns: ["github/codeql-action*"]
