@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { fetch, run } from './git';
+import { fetch, rawDiff, run } from './git';
 
 vi.mock('node:child_process', () => ({
   spawn: vi.fn(),
@@ -230,5 +230,95 @@ describe('fetch', () => {
 
     closeChild(child, 0);
     await expect(promise).resolves.toEqual({ ok: true });
+  });
+});
+
+describe('rawDiff', () => {
+  const ADD_DIFF = [
+    'diff --git a/dev/null b/new.txt',
+    'new file mode 100644',
+    '--- /dev/null',
+    '+++ b/new.txt',
+    '@@ -0,0 +1 @@',
+    '+brand new',
+    '',
+  ].join('\n');
+
+  // The queued children let a single rawDiff call drive several
+  // sequential `run` invocations, which serialize per-cwd.
+  function queueChildren() {
+    spawnMock.mockImplementation(() => makeChild() as never);
+  }
+
+  async function nthChild(n: number): Promise<FakeChild> {
+    for (let i = 0; i < 100 && spawnMock.mock.results.length < n; i++) {
+      await flushMicrotasks();
+    }
+    return spawnMock.mock.results[n - 1].value as FakeChild;
+  }
+
+  function argsOf(n: number): string[] {
+    return spawnMock.mock.calls[n - 1][1] as string[];
+  }
+
+  it('synthesizes an add diff for untracked paths', async () => {
+    queueChildren();
+
+    const promise = rawDiff(repoPath, 'working', ['new.txt']);
+
+    // `git diff HEAD -- new.txt` sees nothing: the file is untracked.
+    closeChild(await nthChild(1), 0, '');
+    closeChild(await nthChild(2), 0, 'new.txt\0');
+    // `--no-index` exits 1 when a difference exists, which is the norm here.
+    closeChild(await nthChild(3), 1, ADD_DIFF);
+
+    const result = await promise;
+    expect(result.ok).toBe(true);
+    expect(result.text).toBe(ADD_DIFF);
+
+    expect(argsOf(2)).toEqual([
+      'ls-files', '--others', '--exclude-standard', '-z', '--', 'new.txt',
+    ]);
+    expect(argsOf(3)).toEqual([
+      'diff', '--no-index', '--no-color', '--', '/dev/null', 'new.txt',
+    ]);
+  });
+
+  it('appends the add diff after tracked changes', async () => {
+    queueChildren();
+    const tracked = 'diff --git a/tracked.txt b/tracked.txt\n@@ -1 +1 @@\n-old\n+new\n';
+
+    const promise = rawDiff(repoPath, 'working', ['tracked.txt', 'new.txt']);
+    closeChild(await nthChild(1), 0, tracked);
+    closeChild(await nthChild(2), 0, 'new.txt\0');
+    closeChild(await nthChild(3), 1, ADD_DIFF);
+
+    const result = await promise;
+    expect(result.text).toBe(tracked + ADD_DIFF);
+  });
+
+  it('returns the tracked diff untouched when nothing is untracked', async () => {
+    queueChildren();
+    const tracked = 'diff --git a/tracked.txt b/tracked.txt\n@@ -1 +1 @@\n-old\n+new\n';
+
+    const promise = rawDiff(repoPath, 'working', ['tracked.txt']);
+    closeChild(await nthChild(1), 0, tracked);
+    closeChild(await nthChild(2), 0, '');
+
+    const result = await promise;
+    expect(result.text).toBe(tracked);
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('propagates a failure from the tracked diff', async () => {
+    queueChildren();
+
+    const promise = rawDiff(repoPath, 'working', ['new.txt']);
+    closeChild(await nthChild(1), 128, '', 'fatal: bad revision\n');
+
+    const result = await promise;
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe('fatal: bad revision');
+    expect(spawnMock).toHaveBeenCalledTimes(1);
   });
 });
