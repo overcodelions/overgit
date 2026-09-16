@@ -97,3 +97,79 @@ jobs:
             release/*.exe
             release/*.AppImage
             release/*.deb
+
+  # Each OS job in the build matrix attaches its own files to the same draft
+  # release, so no single job ever sees the whole asset list. This runs after
+  # all of them: it renames a copy of each installer to a version-free name,
+  # so a link at /releases/latest/download/<name> keeps working release after
+  # release, then writes a download table built from what actually shipped.
+  finalize:
+    name: Stable download links and release notes
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Rename, upload, and write the download table
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dl stable
+          gh release download "$TAG" --repo "$REPO" --dir dl --pattern '*' || true
+          shopt -s nullglob
+          for f in dl/*; do
+            b=$(basename "$f")
+            case "$b" in
+              *arm64*mac*.zip)  cp "$f" "stable/overgit-mac-arm64.zip" ;;
+              *arm64.dmg)       cp "$f" "stable/overgit-mac-arm64.dmg" ;;
+              *mac*.zip)        cp "$f" "stable/overgit-mac-x64.zip" ;;
+              *.dmg)            cp "$f" "stable/overgit-mac-x64.dmg" ;;
+              *arm64*.exe)      cp "$f" "stable/overgit-win-arm64.exe" ;;
+              *.exe)            cp "$f" "stable/overgit-win-x64.exe" ;;
+              *arm64.AppImage)  cp "$f" "stable/overgit-linux-arm64.AppImage" ;;
+              *.AppImage)       cp "$f" "stable/overgit-linux-x64.AppImage" ;;
+              *arm64.deb)       cp "$f" "stable/overgit-linux-arm64.deb" ;;
+              *amd64.deb)       cp "$f" "stable/overgit-linux-x64.deb" ;;
+            esac
+          done
+          ls -la stable
+          if [ -n "$(ls -A stable)" ]; then
+            gh release upload "$TAG" stable/* --repo "$REPO" --clobber
+          fi
+          row () {
+            local label="$1"; shift
+            local links=() f
+            for f in "$@"; do
+              [ -f "stable/$f" ] || continue
+              links+=("[\`${f##*.}\`](https://github.com/$REPO/releases/latest/download/$f)")
+            done
+            [ ${#links[@]} -eq 0 ] && return 0
+            local joined="${links[0]}" i
+            for ((i = 1; i < ${#links[@]}; i++)); do joined+=" · ${links[i]}"; done
+            echo "| $label | $joined |" >> notes.md
+          }
+          {
+            echo "## Download"
+            echo
+            echo "| Platform | Download |"
+            echo "|---|---|"
+          } > notes.md
+          row "**macOS** · Apple Silicon" overgit-mac-arm64.dmg overgit-mac-arm64.zip
+          row "**macOS** · Intel"        overgit-mac-x64.dmg   overgit-mac-x64.zip
+          row "**Windows** · x64"        overgit-win-x64.exe
+          row "**Windows** · ARM64"      overgit-win-arm64.exe
+          row "**Linux** · x64"          overgit-linux-x64.AppImage   overgit-linux-x64.deb
+          row "**Linux** · ARM64"        overgit-linux-arm64.AppImage overgit-linux-arm64.deb
+          cat >> notes.md <<'EOF'
+
+          macOS builds are signed with a Developer ID and notarized. Windows
+          builds are not signed yet — SmartScreen warns on first run:
+          **More info → Run anyway**. The Linux AppImage needs `chmod +x`.
+          EOF
+          cat notes.md
+          gh release edit "$TAG" --repo "$REPO" --notes-file notes.md
