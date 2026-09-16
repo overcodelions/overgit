@@ -10,3 +10,6 @@ this repository, or at:
 This product bundles third-party software licensed under their own terms.
 Run `npm ls --all` or inspect the produced distributables to see the
 full set of bundled dependencies and their respective licenses.
+
+The project name and logo are trademarks of Lionel Farr. The Apache-2.0
+license does not grant permission to use them. See TRADEMARKS.md.
