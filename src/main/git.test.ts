@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { fetch, rawDiff, run } from './git';
+import { fetch, parsePorcelainV2, rawDiff, run } from './git';
 
 vi.mock('node:child_process', () => ({
   spawn: vi.fn(),
@@ -189,15 +189,15 @@ describe('run', () => {
     await expect(promise).resolves.toMatchObject({ ok: true, stdout: 'retry\n' });
   });
 
-  it('serializes concurrent calls for the same cwd', async () => {
+  it('serializes concurrent writes for the same cwd', async () => {
     const first = makeChild();
     const second = makeChild();
     spawnMock
       .mockImplementationOnce(() => first as never)
       .mockImplementationOnce(() => second as never);
 
-    const p1 = run(repoPath, ['status']);
-    const p2 = run(repoPath, ['status']);
+    const p1 = run(repoPath, ['commit', '-m', 'one']);
+    const p2 = run(repoPath, ['commit', '-m', 'two']);
 
     await flushMicrotasks();
     expect(spawnMock).toHaveBeenCalledTimes(1);
@@ -210,6 +210,124 @@ describe('run', () => {
 
     closeChild(second, 0, 'second\n');
     await expect(p2).resolves.toMatchObject({ ok: true, stdout: 'second\n' });
+  });
+
+  it('runs read-only commands for the same cwd concurrently', async () => {
+    const first = makeChild();
+    const second = makeChild();
+    spawnMock
+      .mockImplementationOnce(() => first as never)
+      .mockImplementationOnce(() => second as never);
+
+    const p1 = run(repoPath, ['status', '--porcelain=v1']);
+    const p2 = run(repoPath, ['rev-parse', '--abbrev-ref', 'HEAD']);
+
+    await flushMicrotasks();
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+
+    closeChild(first, 0, 'status\n');
+    closeChild(second, 0, 'main\n');
+    await expect(p1).resolves.toMatchObject({ stdout: 'status\n' });
+    await expect(p2).resolves.toMatchObject({ stdout: 'main\n' });
+  });
+
+  it('classifies a mutating subcommand of a read-ish verb as a write', async () => {
+    const first = makeChild();
+    const second = makeChild();
+    spawnMock
+      .mockImplementationOnce(() => first as never)
+      .mockImplementationOnce(() => second as never);
+
+    const p1 = run(repoPath, ['worktree', 'prune', '--verbose']);
+    const p2 = run(repoPath, ['worktree', 'list', '--porcelain']);
+
+    await flushMicrotasks();
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+
+    closeChild(first, 0, 'pruned\n');
+    await expect(p1).resolves.toMatchObject({ ok: true });
+
+    await flushMicrotasks();
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+    closeChild(second, 0, 'listed\n');
+    await expect(p2).resolves.toMatchObject({ stdout: 'listed\n' });
+  });
+
+  it('holds a write until in-flight reads finish', async () => {
+    const read = makeChild();
+    const write = makeChild();
+    spawnMock
+      .mockImplementationOnce(() => read as never)
+      .mockImplementationOnce(() => write as never);
+
+    const readPromise = run(repoPath, ['log', '-1']);
+    await flushMicrotasks();
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+
+    const writePromise = run(repoPath, ['checkout', 'main']);
+    await flushMicrotasks();
+    // The write must wait — the reader still holds the repo.
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+
+    closeChild(read, 0, 'commit\n');
+    await expect(readPromise).resolves.toMatchObject({ ok: true });
+    await flushMicrotasks();
+
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+    closeChild(write, 0, 'switched\n');
+    await expect(writePromise).resolves.toMatchObject({ ok: true });
+  });
+
+  it('queues a later read behind a write that is still waiting', async () => {
+    const read1 = makeChild();
+    const write = makeChild();
+    const read2 = makeChild();
+    spawnMock
+      .mockImplementationOnce(() => read1 as never)
+      .mockImplementationOnce(() => write as never)
+      .mockImplementationOnce(() => read2 as never);
+
+    const p1 = run(repoPath, ['log', '-1']);
+    await flushMicrotasks();
+    const pWrite = run(repoPath, ['merge', 'other']);
+    const p2 = run(repoPath, ['status', '--porcelain=v2']);
+    await flushMicrotasks();
+    // Only the first read has started: the write is waiting on it,
+    // and the second read is waiting on the write.
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+
+    closeChild(read1, 0, 'log\n');
+    await expect(p1).resolves.toMatchObject({ ok: true });
+    await flushMicrotasks();
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+
+    closeChild(write, 0, 'merged\n');
+    await expect(pWrite).resolves.toMatchObject({ ok: true });
+    await flushMicrotasks();
+    expect(spawnMock).toHaveBeenCalledTimes(3);
+
+    closeChild(read2, 0, 'clean\n');
+    await expect(p2).resolves.toMatchObject({ stdout: 'clean\n' });
+  });
+
+  it('disables optional index locking for read-only commands only', async () => {
+    const reader = makeChild();
+    spawnMock.mockImplementationOnce(() => reader as never);
+    const readPromise = run(repoPath, ['status', '--porcelain=v1']);
+    await flushMicrotasks();
+    const readEnv = (spawnMock.mock.calls[0]?.[2] as { env?: Record<string, string> }).env;
+    expect(readEnv?.GIT_OPTIONAL_LOCKS).toBe('0');
+    closeChild(reader, 0);
+    await readPromise;
+
+    const writer = makeChild();
+    spawnMock.mockImplementationOnce(() => writer as never);
+    const writePromise = run(repoPath, ['add', '-A']);
+    await flushMicrotasks();
+    const writeEnv = (spawnMock.mock.calls[1]?.[2] as { env?: Record<string, string> }).env;
+    expect(writeEnv?.GIT_OPTIONAL_LOCKS).toBeUndefined();
+    closeChild(writer, 0);
+    await writePromise;
   });
 });
 
@@ -320,5 +438,66 @@ describe('rawDiff', () => {
     expect(result.ok).toBe(false);
     expect(result.error).toBe('fatal: bad revision');
     expect(spawnMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('parsePorcelainV2', () => {
+  it('reads branch, upstream and ahead/behind from the header lines', () => {
+    const out = [
+      '# branch.oid 1111111111111111111111111111111111111111',
+      '# branch.head feature/login',
+      '# branch.upstream origin/feature/login',
+      '# branch.ab +3 -1',
+      '',
+    ].join('\n');
+
+    expect(parsePorcelainV2(out)).toEqual({
+      branch: 'feature/login',
+      hasUpstream: true,
+      ahead: 3,
+      behind: 1,
+      dirtyCount: 0,
+      conflicts: [],
+    });
+  });
+
+  it('reports a detached HEAD as no branch', () => {
+    const out = ['# branch.oid 2222222222222222222222222222222222222222', '# branch.head (detached)'].join('\n');
+    expect(parsePorcelainV2(out).branch).toBeNull();
+  });
+
+  it('leaves ahead/behind null when the upstream ref is gone', () => {
+    // git prints the configured upstream but no `branch.ab` line when
+    // the remote-tracking ref has been pruned.
+    const out = ['# branch.head feature', '# branch.upstream origin/feature'].join('\n');
+    const parsed = parsePorcelainV2(out);
+    expect(parsed.hasUpstream).toBe(true);
+    expect(parsed.ahead).toBeNull();
+    expect(parsed.behind).toBeNull();
+  });
+
+  it('counts changed, renamed, unmerged and untracked entries as dirty', () => {
+    const out = [
+      '# branch.head main',
+      '1 .M N... 100644 100644 100644 aaa bbb src/app.ts',
+      '2 R. N... 100644 100644 100644 ccc ddd R100 new.ts\told.ts',
+      'u UU N... 100644 100644 100644 100644 eee fff ggg conflicted.ts',
+      '? untracked.ts',
+      '! ignored.ts',
+    ].join('\n');
+
+    const parsed = parsePorcelainV2(out);
+    expect(parsed.dirtyCount).toBe(4);
+    expect(parsed.conflicts).toEqual(['conflicted.ts']);
+  });
+
+  it('keeps spaces in a conflicted path intact', () => {
+    const out = [
+      '# branch.head main',
+      'u UU N... 100644 100644 100644 100644 aaa bbb ccc my notes.md',
+    ].join('\n');
+    // v1 porcelain quoted these; the raw path is what every caller
+    // actually wants to hand back to git.
+    expect(parsePorcelainV2(out).conflicts).toEqual(['my notes.md']);
   });
 });

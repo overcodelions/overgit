@@ -1,4 +1,5 @@
 import { useStore } from './store';
+import { Spinner } from './Spinner';
 
 /// Custom title bar. macOS uses `titleBarStyle: 'hiddenInset'`, so the
 /// traffic lights overlay our content — we pad the leading edge enough
@@ -30,6 +31,8 @@ export function TitleBar(): JSX.Element {
 
       <div className="flex-1" />
 
+      <BackgroundJobs />
+
       <button
         onClick={() => setSheet({ kind: 'about' })}
         className="no-drag p-1 mr-1 text-ink-muted hover:text-ink rounded hover:bg-card"
@@ -57,6 +60,35 @@ export function TitleBar(): JSX.Element {
           <circle cx="10" cy="10" r="2.2" stroke="currentColor" strokeWidth="1.3" />
         </svg>
       </button>
+    </div>
+  );
+}
+
+/// Bulk actions still running after their sheet was dismissed with
+/// "Run in background". Without this the window looks idle while a
+/// five-repo sync is mid-flight — the action's own progress UI went
+/// away with the sheet. Lives in the title bar so it's visible from
+/// every pane, and disappears on its own when the job finishes (the
+/// result toast takes over from there).
+function BackgroundJobs(): JSX.Element | null {
+  const jobs = useStore((s) => s.backgroundJobs);
+  if (jobs.length === 0) return null;
+  return (
+    <div className="no-drag flex items-center gap-2 mr-2">
+      {jobs.map((job) => (
+        <span
+          key={job.id}
+          className="flex items-center gap-1.5 text-[11px] text-accent bg-accent/10 rounded-full px-2 py-0.5"
+          title={`${job.verb} ${job.done} of ${job.total} in ${job.scope} — running in the background`}
+          aria-live="polite"
+        >
+          <Spinner size={10} />
+          <span className="tabular-nums">
+            {job.verb} {job.done}/{job.total}
+          </span>
+          <span className="text-accent/70 max-w-[140px] truncate">· {job.scope}</span>
+        </span>
+      ))}
     </div>
   );
 }

@@ -5,6 +5,7 @@ import { TitleBar } from './TitleBar';
 import { SheetHost, ReviewBody, formatBytes } from './Sheets';
 import { CommandPalette } from './CommandPalette';
 import { Explain } from './Explain';
+import { Spinner } from './Spinner';
 import { relativeTime } from './BranchPicker';
 import type {
   ChangedFile,
@@ -589,12 +590,13 @@ function Sidebar(): JSX.Element {
   const runResetAllReposFlow = useStore((s) => s.runResetAllReposFlow);
   const [resetting, setResetting] = useState(false);
   /// In-flight per-workspace bulk actions. Key is the workspace id;
-  /// value is the human-readable verb ("Resetting…", "Fetching…")
-  /// shown inline on the row. Used to disable the row's buttons while
-  /// a bulk action is running so the user can't kick off a second one
-  /// and create a partial pile-up.
-  const [busyWorkspaceVerb, setBusyWorkspaceVerb] = useState<
-    Record<UUID, string>
+  /// value is which action is running. Drives both the inline verb on
+  /// the row ("Resetting…", "Fetching…") and the spinner that replaces
+  /// that action's icon, so the user can see *which* button they hit.
+  /// Also disables the row's buttons while it runs, so a second click
+  /// can't pile a partial second pass on top.
+  const [busyWorkspaceAction, setBusyWorkspaceAction] = useState<
+    Record<UUID, WorkspaceBulkAction>
   >({});
 
   const [search, setSearch] = useState('');
@@ -831,12 +833,12 @@ function Sidebar(): JSX.Element {
             <SectionHeader label="Workspaces" count={visibleWorkspaces.length} />
             {visibleWorkspaces.map((w) => {
               const idx = rowIndex.get(`workspace:${w.id}`) ?? -1;
-              const busyVerb = busyWorkspaceVerb[w.id];
-              const busy = Boolean(busyVerb);
-              const markBusy = (verb: string) =>
-                setBusyWorkspaceVerb((s) => ({ ...s, [w.id]: verb }));
+              const busyAction = busyWorkspaceAction[w.id];
+              const busy = Boolean(busyAction);
+              const markBusy = (action: WorkspaceBulkAction) =>
+                setBusyWorkspaceAction((s) => ({ ...s, [w.id]: action }));
               const clearBusy = () =>
-                setBusyWorkspaceVerb((s) => {
+                setBusyWorkspaceAction((s) => {
                   const n = { ...s };
                   delete n[w.id];
                   return n;
@@ -847,14 +849,13 @@ function Sidebar(): JSX.Element {
                   workspace={w}
                   selected={selectedWorkspace === w.id}
                   keyboardActive={idx === activeIdx}
-                  busy={busy}
-                  busyLabel={busyVerb}
+                  busyAction={busyAction}
                   onToggleCollapsed={() => void toggleWorkspaceCollapsed(w.id)}
                   onSelect={() => selectWorkspace(w.id)}
                   onEdit={() => setSheet({ kind: 'editWorkspace', workspaceId: w.id })}
                   onReset={async () => {
                     if (busy) return;
-                    markBusy('Resetting…');
+                    markBusy('reset');
                     try {
                       await runResetWorkspaceFlow(w.id);
                     } finally {
@@ -863,7 +864,7 @@ function Sidebar(): JSX.Element {
                   }}
                   onFetch={async () => {
                     if (busy) return;
-                    markBusy('Fetching…');
+                    markBusy('fetch');
                     try {
                       await fetchAllInWorkspace(w.id);
                     } finally {
@@ -921,9 +922,10 @@ function Sidebar(): JSX.Element {
                 onClick={onResetAll}
                 disabled={resetting}
                 title="Fetch, switch to default branch, and pull on every repo. Dirty repos are skipped."
-                className="text-[10px] text-ink-faint hover:text-ink px-1.5 py-0.5 rounded hover:bg-card disabled:opacity-50"
+                className="text-[10px] text-ink-faint hover:text-ink px-1.5 py-0.5 rounded hover:bg-card disabled:opacity-50 inline-flex items-center gap-1"
               >
-                {resetting ? 'Resetting…' : 'Reset all'}
+                {resetting && <Spinner size={9} />}
+                <span>{resetting ? 'Resetting…' : 'Reset all'}</span>
               </button>
             ) : null
           }
@@ -1410,6 +1412,14 @@ function WorksetRow({
   );
 }
 
+/// The bulk actions a workspace row can run. Both are slow, remote-
+/// bound fan-outs, so the row needs to say which one is in flight.
+type WorkspaceBulkAction = 'reset' | 'fetch';
+const WORKSPACE_BULK_VERB: Record<WorkspaceBulkAction, string> = {
+  reset: 'Resetting…',
+  fetch: 'Fetching…',
+};
+
 /// One Workspace block in the sidebar — a collapsible header
 /// followed by its member RepoRow children (passed as `children` so
 /// the parent keeps repo lookup + selection logic in one place). The
@@ -1420,8 +1430,7 @@ function WorkspaceSection({
   workspace,
   selected,
   keyboardActive = false,
-  busy = false,
-  busyLabel,
+  busyAction,
   onToggleCollapsed,
   onSelect,
   onEdit,
@@ -1433,11 +1442,10 @@ function WorkspaceSection({
   workspace: Workspace;
   selected: boolean;
   keyboardActive?: boolean;
-  busy?: boolean;
-  /// Short verb shown next to the workspace name when a bulk action
-  /// is in flight ("Resetting…", "Fetching…"). Replaces the repo
-  /// count badge so the row is unambiguous about what's happening.
-  busyLabel?: string;
+  /// Which bulk action is in flight, if any. Swaps that action's icon
+  /// for a spinner and shows its verb where the repo count usually
+  /// sits, so the row says both "working" and "working on what".
+  busyAction?: WorkspaceBulkAction;
   onToggleCollapsed: () => void;
   onSelect: () => void;
   onEdit: () => void;
@@ -1450,6 +1458,8 @@ function WorkspaceSection({
   useEffect(() => {
     if (keyboardActive) ref.current?.scrollIntoView({ block: 'nearest' });
   }, [keyboardActive]);
+  const busy = Boolean(busyAction);
+  const busyLabel = busyAction ? WORKSPACE_BULK_VERB[busyAction] : null;
   return (
     <div className="mt-1 first:mt-0">
       <div
@@ -1501,9 +1511,13 @@ function WorkspaceSection({
             onClick={onReset}
             disabled={busy}
             title="Fetch, switch to default, and pull on every repo in this workspace. Dirty repos are skipped."
-            className="w-5 h-5 flex items-center justify-center rounded text-ink-faint opacity-0 group-hover:opacity-100 hover:text-ink hover:bg-card disabled:opacity-40"
+            className={`w-5 h-5 flex items-center justify-center rounded hover:text-ink hover:bg-card disabled:opacity-40 ${
+              busyAction === 'reset'
+                ? 'text-accent opacity-100'
+                : 'text-ink-faint opacity-0 group-hover:opacity-100'
+            }`}
           >
-            <ResetIcon />
+            {busyAction === 'reset' ? <Spinner size={11} /> : <ResetIcon />}
           </button>
         </Explain>
         <Explain
@@ -1514,9 +1528,13 @@ function WorkspaceSection({
             onClick={onFetch}
             disabled={busy}
             title="Fetch every repo in this workspace"
-            className="w-5 h-5 flex items-center justify-center rounded text-ink-faint opacity-0 group-hover:opacity-100 hover:text-ink hover:bg-card disabled:opacity-40"
+            className={`w-5 h-5 flex items-center justify-center rounded hover:text-ink hover:bg-card disabled:opacity-40 ${
+              busyAction === 'fetch'
+                ? 'text-accent opacity-100'
+                : 'text-ink-faint opacity-0 group-hover:opacity-100'
+            }`}
           >
-            <FetchIcon />
+            {busyAction === 'fetch' ? <Spinner size={11} /> : <FetchIcon />}
           </button>
         </Explain>
         <Explain
@@ -1550,18 +1568,7 @@ function WorkspaceSection({
 }
 
 function SpinnerDot(): JSX.Element {
-  return (
-    <svg width="9" height="9" viewBox="0 0 16 16" className="animate-spin" aria-hidden="true">
-      <circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="2" fill="none" opacity="0.25" />
-      <path
-        d="M14 8a6 6 0 0 0-6-6"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinecap="round"
-        fill="none"
-      />
-    </svg>
-  );
+  return <Spinner size={9} />;
 }
 
 function ResetIcon(): JSX.Element {
@@ -1864,18 +1871,20 @@ function WorkspaceDetail({ workspaceId }: { workspaceId: UUID }): JSX.Element {
             <button
               onClick={onReset}
               disabled={busy !== null || members.length === 0}
-              className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+              className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50 inline-flex items-center gap-1.5"
               title="Reset every repo to origin's tip of its default branch."
             >
-              {busy === 'reset' ? 'Resetting…' : 'Reset all'}
+              {busy === 'reset' && <Spinner size={11} />}
+              <span>{busy === 'reset' ? 'Resetting…' : 'Reset all'}</span>
             </button>
             <button
               onClick={onFetch}
               disabled={busy !== null || members.length === 0}
-              className="text-xs px-3 py-1.5 rounded border border-card text-ink-muted hover:text-ink hover:bg-card disabled:opacity-50"
+              className="text-xs px-3 py-1.5 rounded border border-card text-ink-muted hover:text-ink hover:bg-card disabled:opacity-50 inline-flex items-center gap-1.5"
               title="Run git fetch on every repo so ahead/behind reflects the remote."
             >
-              {busy === 'fetch' ? 'Fetching…' : 'Fetch all'}
+              {busy === 'fetch' && <Spinner size={11} />}
+              <span>{busy === 'fetch' ? 'Fetching…' : 'Fetch all'}</span>
             </button>
             {aggregate.behind > 0 && (
               <button
@@ -2095,6 +2104,25 @@ function WorksetView({ worksetId }: { worksetId: UUID }): JSX.Element {
   const dismissToast = useStore((s) => s.dismissToast);
 
   const [busy, setBusy] = useState(false);
+  /// Manual Refresh runs status + PRs + landing together. Statuses
+  /// come back fast; the PR and landing passes shell out to `gh` and
+  /// can take seconds, so the button stays spinning until all three
+  /// settle rather than snapping back while work is still running.
+  const [refreshBusy, setRefreshBusy] = useState(false);
+  const onRefresh = useCallback(async () => {
+    if (refreshBusy) return;
+    setRefreshBusy(true);
+    try {
+      // Explicit user intent, so bypass the TTL cache.
+      await Promise.all([
+        refresh(worksetId, true),
+        refreshPRs(worksetId, true),
+        refreshLanding(worksetId, true),
+      ]);
+    } finally {
+      setRefreshBusy(false);
+    }
+  }, [refreshBusy, refresh, refreshPRs, refreshLanding, worksetId]);
   const [recheckBusy, setRecheckBusy] = useState(false);
   const onRecheck = useCallback(async () => {
     if (recheckBusy) return;
@@ -2410,17 +2438,8 @@ function WorksetView({ worksetId }: { worksetId: UUID }): JSX.Element {
               }}
               className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50 inline-flex items-center gap-1.5"
             >
-              {busy ? (
-                <>
-                  <svg width="12" height="12" viewBox="0 0 24 24" className="animate-spin" aria-hidden>
-                    <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" opacity="0.25" fill="none" />
-                    <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" strokeWidth="3" fill="none" strokeLinecap="round" />
-                  </svg>
-                  <span>Fetching all…</span>
-                </>
-              ) : (
-                'Fetch all'
-              )}
+              {busy && <Spinner size={11} />}
+              <span>{busy ? 'Fetching all…' : 'Fetch all'}</span>
             </button>
           </Explain>
           <Explain
@@ -2428,17 +2447,12 @@ function WorksetView({ worksetId }: { worksetId: UUID }): JSX.Element {
             plain="Re-read every repo's status and re-fetch open PRs without touching git remotes."
           >
             <button
-              disabled={busy}
-              onClick={() => {
-                // Manual "Refresh" button — explicit user intent, so
-                // bypass the TTL cache.
-                refresh(worksetId, true);
-                refreshPRs(worksetId, true);
-                refreshLanding(worksetId, true);
-              }}
-              className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+              disabled={busy || refreshBusy}
+              onClick={() => void onRefresh()}
+              className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50 inline-flex items-center gap-1.5"
             >
-              Refresh
+              {refreshBusy && <Spinner size={11} />}
+              <span>{refreshBusy ? 'Refreshing…' : 'Refresh'}</span>
             </button>
           </Explain>
         </div>
@@ -3197,30 +3211,14 @@ function WorksetUnifiedCommit({
             {committable.length < dirtyOnBranch.length && ' — check files and add a message for the rest'}
           </span>
           <div className="flex gap-2 items-center">
-            {refreshing && (
-              <span
-                className="flex items-center gap-1 text-[11px] text-accent"
-                aria-live="polite"
-              >
-                <svg
-                  width="10"
-                  height="10"
-                  viewBox="0 0 24 24"
-                  className="animate-spin"
-                  aria-hidden
-                >
-                  <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" opacity="0.25" fill="none" />
-                  <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" strokeWidth="3" fill="none" strokeLinecap="round" />
-                </svg>
-                Refreshing…
-              </span>
-            )}
             <button
               onClick={() => void runRefresh()}
               disabled={busy || refreshing}
-              className="text-[11px] px-2 py-1 rounded border border-card hover:bg-surface-elevated disabled:opacity-50"
+              aria-live="polite"
+              className="text-[11px] px-2 py-1 rounded border border-card hover:bg-surface-elevated disabled:opacity-50 inline-flex items-center gap-1.5"
             >
-              Refresh
+              {refreshing && <Spinner size={10} />}
+              <span>{refreshing ? 'Refreshing…' : 'Refresh'}</span>
             </button>
             <button
               onClick={() => void onCommitAll()}
@@ -3554,10 +3552,7 @@ function ResumeBanner({
         title={`Checkout ${boundBranch} across the ${drifters.length} drifted ${drifters.length === 1 ? 'repo' : 'repos'}. Dirty repos surface inline so you can stash, commit, or skip per-repo.`}
       >
         {busy && (
-          <svg width="11" height="11" viewBox="0 0 24 24" className="animate-spin" aria-hidden>
-            <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" opacity="0.25" fill="none" />
-            <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" strokeWidth="3" fill="none" strokeLinecap="round" />
-          </svg>
+          <Spinner size={11} />
         )}
         <span>{busy ? 'Resuming…' : 'Resume'}</span>
       </button>
@@ -3665,10 +3660,7 @@ function LifecycleStepper({
         }`}
       >
         {archiving && (
-          <svg width="11" height="11" viewBox="0 0 24 24" className="animate-spin" aria-hidden>
-            <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" opacity="0.25" fill="none" />
-            <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" strokeWidth="3" fill="none" strokeLinecap="round" />
-          </svg>
+          <Spinner size={11} />
         )}
         <span>{archiving ? 'Archiving…' : 'Archive'}</span>
       </button>
@@ -3842,10 +3834,7 @@ function CheckoutOutcomeRow({
         {createdResult.kind === 'idle' && <CheckoutBadge outcome={outcome} />}
         {createdResult.kind === 'creating' && (
           <span className="text-ink-faint font-mono inline-flex items-center gap-1.5">
-            <svg width="10" height="10" viewBox="0 0 24 24" className="animate-spin" aria-hidden>
-              <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" opacity="0.25" fill="none" />
-              <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" strokeWidth="3" fill="none" strokeLinecap="round" />
-            </svg>
+            <Spinner size={10} />
             creating…
           </span>
         )}
@@ -4688,12 +4677,7 @@ function SyncToCommonBranchButton({
           title={`Fetch, sync default, pull, then check out ${commonBranch} in this repo`}
           className="text-[10px] px-2 py-1 rounded border border-card hover:bg-card disabled:opacity-50 inline-flex items-center gap-1.5"
         >
-          {busy && (
-            <svg width="10" height="10" viewBox="0 0 24 24" className="animate-spin" aria-hidden>
-              <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" opacity="0.25" fill="none" />
-              <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" strokeWidth="3" fill="none" strokeLinecap="round" />
-            </svg>
-          )}
+          {busy && <Spinner size={10} />}
           <span>{busy ? 'Syncing…' : `Sync to ${commonBranch}`}</span>
         </button>
       </Explain>

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useStore } from './store';
 import type {
   AbandonLocalPreview,
@@ -3323,6 +3323,9 @@ function ResetWorkspaceProgressSheet({
   /// Completion toast then fires from the loop directly (since the
   /// React `allDone` effect won't run after unmount).
   const backgroundRef = useRef(false);
+  /// Identity for the title-bar progress pill, used only if this run
+  /// is sent to the background. Stable for the life of the sheet.
+  const jobId = useId();
   /// Buffer the workspace name at effect-creation time so the
   /// background-completion toast (which fires after the component
   /// has unmounted) can still name the workspace correctly.
@@ -3361,6 +3364,7 @@ function ResetWorkspaceProgressSheet({
           const outcome = await resetRepoToDefault(id);
           if (cancelledRef.current) return;
           outcomes.push(outcome);
+          useStore.getState().advanceBackgroundJob(jobId, outcomes.length);
           setRows((prev) => ({
             ...prev,
             [id]: { phase: 'done', outcome },
@@ -3374,6 +3378,7 @@ function ResetWorkspaceProgressSheet({
             message: err instanceof Error ? err.message : String(err),
           };
           outcomes.push(outcome);
+          useStore.getState().advanceBackgroundJob(jobId, outcomes.length);
           setRows((prev) => ({
             ...prev,
             [id]: { phase: 'done', outcome },
@@ -3383,6 +3388,9 @@ function ResetWorkspaceProgressSheet({
     };
     const concurrency = Math.min(3, repoIds.length);
     Promise.all(Array.from({ length: concurrency }, worker)).then(() => {
+      // No-op unless the run was backgrounded; the title-bar pill
+      // hands off to the completion toast below.
+      useStore.getState().endBackgroundJob(jobId);
       if (cancelledRef.current) return;
       setAllDone(true);
       void refreshAllRepoStatuses(true);
@@ -3486,6 +3494,15 @@ function ResetWorkspaceProgressSheet({
   /// won't run after unmount).
   const onRunInBackground = () => {
     backgroundRef.current = true;
+    // Hand the sheet's progress to the title bar so the work stays
+    // visible once this sheet is gone.
+    useStore.getState().beginBackgroundJob({
+      id: jobId,
+      verb: 'Resetting',
+      scope: workspaceName,
+      done: Object.values(rows).filter((r) => r.phase === 'done').length,
+      total: repoIds.length,
+    });
     setSheet(null);
   };
 
@@ -4118,6 +4135,9 @@ function FetchWorkspaceProgressSheet({
   /// background"; cleanup then leaves the workers running and the
   /// completion handler fires the toast directly via the store.
   const backgroundRef = useRef(false);
+  /// Identity for the title-bar progress pill, used only if this run
+  /// is sent to the background. Stable for the life of the sheet.
+  const jobId = useId();
   const workspaceName = workspace?.name ?? 'workspace';
 
   useEffect(() => {
@@ -4144,6 +4164,7 @@ function FetchWorkspaceProgressSheet({
           if (cancelledRef.current) return;
           const outcome = { ok: res.ok, error: res.error };
           outcomes.push(outcome);
+          useStore.getState().advanceBackgroundJob(jobId, outcomes.length);
           setRows((prev) => ({
             ...prev,
             [id]: { phase: 'done', outcome },
@@ -4155,6 +4176,7 @@ function FetchWorkspaceProgressSheet({
             error: err instanceof Error ? err.message : String(err),
           };
           outcomes.push(outcome);
+          useStore.getState().advanceBackgroundJob(jobId, outcomes.length);
           setRows((prev) => ({
             ...prev,
             [id]: { phase: 'done', outcome },
@@ -4169,6 +4191,9 @@ function FetchWorkspaceProgressSheet({
     // much pressure on credential helpers or remote rate limits.
     const concurrency = Math.min(6, repoIds.length);
     Promise.all(Array.from({ length: concurrency }, worker)).then(() => {
+      // No-op unless the run was backgrounded; the title-bar pill
+      // hands off to the completion toast below.
+      useStore.getState().endBackgroundJob(jobId);
       if (cancelledRef.current) return;
       setAllDone(true);
       void refreshAllRepoStatuses(true);
@@ -4250,6 +4275,15 @@ function FetchWorkspaceProgressSheet({
 
   const onRunInBackground = () => {
     backgroundRef.current = true;
+    // Hand the sheet's progress to the title bar so the work stays
+    // visible once this sheet is gone.
+    useStore.getState().beginBackgroundJob({
+      id: jobId,
+      verb: 'Fetching',
+      scope: workspaceName,
+      done: Object.values(rows).filter((r) => r.phase === 'done').length,
+      total: repoIds.length,
+    });
     setSheet(null);
   };
 
@@ -4423,6 +4457,9 @@ function SyncBehindProgressSheet({
   const cancelledRef = useRef(false);
   /// Set when "Run in background" is clicked. Distinct from cancel.
   const backgroundRef = useRef(false);
+  /// Identity for the title-bar progress pill, used only if this run
+  /// is sent to the background. Stable for the life of the sheet.
+  const jobId = useId();
   const workspaceName = workspace?.name ?? 'workspace';
 
   useEffect(() => {
@@ -4448,6 +4485,7 @@ function SyncBehindProgressSheet({
           const res = await fastForwardRepo(id);
           if (cancelledRef.current) return;
           outcomes.push(res);
+          useStore.getState().advanceBackgroundJob(jobId, outcomes.length);
           setRows((prev) => ({
             ...prev,
             [id]: { phase: 'done', outcome: res },
@@ -4459,6 +4497,7 @@ function SyncBehindProgressSheet({
             error: err instanceof Error ? err.message : String(err),
           };
           outcomes.push(outcome);
+          useStore.getState().advanceBackgroundJob(jobId, outcomes.length);
           setRows((prev) => ({
             ...prev,
             [id]: { phase: 'done', outcome },
@@ -4468,6 +4507,9 @@ function SyncBehindProgressSheet({
     };
     const concurrency = Math.min(4, repoIds.length);
     Promise.all(Array.from({ length: concurrency }, worker)).then(() => {
+      // No-op unless the run was backgrounded; the title-bar pill
+      // hands off to the completion toast below.
+      useStore.getState().endBackgroundJob(jobId);
       if (cancelledRef.current) return;
       setAllDone(true);
       void refreshAllRepoStatuses(true);
@@ -4551,6 +4593,15 @@ function SyncBehindProgressSheet({
 
   const onRunInBackground = () => {
     backgroundRef.current = true;
+    // Hand the sheet's progress to the title bar so the work stays
+    // visible once this sheet is gone.
+    useStore.getState().beginBackgroundJob({
+      id: jobId,
+      verb: 'Syncing',
+      scope: workspaceName,
+      done: Object.values(rows).filter((r) => r.phase === 'done').length,
+      total: repoIds.length,
+    });
     setSheet(null);
   };
 

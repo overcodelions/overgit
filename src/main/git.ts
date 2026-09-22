@@ -104,23 +104,129 @@ const STALE_LOCK_THRESHOLD_MS = 2_000;
 const LOCK_RETRY_DELAY_MS = 150;
 const LOCK_RETRY_MAX_ATTEMPTS = 4;
 
-/// Per-repo serialization. Two `run()` calls into the same cwd queue
-/// up instead of racing the index/refs locks. This eliminates the
-/// in-process collision (status poll firing while sync is mid-merge);
-/// external tools racing us are handled by the retry loop below.
-const repoLocks = new Map<string, Promise<unknown>>();
+/// Git verbs that only read the repository. Everything not listed
+/// here is treated as a writer and gets the repo to itself — the
+/// allowlist is deliberately conservative, since the cost of
+/// mis-classifying a writer as a reader is a racing index lock.
+const READ_ONLY_VERBS = new Set([
+  'blame',
+  'cat-file',
+  'cherry',
+  'describe',
+  'diff',
+  'for-each-ref',
+  'log',
+  'ls-files',
+  'ls-remote',
+  'merge-base',
+  'rev-list',
+  'rev-parse',
+  'shortlog',
+  'show',
+  'show-ref',
+  'status',
+]);
 
-function withRepoLock<T>(cwd: string, fn: () => Promise<T>): Promise<T> {
-  const prev = repoLocks.get(cwd) ?? Promise.resolve();
-  const next = prev.then(fn, fn);
-  repoLocks.set(cwd, next);
-  // Drop the entry once we're the tail so the map doesn't grow
-  // unboundedly across the process lifetime.
-  next.catch(() => {}).finally(() => {
-    if (repoLocks.get(cwd) === next) repoLocks.delete(cwd);
-  });
+/// Verbs whose read-ness depends on the subcommand — `worktree list`
+/// reads, `worktree prune` writes. Keyed as "<verb> <subcommand>".
+const READ_ONLY_SUBCOMMANDS = new Set([
+  'config --get',
+  'remote -v',
+  'remote get-url',
+  'stash list',
+  'submodule status',
+  'worktree list',
+]);
+
+/// Classify a command as a reader. Leading global flags are skipped
+/// so `git -C <dir> log` still reads; an unrecognized global flag
+/// (`-c key=value` and friends, which swallow the next argument)
+/// falls through as a writer rather than risk guessing wrong.
+function isReadOnlyCommand(args: string[]): boolean {
+  let i = 0;
+  while (i < args.length && args[i].startsWith('-')) {
+    if (args[i] === '--no-optional-locks' || args[i] === '--no-pager') i += 1;
+    else return false;
+  }
+  const verb = args[i];
+  if (!verb) return false;
+  const sub = args[i + 1];
+  if (sub && READ_ONLY_SUBCOMMANDS.has(`${verb} ${sub}`)) return true;
+  return READ_ONLY_VERBS.has(verb);
+}
+
+/// Per-repo read/write lock. Writers get the repo to themselves —
+/// they wait for every in-flight reader plus the previous writer —
+/// which is what keeps a status poll from landing mid-merge and
+/// racing the index/refs locks. Readers only queue behind writers,
+/// never behind each other.
+///
+/// The read-read concurrency is what makes a refresh feel instant:
+/// `status()` is three git processes, and serializing them made a
+/// single repo's status cost sum(spawns) rather than max(spawns) —
+/// ~130ms instead of ~22ms, multiplied by every repo on screen.
+/// External tools racing us are still handled by the retry loop
+/// below.
+interface RepoLane {
+  /// Resolves when the most recently queued writer has finished.
+  writeTail: Promise<unknown>;
+  /// Readers that have started and not yet settled.
+  reads: Set<Promise<unknown>>;
+  /// Everything queued on this lane, readers and writers alike. The
+  /// lane is only safe to drop at zero — dropping it while a writer
+  /// is still queued would hand the next caller a fresh lane and let
+  /// it run alongside that writer.
+  pending: number;
+}
+
+const repoLanes = new Map<string, RepoLane>();
+
+function laneFor(cwd: string): RepoLane {
+  let lane = repoLanes.get(cwd);
+  if (!lane) {
+    lane = { writeTail: Promise.resolve(), reads: new Set(), pending: 0 };
+    repoLanes.set(cwd, lane);
+  }
+  return lane;
+}
+
+function withRepoLock<T>(cwd: string, fn: () => Promise<T>, readOnly: boolean): Promise<T> {
+  const lane = laneFor(cwd);
+  lane.pending += 1;
+  // Drop the lane once nothing is queued on it, so the map doesn't
+  // grow unboundedly across the process lifetime.
+  const release = () => {
+    lane.pending -= 1;
+    if (lane.pending === 0 && repoLanes.get(cwd) === lane) repoLanes.delete(cwd);
+  };
+
+  if (readOnly) {
+    // Readers wait only for writers that were already queued.
+    const next = lane.writeTail.then(fn, fn);
+    lane.reads.add(next);
+    next.catch(() => {}).finally(() => {
+      lane.reads.delete(next);
+      release();
+    });
+    return next;
+  }
+
+  // A writer waits for the previous writer *and* every reader already
+  // in flight. `allSettled` so one failed read can't reject the write
+  // queued behind it.
+  const gate = Promise.allSettled([lane.writeTail, ...lane.reads]);
+  const next = gate.then(fn);
+  lane.writeTail = next;
+  next.catch(() => {}).finally(release);
   return next;
 }
+
+/// Read-only commands run with optional index locking off. `git
+/// status` and `git diff` like to refresh the on-disk index as a side
+/// effect, which takes `.git/index.lock` — harmless when they were
+/// serialized, a source of spurious "File exists" retries now that
+/// several of them run at once.
+const READ_ONLY_ENV: Record<string, string> = { GIT_OPTIONAL_LOCKS: '0' };
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -130,10 +236,12 @@ export async function run(
   envOverride?: Record<string, string>,
   timeoutMs?: number,
 ): Promise<RunResult> {
+  const readOnly = isReadOnlyCommand(args);
+  const env = readOnly ? { ...READ_ONLY_ENV, ...envOverride } : envOverride;
   return withRepoLock(cwd, async () => {
     let last: RunResult | null = null;
     for (let attempt = 0; attempt < LOCK_RETRY_MAX_ATTEMPTS; attempt++) {
-      const res = await runOnce(cwd, args, envOverride, timeoutMs);
+      const res = await runOnce(cwd, args, env, timeoutMs);
       if (res.ok) return res;
       const m = STALE_LOCK_RE.exec(res.stderr);
       if (!m) return res;
@@ -160,8 +268,8 @@ export async function run(
         await sleep(LOCK_RETRY_DELAY_MS);
       }
     }
-    return last ?? (await runOnce(cwd, args, envOverride, timeoutMs));
-  });
+    return last ?? (await runOnce(cwd, args, env, timeoutMs));
+  }, readOnly);
 }
 
 function runOnce(
@@ -593,11 +701,25 @@ export async function resolveDefaultRef(
   repoPath: string,
   defaultBranch: string,
 ): Promise<string | null> {
-  const [remoteExists, localExists] = await Promise.all([
-    run(repoPath, ['show-ref', '--verify', '--quiet', `refs/remotes/origin/${defaultBranch}`]),
-    run(repoPath, ['show-ref', '--verify', '--quiet', `refs/heads/${defaultBranch}`]),
+  // One `for-each-ref` over both candidates rather than a `show-ref`
+  // apiece: same answer, one process instead of two, and a sidebar
+  // sweep runs this once per repo.
+  const res = await run(repoPath, [
+    'for-each-ref',
+    '--format=%(refname)',
+    `refs/remotes/origin/${defaultBranch}`,
+    `refs/heads/${defaultBranch}`,
   ]);
-  return remoteExists.ok ? `origin/${defaultBranch}` : localExists.ok ? defaultBranch : null;
+  if (!res.ok) return null;
+  const refs = new Set(
+    res.stdout
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean),
+  );
+  if (refs.has(`refs/remotes/origin/${defaultBranch}`)) return `origin/${defaultBranch}`;
+  if (refs.has(`refs/heads/${defaultBranch}`)) return defaultBranch;
+  return null;
 }
 
 export interface MergePreflight {
@@ -812,6 +934,74 @@ export async function initRepo(
   return { ok: true };
 }
 
+/// What `git status --porcelain=v2 --branch` tells us in one pass.
+/// Exported for tests — the format is stable and documented, but it's
+/// load-bearing enough (every repo row on screen) to pin down.
+export interface PorcelainV2Status {
+  /// Current branch, or null when HEAD is detached.
+  branch: string | null;
+  /// True when the branch is configured to track an upstream, whether
+  /// or not that upstream's ref still exists locally.
+  hasUpstream: boolean;
+  /// Commits on HEAD the upstream lacks, and vice versa. Both null
+  /// when there's no upstream, or when its ref is gone so git can't
+  /// count the distance.
+  ahead: number | null;
+  behind: number | null;
+  /// Entries git considers changed — staged, unstaged, unmerged and
+  /// untracked. Matches what `--porcelain=v1` counted line for line.
+  dirtyCount: number;
+  /// Paths in an unmerged (conflicted) state.
+  conflicts: string[];
+}
+
+export function parsePorcelainV2(out: string): PorcelainV2Status {
+  let branch: string | null = null;
+  let hasUpstream = false;
+  let ahead: number | null = null;
+  let behind: number | null = null;
+  let dirtyCount = 0;
+  const conflicts: string[] = [];
+
+  for (const line of out.split('\n')) {
+    if (line.length === 0) continue;
+    if (line.startsWith('# branch.head ')) {
+      const head = line.slice('# branch.head '.length).trim();
+      // Detached HEAD reports the literal "(detached)".
+      branch = head && head !== '(detached)' ? head : null;
+      continue;
+    }
+    if (line.startsWith('# branch.upstream ')) {
+      hasUpstream = true;
+      continue;
+    }
+    if (line.startsWith('# branch.ab ')) {
+      // "# branch.ab +3 -1" — ahead first, behind second.
+      const m = /^# branch\.ab \+(\d+) -(\d+)/.exec(line);
+      if (m) {
+        ahead = Number.parseInt(m[1], 10);
+        behind = Number.parseInt(m[2], 10);
+      }
+      continue;
+    }
+    if (line.startsWith('#')) continue;
+
+    const kind = line[0];
+    // `1` changed, `2` renamed/copied, `u` unmerged, `?` untracked.
+    // `!` is ignored-file noise, which git only emits when asked.
+    if (kind === '1' || kind === '2' || kind === 'u' || kind === '?') dirtyCount += 1;
+    if (kind === 'u') {
+      // u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>
+      // Split off exactly the ten fixed fields so a path containing
+      // spaces survives intact.
+      const path = line.split(' ').slice(10).join(' ');
+      if (path) conflicts.push(path);
+    }
+  }
+
+  return { branch, hasUpstream, ahead, behind, dirtyCount, conflicts };
+}
+
 export async function status(
   repoId: UUID,
   repoPath: string,
@@ -837,73 +1027,47 @@ export async function status(
     };
   }
 
-  // Status fan-out: HEAD branch, working-tree porcelain, upstream
-  // distance, and diff shortstat are all independent reads of the
-  // same repo state. Running them serially used to dominate
-  // repo-open latency on big repos (each step is 50–500ms of git +
-  // disk I/O). Fire in parallel — wall time is now max(steps), not
-  // sum(steps). Concurrent git pressure is controlled by the outer
-  // fan-out caps (`STATUS_CONCURRENCY=2` in the renderer, `pool(3, …)`
-  // in worksetStatus), not by serializing here.
+  // Status fan-out. `status --porcelain=v2 --branch` answers four
+  // questions in one process — current branch, upstream presence,
+  // ahead/behind, and the dirty/conflicted entry list — where we used
+  // to spawn `rev-parse`, `status`, and `rev-list @{u}` separately.
+  // Spawning git is the dominant cost of a sidebar sweep (a dozen
+  // repos is dozens of processes), so folding three into one is worth
+  // more than any parsing shortcut.
   //
-  // Default-branch distance still depends on `branch` (to avoid
-  // comparing HEAD to itself when on the default branch), so that
-  // piece runs after the initial fan-out resolves.
-  const [branchRes, porcelainRes, upstreamRes, shortstatRes] = await Promise.all([
-    run(repoPath, ['rev-parse', '--abbrev-ref', 'HEAD']),
-    run(repoPath, ['status', '--porcelain=v1']),
-    run(repoPath, ['rev-list', '--left-right', '--count', '@{u}...HEAD']),
+  // Which ref counts as "the default" is independent of HEAD, so it
+  // rides along in the same wave even though we only *use* it when
+  // HEAD isn't the default branch. Resolving it separately would add
+  // a whole extra round-trip to every repo on the hot path.
+  const [porcelainRes, shortstatRes, resolvedDefaultRef] = await Promise.all([
+    run(repoPath, ['status', '--porcelain=v2', '--branch']),
     run(repoPath, ['diff', '--shortstat', 'HEAD']),
+    defaultBranch
+      ? resolveDefaultRef(repoPath, defaultBranch)
+      : Promise.resolve(null),
   ]);
 
-  const rawBranch = branchRes.stdout.trim();
-  const branch = rawBranch && rawBranch !== 'HEAD' ? rawBranch : null;
-
-  const dirtyCount = porcelainRes.stdout
-    .split('\n')
-    .filter((line) => line.trim().length > 0).length;
-
-  // Conflicting paths: porcelain v1 emits `XY <path>` where conflict
-  // states are any of UU AA DD AU UA DU UD. Pull paths out of those
-  // rows so the conflict pane has something to render.
-  const conflicts: string[] = [];
-  for (const line of porcelainRes.stdout.split('\n')) {
-    if (line.length < 4) continue;
-    const xy = line.slice(0, 2);
-    const path = line.slice(3);
-    if (
-      xy === 'UU' ||
-      xy === 'AA' ||
-      xy === 'DD' ||
-      xy === 'AU' ||
-      xy === 'UA' ||
-      xy === 'DU' ||
-      xy === 'UD'
-    ) {
-      conflicts.push(path);
-    }
-  }
+  const parsed = parsePorcelainV2(porcelainRes.stdout);
+  const branch = parsed.branch;
+  const dirtyCount = parsed.dirtyCount;
+  const conflicts = parsed.conflicts;
 
   let ahead: number | null = null;
   let behind: number | null = null;
   let hasUpstream = false;
   let upstreamGone = false;
-  if (branch) {
-    if (upstreamRes.ok) {
-      hasUpstream = true;
-      const [b, a] = upstreamRes.stdout.trim().split(/\s+/).map((n) => Number.parseInt(n, 10));
-      if (Number.isFinite(b) && Number.isFinite(a)) {
-        behind = b;
-        ahead = a;
-      }
+  if (branch && parsed.hasUpstream) {
+    // An upstream with no `# branch.ab` line means the branch tracks
+    // a remote ref that no longer exists — merged and pruned,
+    // typically. git can't count the distance, and the UI wants that
+    // told apart from "never had an upstream" so it doesn't nag you
+    // to push a branch the team deleted.
+    if (parsed.ahead === null) {
+      upstreamGone = true;
     } else {
-      // rev-list against @{u} fails for two distinct cases: (1) no
-      // upstream ever configured, and (2) upstream was configured but
-      // its remote-tracking ref is gone (merged + pruned). Tell them
-      // apart by reading config directly — `branch.<name>.merge` sticks
-      // around even after `git fetch --prune` removes the ref.
-      const cfg = await run(repoPath, ['config', '--get', `branch.${branch}.merge`]);
-      if (cfg.ok && cfg.stdout.trim().length > 0) upstreamGone = true;
+      hasUpstream = true;
+      ahead = parsed.ahead;
+      behind = parsed.behind;
     }
   }
 
@@ -918,7 +1082,7 @@ export async function status(
   let behindDefault: number | null = null;
   let defaultRef: string | null = null;
   if (defaultBranch && branch && branch !== defaultBranch) {
-    const ref = await resolveDefaultRef(repoPath, defaultBranch);
+    const ref = resolvedDefaultRef;
     if (ref) {
       const cmp = await run(repoPath, [
         'rev-list',
