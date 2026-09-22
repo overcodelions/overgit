@@ -3,6 +3,7 @@ import { useStore } from './store';
 import { FileEditor } from './FileEditor';
 import { BranchPicker } from './BranchPicker';
 import { Explain } from './Explain';
+import { Spinner } from './Spinner';
 import { sanitizeBranchName } from '@shared/branch-name';
 import type {
   BranchPruneCandidate,
@@ -1592,34 +1593,6 @@ function StatusPill({
   );
 }
 
-function Spinner(): JSX.Element {
-  return (
-    <svg
-      width="10"
-      height="10"
-      viewBox="0 0 16 16"
-      className="animate-spin"
-      aria-hidden="true"
-    >
-      <circle
-        cx="8"
-        cy="8"
-        r="6"
-        stroke="currentColor"
-        strokeWidth="2"
-        fill="none"
-        opacity="0.25"
-      />
-      <path
-        d="M14 8a6 6 0 0 0-6-6"
-        stroke="currentColor"
-        strokeWidth="2"
-        fill="none"
-        strokeLinecap="round"
-      />
-    </svg>
-  );
-}
 
 interface BulkAction {
   /// Short label, used in the visible button.
@@ -1678,6 +1651,18 @@ function ConflictBanner({
   };
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /// Re-reading status + changes is two IPC roundtrips; on a big repo
+  /// that's long enough that a button with no feedback looks dead.
+  const [rechecking, setRechecking] = useState(false);
+  const onRecheck = async () => {
+    if (rechecking) return;
+    setRechecking(true);
+    try {
+      await Promise.all([refreshStatus(repoId), refreshChanges(repoId)]);
+    } finally {
+      setRechecking(false);
+    }
+  };
 
   const remaining = conflicts.length;
   const allResolved = remaining === 0;
@@ -1840,14 +1825,12 @@ function ConflictBanner({
             Abort
           </button>
           <button
-            onClick={() => {
-              void refreshStatus(repoId);
-              void refreshChanges(repoId);
-            }}
-            className="text-[11px] h-7 px-2 rounded text-ink-faint hover:text-ink hover:bg-card"
+            onClick={() => void onRecheck()}
+            disabled={rechecking}
+            className="text-[11px] h-7 px-2 rounded text-ink-faint hover:text-ink hover:bg-card disabled:opacity-50 inline-flex items-center justify-center"
             title="Re-check git status"
           >
-            ↻
+            {rechecking ? <Spinner /> : '↻'}
           </button>
         </div>
       </div>
@@ -2876,9 +2859,10 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
           <button
             onClick={onRefresh}
             disabled={busy}
-            className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50"
+            className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card disabled:opacity-50 inline-flex items-center gap-1.5"
           >
-            {busy ? 'Refreshing…' : 'Refresh'}
+            {busy && <Spinner />}
+            <span>{busy ? 'Refreshing…' : 'Refresh'}</span>
           </button>
         </div>
       </header>

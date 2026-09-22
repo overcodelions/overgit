@@ -83,6 +83,22 @@ export interface Toast {
   details?: string[];
 }
 
+/// A bulk action the user sent to the background. The originating
+/// sheet keeps running its workers after it unmounts, so without this
+/// the window goes quiet and the work looks like it never started —
+/// the whole reason "Run in background" felt broken. The title bar
+/// renders one row per job until it finishes.
+export interface BackgroundJob {
+  id: string;
+  /// Present participle for the chrome: "Syncing", "Fetching",
+  /// "Resetting". Rendered as "<verb> <done>/<total> · <scope>".
+  verb: string;
+  /// What the job is running over, usually a workspace name.
+  scope: string;
+  done: number;
+  total: number;
+}
+
 /// Modeless confirmation request. `requestConfirm` returns a promise so
 /// callers read the same as `window.confirm` (`if (await ...)`), but
 /// it's resolved by the in-app sheet rather than blocking the renderer.
@@ -179,6 +195,9 @@ interface UiState {
   /// renders them top-to-bottom so the most recent is visible without
   /// scrolling.
   toasts: Toast[];
+  /// Bulk actions still running after their sheet was dismissed with
+  /// "Run in background". Empty the rest of the time.
+  backgroundJobs: BackgroundJob[];
   /// Pending confirmation, if any. Renderer's <ConfirmHost /> watches
   /// this and renders the modal. Single-slot — only one confirm at a
   /// time, which matches what `window.confirm` allowed.
@@ -446,6 +465,14 @@ interface UiState {
 
   pushToast: (toast: Omit<Toast, 'id'>) => string;
   dismissToast: (id: string) => void;
+  /// Register a bulk action that's continuing without its sheet.
+  /// Called from the sheet's "Run in background" handler, which
+  /// already knows how far along the workers are.
+  beginBackgroundJob: (job: BackgroundJob) => void;
+  /// Bump a running job's completed count. A no-op for a job that was
+  /// never registered, so sheet workers can call it unconditionally.
+  advanceBackgroundJob: (id: string, done: number) => void;
+  endBackgroundJob: (id: string) => void;
   /// Replacement for `window.confirm`. Returns true when the user
   /// confirms, false on cancel or escape. Reasonable defaults so most
   /// call sites just need to pass `body`.
@@ -572,6 +599,7 @@ export const useStore = create<UiState>((set, get) => ({
   sheet: null,
   paletteOpen: false,
   toasts: [],
+  backgroundJobs: [],
   pendingConfirm: null,
 
   hydrate: async () => {
@@ -1436,12 +1464,13 @@ export const useStore = create<UiState>((set, get) => ({
 
   refreshRepoStatuses: async (ids) => {
     if (ids.length === 0) return;
-    // Bound the fan-out. Each `gitStatus` spawns ~4 parallel git
-    // subprocesses; STATUS_CONCURRENCY=3 = ~12 concurrent gits worst
-    // case, which a modern Mac handles fine without saturating. We
-    // tried 4 (16 concurrent) — that pegged CPU and starved
-    // foreground IPCs. 3 fills a 19-repo workspace in ~2s instead of
-    // ~4s, with headroom for the user's next click to land on time.
+    // Bound the fan-out. Each `gitStatus` spawns 3 git subprocesses,
+    // now genuinely in parallel (the main process's per-repo lock
+    // lets readers overlap), so STATUS_CONCURRENCY=3 is ~9 concurrent
+    // gits worst case. Measured on a 12-repo sweep, 2 is slower and
+    // 4/6/8 are no faster — spawn throughput, not the cap, is the
+    // ceiling — so 3 stays, and it leaves headroom for the user's
+    // next click to land on time.
     //
     // Routes through `refreshRepoStatus(id)` rather than calling
     // `repo:status` raw so the 2s TTL + in-flight dedupe on that
@@ -2173,6 +2202,22 @@ export const useStore = create<UiState>((set, get) => ({
 
   dismissToast: (id) => {
     set({ toasts: get().toasts.filter((t) => t.id !== id) });
+  },
+
+  beginBackgroundJob: (job) => {
+    set({ backgroundJobs: [...get().backgroundJobs.filter((j) => j.id !== job.id), job] });
+  },
+
+  advanceBackgroundJob: (id, done) => {
+    const jobs = get().backgroundJobs;
+    if (!jobs.some((j) => j.id === id)) return;
+    set({ backgroundJobs: jobs.map((j) => (j.id === id ? { ...j, done } : j)) });
+  },
+
+  endBackgroundJob: (id) => {
+    const jobs = get().backgroundJobs;
+    if (!jobs.some((j) => j.id === id)) return;
+    set({ backgroundJobs: jobs.filter((j) => j.id !== id) });
   },
 
   requestConfirm: ({
