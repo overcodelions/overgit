@@ -272,7 +272,10 @@ interface UiState {
   retryCheckoutRepo: (id: UUID) => Promise<void>;
 
   refreshRepoChanges: (id: UUID) => Promise<void>;
-  refreshRepoStatus: (id: UUID) => Promise<void>;
+  /// `force` skips joining an in-flight read — pass it right after a
+  /// mutation, since a read that started before the mutation would
+  /// hand back the pre-mutation status.
+  refreshRepoStatus: (id: UUID, force?: boolean) => Promise<void>;
   refreshRepoHeadCommit: (id: UUID, force?: boolean) => Promise<void>;
   /// Re-resolve one repo's commit identity. Call with `force` after
   /// anything that can change the answer (per-repo override saved or
@@ -508,6 +511,9 @@ function diffKey(sha: string | undefined): string {
 /// Callers pass `force: true` after a mutation (commit, push, fetch)
 /// because the cached data is now stale even if the timestamp is fresh.
 const _inflight = new Map<string, Promise<unknown>>();
+/// Per-repo sequence for `refreshRepoStatus` so an older read can't
+/// overwrite a newer one.
+const _statusSeq = new Map<string, number>();
 const _lastRefresh = new Map<string, number>();
 
 async function cached<T>(
@@ -1201,7 +1207,7 @@ export const useStore = create<UiState>((set, get) => ({
     });
   },
 
-  refreshRepoStatus: async (id) => {
+  refreshRepoStatus: async (id, force = false) => {
     // Same story as `refreshRepoChanges`: TTL=0 keeps in-flight
     // dedupe (concurrent fires share one IPC) but doesn't block
     // fresh post-mutation refreshes. The 2s gate was the real reason
@@ -1209,10 +1215,23 @@ export const useStore = create<UiState>((set, get) => ({
     // checkoutRepo's `refreshRepoStatus` was being eaten by TTL, so
     // `status.branch` never updated and the branch-change watcher
     // in HistoryTab never fired.
-    await cached(`repoStatus:${id}`, 0, async () => {
-      const st = await window.overgit.invoke('repo:status', id);
-      set({ repoStatus: { ...get().repoStatus, [id]: st } });
-    });
+    //
+    // Last-started wins: reads overlap (a sweep plus a post-mutation
+    // force), and one that began before a fast-forward can resolve
+    // after it. Without the sequence check its stale ahead/behind
+    // would overwrite the fresh one and the badge would bounce back.
+    await cached(
+      `repoStatus:${id}`,
+      0,
+      async () => {
+        const seq = (_statusSeq.get(id) ?? 0) + 1;
+        _statusSeq.set(id, seq);
+        const st = await window.overgit.invoke('repo:status', id);
+        if (_statusSeq.get(id) !== seq) return;
+        set({ repoStatus: { ...get().repoStatus, [id]: st } });
+      },
+      force,
+    );
   },
 
   refreshRepoHeadCommit: async (id, force = false) => {

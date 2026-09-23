@@ -4483,6 +4483,9 @@ function SyncBehindProgressSheet({
         setRows((prev) => ({ ...prev, [id]: { phase: 'running' } }));
         try {
           const res = await fastForwardRepo(id);
+          // Forced so it can't reuse a status read that started before
+          // the fast-forward and still reports the old behind count.
+          void useStore.getState().refreshRepoStatus(id, true);
           if (cancelledRef.current) return;
           outcomes.push(res);
           useStore.getState().advanceBackgroundJob(jobId, outcomes.length);
@@ -4505,7 +4508,9 @@ function SyncBehindProgressSheet({
         }
       }
     };
-    const concurrency = Math.min(4, repoIds.length);
+    // Each row is a handful of local git calls (no network), so a
+    // wider pool just finishes sooner.
+    const concurrency = Math.min(8, repoIds.length);
     Promise.all(Array.from({ length: concurrency }, worker)).then(() => {
       // No-op unless the run was backgrounded; the title-bar pill
       // hands off to the completion toast below.
