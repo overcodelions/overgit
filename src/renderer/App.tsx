@@ -1901,7 +1901,7 @@ function WorkspaceDetail({ workspaceId }: { workspaceId: UUID }): JSX.Element {
                 }}
                 disabled={busy !== null}
                 className="text-xs px-3 py-1.5 rounded border border-accent/40 text-accent hover:bg-accent/10 disabled:opacity-50"
-                title="Fast-forward every behind repo to its upstream. Diverged branches are reported, never merged."
+                title="Fast-forward every behind repo to its last-fetched upstream. Diverged branches are reported, never merged."
               >
                 Sync {aggregate.behind} behind
               </button>

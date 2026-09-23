@@ -2747,6 +2747,13 @@ export async function push(
 /// directly is deterministic. Divergence is detected ahead of the
 /// merge via rev-list so we can return a clean `diverged: true`
 /// instead of a generic FF-refused stderr.
+///
+/// Local-only on purpose: the behind count that offers this sync was
+/// computed from the remote-tracking ref, so fast-forwarding to that
+/// ref is exactly what the user saw. A per-repo network fetch here
+/// cost 1-5s each and queued behind any other fetch holding the
+/// repo's write lane, which turned a 9-repo sync into a minute-plus
+/// wait. "Fetch all" is the way to get something fresher.
 export async function pullFastForward(
   repoPath: string,
 ): Promise<{
@@ -2768,46 +2775,30 @@ export async function pullFastForward(
   }
   const branch = head.stdout.trim();
   // HEAD can point at an attacker-named ref in a cloned repo, and this
-  // one goes straight into a network command.
+  // one goes straight into a ref argument.
   if (!isSafeRefArg(branch)) {
     return { ok: false, error: `Refusing branch name "${branch}"` };
   }
-  // 2. Refresh origin's view of this branch. Targeted fetch — no
-  // --all — so FETCH_HEAD ends up with at most one entry and the
-  // remote-tracking ref we're about to merge against is fresh.
-  const fetchRes = await run(
-    repoPath,
-    ['fetch', 'origin', branch],
-    NETWORK_ENV,
-    NETWORK_TIMEOUT_MS,
-  );
-  if (!fetchRes.ok) {
-    return {
-      ok: false,
-      error: fetchRes.stderr.trim() || `git fetch exited ${fetchRes.code}`,
-    };
-  }
-  // 3. Verify the remote-tracking ref now exists.
+  // 2. Ahead/behind against the remote-tracking ref in one call. A
+  // missing ref makes rev-list fail, which is the "not found" case.
   const remoteRef = `refs/remotes/origin/${branch}`;
-  const remoteCheck = await run(repoPath, [
-    'rev-parse',
-    '--verify',
-    '--quiet',
-    remoteRef,
+  const counts = await run(repoPath, [
+    'rev-list',
+    '--left-right',
+    '--count',
+    `refs/heads/${branch}...${remoteRef}`,
   ]);
-  if (!remoteCheck.ok) {
+  if (!counts.ok) {
     return {
       ok: false,
-      error: `origin/${branch} not found after fetch — branch may have been deleted upstream.`,
+      error: `origin/${branch} not found — branch may have been deleted upstream. Try Fetch all.`,
     };
   }
-  // 4. Diverged? Local has commits not on origin.
-  const ahead = await run(repoPath, [
-    'rev-list',
-    '--count',
-    `${remoteRef}..refs/heads/${branch}`,
-  ]);
-  const aheadN = ahead.ok ? parseInt(ahead.stdout.trim(), 10) || 0 : 0;
+  const [aheadN = 0, behindN = 0] = counts.stdout
+    .trim()
+    .split(/\s+/)
+    .map((n) => parseInt(n, 10) || 0);
+  // 3. Diverged? Local has commits not on origin.
   if (aheadN > 0) {
     return {
       ok: false,
@@ -2815,15 +2806,9 @@ export async function pullFastForward(
       error: `Local has ${aheadN} ${aheadN === 1 ? 'commit' : 'commits'} not on origin/${branch} — fast-forward refused.`,
     };
   }
-  // 5. Already up to date? No-op so the renderer can label it.
-  const behind = await run(repoPath, [
-    'rev-list',
-    '--count',
-    `refs/heads/${branch}..${remoteRef}`,
-  ]);
-  const behindN = behind.ok ? parseInt(behind.stdout.trim(), 10) || 0 : 0;
+  // 4. Already up to date? No-op so the renderer can label it.
   if (behindN === 0) return { ok: true, alreadyUpToDate: true };
-  // 6. Merge --ff-only against the specific remote-tracking ref. No
+  // 5. Merge --ff-only against the specific remote-tracking ref. No
   // FETCH_HEAD involved.
   const merge = await run(repoPath, ['merge', '--ff-only', remoteRef]);
   if (!merge.ok) {
