@@ -55,6 +55,7 @@
       "main": "dist/main/index.js"
     },
     "mac": {
+      "icon": "build/icon.icns",
       "category": "public.app-category.developer-tools",
       "target": [
         {
