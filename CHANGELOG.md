@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-23
+
 ### Added
 
 - A first-run welcome screen. With nothing added yet, overgit explains repos,
@@ -37,6 +39,44 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   in, instead of a paragraph with no actions.
 - The menu no longer has View → Reload. Electron's default menu bound it to
   ⌘R, the key overgit uses to refresh a pane.
+- Repo status is faster. Read-only git commands in a repo now run
+  concurrently instead of queueing behind one lock, and status takes three git
+  processes instead of seven. A full sidebar sweep over 12 repos went from
+  about 450ms to about 170ms.
+- Slow actions show a spinner on the button that started them, and work sent
+  to the background ("Run in background" on reset, fetch and sync) shows as a
+  live progress pill in the title bar until it finishes.
+- Sync N behind is local-only: it fast-forwards to the already-fetched
+  remote-tracking branch, eight repos at a time, instead of fetching each repo
+  first.
+- Release pages have a download table and permanent, version-free download
+  links under `/releases/latest/download/`.
+- CI type-checks the whole tree, tests included (`npm run typecheck`).
+
+### Fixed
+
+- Synced repos no longer show as behind again: a status read that started
+  before a fast-forward can't overwrite the fresher result.
+- Conflicted paths containing spaces are no longer shown quoted, and a repo
+  with no commits reports its branch instead of reading as detached.
+- Reviewing a selection made only of new, untracked files showed "no changes";
+  those files now appear in the diff.
+
+### Security
+
+- Electron 41.10.7 (CVE-2026-70608, the one advisory that reached the shipped
+  app), electron-builder 26.15.3 and related packaging libraries, plus vite
+  and vitest. The unpatchable `extract-zip` dependency is gone.
+- Dev dependency advisories cleared (postcss, axios, form-data, shell-quote
+  and others); none of them ship in the app.
+- The repo pins the public npm registry, so a machine configured for a private
+  mirror can't rewrite the lockfile's URLs.
+
+### Documentation
+
+- TRADEMARKS.md: the Apache-2.0 license covers the code, not the overgit name
+  or logo. CONTRIBUTING.md gains contribution terms (DCO sign-off,
+  Apache-2.0 inbound).
 
 ## [0.3.0] - 2026-09-13
 
@@ -131,7 +171,8 @@ Initial public release. Building in the open from here.
 - Per-lane colored branch graph with ref labels.
 - Resizable sidebar, light / dark / system theme, keyboard shortcuts.
 
-[Unreleased]: https://github.com/overcodelions/overgit/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/overcodelions/overgit/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/overcodelions/overgit/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/overcodelions/overgit/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/overcodelions/overgit/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/overcodelions/overgit/releases/tag/v0.1.0
