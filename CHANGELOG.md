@@ -6,6 +6,24 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-23
+
+### Added
+
+- Overgit now updates itself. New versions download in the background from
+  GitHub Releases and install when you quit; once one is ready, a prompt
+  offers to restart now. Settings → General has an Update channel switch:
+  Stable follows tagged releases, Nightly follows the daily builds. This is
+  the first version that can update itself, so 0.4.1 and earlier still need
+  this one installed by hand.
+
+### Changed
+
+- The Windows installer is now named `Overgit-Setup-<version>.exe`.
+- Nightly builds are versioned one patch ahead of the latest release (for
+  example `0.4.3-nightly.<date>.<sha>`) and each is published under its own
+  tag, so their download links change with every build.
+
 ## [0.4.1] - 2026-09-23
 
 ### Fixed
@@ -180,7 +198,8 @@ Initial public release. Building in the open from here.
 - Per-lane colored branch graph with ref labels.
 - Resizable sidebar, light / dark / system theme, keyboard shortcuts.
 
-[Unreleased]: https://github.com/overcodelions/overgit/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/overcodelions/overgit/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/overcodelions/overgit/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/overcodelions/overgit/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/overcodelions/overgit/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/overcodelions/overgit/compare/v0.2.0...v0.3.0
