@@ -31,6 +31,7 @@ import type {
   Worktree,
 } from '@shared/types';
 import { SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH } from '@shared/types';
+import { UpdateToast } from './UpdateToast';
 
 // Stable empty arrays for Zustand selector fallbacks. Using `?? []`
 // inside a `useStore` selector returns a NEW array on every call, which
@@ -95,6 +96,7 @@ export function App(): JSX.Element {
       <CommandPalette />
       <ConfirmHost />
       <ToastHost />
+      <UpdateToast />
     </div>
   );
 }

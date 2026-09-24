@@ -742,6 +742,10 @@ export interface AppSettings {
   /// retires itself once every step is done, so this only records a user
   /// who wanted it gone early.
   gettingStartedDismissed?: boolean;
+  /// Which release feed the auto-updater follows. 'stable' (the default)
+  /// tracks tagged releases; 'nightly' tracks the rolling prerelease
+  /// builds. Missing means 'stable'.
+  updateChannel?: 'stable' | 'nightly';
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -771,6 +775,9 @@ export interface IPCInvokeMap {
   'store:saveWorksets': (worksets: Workset[]) => void;
   'store:saveWorkspaces': (workspaces: Workspace[]) => void;
   'store:saveSettings': (settings: AppSettings) => void;
+  /// Quit and install an already-downloaded update now instead of
+  /// waiting for the next quit.
+  'update:quitAndInstall': () => void;
 
   'repo:add': (path: string) => { ok: true; repo: Repo } | { ok: false; error: string };
   /// Run `git init` (optionally with `-b <initialBranch>`) at the given
@@ -1494,4 +1501,9 @@ export type MainToRendererEvent =
       /// trailing carriage-return progress updates ("Receiving objects:
       /// 42% …") that git emits on its own line.
       line: string;
-    };
+    }
+  /// Auto-updater lifecycle (src/main/updater.ts). The download starts on
+  /// its own; `downloaded` means it installs on the next quit.
+  | { kind: 'update:available'; version: string }
+  | { kind: 'update:progress'; percent: number }
+  | { kind: 'update:downloaded'; version: string };

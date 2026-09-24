@@ -39,8 +39,10 @@ jobs:
 
       - run: npm ci
 
-      # electron-builder picks GH_TOKEN up automatically and will attach
-      # the produced artifacts to the GitHub Release for the pushed tag.
+      # `--publish never`: electron-builder only builds here. The attach
+      # step below uploads the installers plus the latest*.yml files the
+      # auto-updater reads (src/main/updater.ts), so the draft release is
+      # the single place a build becomes visible to installed apps.
       # macOS builds are signed with the Developer ID and notarized when the
       # Apple secrets are available (same setup as overcli).
       - name: Build distributables
@@ -67,7 +69,7 @@ jobs:
             echo "No Apple credentials in secrets — building unsigned."
             export CSC_IDENTITY_AUTO_DISCOVERY=false
           fi
-          npm run ${{ matrix.dist_script }}
+          npm run ${{ matrix.dist_script }} -- --publish never
 
       - name: Upload build artifacts (workflow run)
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -79,6 +81,7 @@ jobs:
             release/*.exe
             release/*.AppImage
             release/*.deb
+            release/latest*.yml
           if-no-files-found: ignore
 
       # On tag pushes, attach the per-platform artifacts to the GitHub
@@ -97,6 +100,7 @@ jobs:
             release/*.exe
             release/*.AppImage
             release/*.deb
+            release/latest*.yml
 
   # Each OS job in the build matrix attaches its own files to the same draft
   # release, so no single job ever sees the whole asset list. This runs after
@@ -170,6 +174,9 @@ jobs:
           macOS builds are signed with a Developer ID and notarized. Windows
           builds are not signed yet — SmartScreen warns on first run:
           **More info → Run anyway**. The Linux AppImage needs `chmod +x`.
+
+          The `latest*.yml` files in the asset list are auto-updater metadata,
+          not downloads.
           EOF
           cat notes.md
           gh release edit "$TAG" --repo "$REPO" --notes-file notes.md
