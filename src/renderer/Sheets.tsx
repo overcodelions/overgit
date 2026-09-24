@@ -1,5 +1,8 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useStore } from './store';
+import { AppMark, KeyCombo } from './onboarding/helpChrome';
+import { BasicsSheet, SetupSheet, ShortcutsSheet } from './onboarding/HelpSheets';
+import { SHORTCUT_GROUPS, shortcutText } from './onboarding/shortcuts';
 import type {
   AbandonLocalPreview,
   AppSettings,
@@ -63,6 +66,10 @@ export function SheetHost(): JSX.Element | null {
             ? 'w-[760px] max-w-[92vw] h-[85vh]'
             : sheet.kind === 'about'
               ? 'w-[720px] max-w-[92vw] max-h-[85vh]'
+              : sheet.kind === 'basics' || sheet.kind === 'setup' || sheet.kind === 'shortcuts'
+                // One size for all three so hopping between them via the
+                // footer links doesn't jolt the window.
+                ? 'w-[860px] max-w-[92vw] h-[82vh]'
               : sheet.kind === 'settings'
                 ? 'w-[1080px] max-w-[95vw] h-[80vh]'
                 : sheet.kind === 'pullConflict'
@@ -80,6 +87,9 @@ export function SheetHost(): JSX.Element | null {
       >
         {sheet.kind === 'settings' && <SettingsSheet />}
         {sheet.kind === 'about' && <AboutSheet />}
+        {sheet.kind === 'basics' && <BasicsSheet />}
+        {sheet.kind === 'setup' && <SetupSheet />}
+        {sheet.kind === 'shortcuts' && <ShortcutsSheet />}
         {sheet.kind === 'newWorkset' && <WorksetSheet />}
         {sheet.kind === 'editWorkset' && (
           <WorksetSheet worksetId={sheet.worksetId} />
@@ -1116,8 +1126,34 @@ function SettingsGeneralPanel(): JSX.Element {
 
 function SettingsCliPanel(): JSX.Element {
   const cli = useStore((s) => s.cliPresence);
+  const git = useStore((s) => s.gitInfo);
+  const setSheet = useStore((s) => s.setSheet);
   return (
     <div className="flex flex-col gap-6 text-sm">
+      <SettingsGroup
+        eyebrow="Required"
+        title="Git"
+        subtitle="Every action is a git command. Landing Check needs 2.38 or newer."
+      >
+        <ul className="flex flex-col">
+          <CliRow
+            name="git"
+            present={git ? git.installed : undefined}
+            purpose={
+              git?.installed
+                ? `Version ${git.version}${git.landingCheck ? '' : ' · too old for Landing Check'}`
+                : 'Not found on PATH'
+            }
+          />
+        </ul>
+        <button
+          onClick={() => setSheet({ kind: 'setup' })}
+          className="mt-2 text-[11px] text-ink-faint hover:text-ink"
+        >
+          Missing something? Setup has the install commands →
+        </button>
+      </SettingsGroup>
+
       <SettingsGroup
         eyebrow="AI"
         title="LLM CLIs"
@@ -1726,25 +1762,29 @@ function IdentityBulkTable(): JSX.Element {
 }
 
 function SettingsShortcutsPanel(): JSX.Element {
+  const setSheet = useStore((s) => s.setSheet);
   return (
     <div className="flex flex-col gap-6 text-sm">
-      <SettingsGroup
-        eyebrow="Input"
-        title="Keyboard shortcuts"
-        subtitle="Inputs and textareas are skipped for alphabetic shortcuts so typing isn't intercepted; ⌘K and number-tabs always fire."
+      {SHORTCUT_GROUPS.map((g, i) => (
+        <SettingsGroup
+          key={g.title}
+          eyebrow={i === 0 ? 'Input' : 'Keys'}
+          title={g.title}
+          subtitle={g.note}
+        >
+          <ul className="grid grid-cols-1 gap-y-1.5 text-[11px]">
+            {g.items.map((s) => (
+              <ShortcutRow key={s.label} keys={s.keys} what={s.label} />
+            ))}
+          </ul>
+        </SettingsGroup>
+      ))}
+      <button
+        onClick={() => setSheet({ kind: 'shortcuts' })}
+        className="self-start text-[11px] text-ink-faint hover:text-ink"
       >
-        <ul className="grid grid-cols-1 gap-y-1.5 font-mono text-[11px]">
-          <ShortcutRow keys="⌘ K" what="Command palette (switch / create branch, jump to repo, file)" />
-          <ShortcutRow keys="⌘ ," what="Open settings" />
-          <ShortcutRow keys="⌘ \\" what="Toggle sidebar" />
-          <ShortcutRow keys="⌘ R" what="Refresh current pane" />
-          <ShortcutRow keys="⌘ B" what="Branch picker (in a repo)" />
-          <ShortcutRow keys="⌘ N" what="New branch (in a workset)" />
-          <ShortcutRow keys="⌘ 1 – 4" what="Changes / History / Files / Graph" />
-          <ShortcutRow keys="⌘ S" what="Save open file" />
-          <ShortcutRow keys="↑ ↓ ⏎" what="Navigate picker / palette" />
-        </ul>
-      </SettingsGroup>
+        Open as a cheat sheet ({shortcutText(['Mod', '/'])} anywhere) →
+      </button>
     </div>
   );
 }
@@ -1783,10 +1823,12 @@ function Stat({ label, value }: { label: string; value: string }): JSX.Element {
   );
 }
 
-function ShortcutRow({ keys, what }: { keys: string; what: string }): JSX.Element {
+function ShortcutRow({ keys, what }: { keys: string[]; what: string }): JSX.Element {
   return (
-    <li className="flex justify-between items-baseline gap-3">
-      <span className="text-ink min-w-[68px]">{keys}</span>
+    <li className="flex justify-between items-center gap-3">
+      <span className="min-w-[92px]">
+        <KeyCombo keys={keys} />
+      </span>
       <span className="text-ink-faint flex-1 font-sans">{what}</span>
     </li>
   );
@@ -2063,21 +2105,12 @@ const ABOUT_FEATURES = [
   { title: 'Sandboxed file editor', body: 'Syntax-highlighted, scoped to your registered repos.' },
 ] as const;
 
-const ABOUT_SHORTCUTS = [
-  { keys: '⌘K', label: 'Command palette' },
-  { keys: '⌘B', label: 'Branch picker' },
-  { keys: '⌘N', label: 'New branch' },
-  { keys: '⌘P', label: 'Push' },
-  { keys: '⌘F', label: 'Fetch' },
-  { keys: '⌘⏎', label: 'Commit' },
-  { keys: '⌘1–5', label: 'Repo tabs' },
-  { keys: '⌘R', label: 'Refresh' },
-  { keys: '⌘,', label: 'Settings' },
-  { keys: '⌘\\', label: 'Toggle sidebar' },
-] as const;
+// The About sheet's short list; the full one is Help → Keyboard shortcuts.
+const ABOUT_SHORTCUTS = SHORTCUT_GROUPS.flatMap((g) => g.items).filter((s) => s.essential);
 
 function AboutSheet(): JSX.Element {
   const setSheet = useStore((s) => s.setSheet);
+  const appVersion = useStore((s) => s.appVersion);
   // Wrapper must fill the modal AND allow its children to shrink, or
   // the inner `overflow-y-auto` body has no constrained height to
   // scroll within. `h-full min-h-0 flex flex-col` is the recipe: fill,
@@ -2094,7 +2127,7 @@ function AboutSheet(): JSX.Element {
             <div className="flex items-baseline gap-3">
               <div className="text-[30px] font-bold leading-none tracking-tight text-ink">overgit</div>
               <div className="rounded-full border border-card bg-card/60 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider text-ink-muted">
-                v0.1.0
+                {appVersion ? `v${appVersion}` : 'overgit'}
               </div>
             </div>
             <div className="mt-2.5 text-sm leading-snug text-ink-muted">
@@ -2138,14 +2171,20 @@ function AboutSheet(): JSX.Element {
         <SectionLabel className="mt-6">Shortcuts</SectionLabel>
         <div className="mt-3 grid grid-cols-2 gap-x-3 gap-y-1.5 rounded-xl border border-card bg-card/30 px-4 py-3">
           {ABOUT_SHORTCUTS.map((s) => (
-            <div key={s.keys} className="flex items-center gap-2 text-[11px]">
-              <kbd className="inline-flex min-w-[44px] justify-center rounded border border-card bg-surface/70 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-ink">
-                {s.keys}
-              </kbd>
-              <span className="text-ink-muted">{s.label}</span>
+            <div key={s.label} className="flex items-center gap-2 text-[11px]">
+              <span className="w-[64px] flex-shrink-0">
+                <KeyCombo keys={s.keys} />
+              </span>
+              <span className="min-w-0 truncate text-ink-muted" title={s.label}>{s.label}</span>
             </div>
           ))}
         </div>
+        <button
+          onClick={() => setSheet({ kind: 'shortcuts' })}
+          className="mt-2 text-[11px] text-ink-faint hover:text-ink"
+        >
+          All shortcuts →
+        </button>
 
         <div className="mt-6 flex items-center justify-between rounded-xl border border-card bg-card/40 px-4 py-3 text-xs">
           <div>
@@ -2175,6 +2214,12 @@ function AboutSheet(): JSX.Element {
           Shells out to git, gh, claude, codex, gemini — uses your existing CLIs.
         </span>
         <div className="flex-1" />
+        <button
+          onClick={() => setSheet({ kind: 'basics' })}
+          className="rounded px-2 py-1 text-ink-muted hover:bg-card hover:text-ink"
+        >
+          How it works
+        </button>
         <a
           href="https://github.com/overcodelions/overcli"
           target="_blank"
@@ -2198,29 +2243,6 @@ function AboutSheet(): JSX.Element {
           Done
         </button>
       </div>
-    </div>
-  );
-}
-
-function AppMark(): JSX.Element {
-  return (
-    <div className="relative flex h-[80px] w-[80px] items-center justify-center rounded-[20px] border border-card bg-gradient-to-br from-accent/55 via-accent/20 to-accent/5 shadow-[0_12px_24px_rgba(0,0,0,0.28)] flex-shrink-0">
-      <div className="absolute inset-[5px] rounded-[15px] border border-ink/5 bg-surface/30" />
-      <svg width="42" height="42" viewBox="0 0 42 42" fill="none" className="relative">
-        {/* Stylized branch glyph: trunk + fork. Reads as "git" without
-            being literal. White-on-purple keeps it punchy in dark mode. */}
-        <circle cx="13" cy="11" r="3.5" stroke="currentColor" strokeWidth="2.5" className="text-ink" />
-        <circle cx="13" cy="31" r="3.5" stroke="currentColor" strokeWidth="2.5" className="text-ink" />
-        <circle cx="29" cy="21" r="3.5" stroke="currentColor" strokeWidth="2.5" className="text-ink" />
-        <path d="M13 14.5 V 27.5" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" className="text-ink" />
-        <path
-          d="M13 21 Q 21 21 25.5 21"
-          stroke="currentColor"
-          strokeWidth="2.5"
-          strokeLinecap="round"
-          className="text-ink"
-        />
-      </svg>
     </div>
   );
 }

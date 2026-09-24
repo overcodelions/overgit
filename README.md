@@ -23,6 +23,14 @@ A repo can belong to many workspaces (small shared libs are the common case) and
 2. **Overlay, not metadata.** overgit never writes inside `.git`. No manifest, no synthetic root, no hidden file on disk. Stop using it any time and your repos behave the same in any other tool.
 3. **AI in the loop.** Pipe a diff to `claude` / `codex` / `gemini` for review. Have an LLM CLI draft your commit message from the staged diff. Uses your existing CLI auth — nothing leaves your machine via overgit.
 
+## Getting started
+
+1. **Open overgit.** With nothing added yet, the welcome screen checks this machine for git (the only requirement) and for the optional CLIs, with an install command for anything missing. It notices a new install on its own; no restart needed.
+2. **Add your repos** (⌘O). Pick a repo, or the folder that holds all your checkouts — every repo one level down comes in. Or clone one from a URL, GitHub, GitLab or Bitbucket.
+3. **Follow the checklist.** The sidebar's *Getting started* card walks you through your first workspace and your first workset, then gets out of the way.
+
+Help is always one step away: the **Help** menu (How Overgit Works, Setup — Git and CLIs, Keyboard Shortcuts), typing `help` in the command palette (⌘K), or ⌘/ (or `?`) for the shortcut cheat sheet.
+
 ## What's in the box
 
 ### Workspaces (durable groupings)
@@ -54,7 +62,7 @@ Landing Check continuously answers whether every committed workset branch will l
 
 ## Status
 
-v0.1.0 — building in the open. Expect things to move.
+Pre-1.0 and building in the open. Expect things to move; see [CHANGELOG.md](./CHANGELOG.md).
 
 ## Stack
 
@@ -73,15 +81,21 @@ If you want to use overgit on its own source tree, run `npm start` rather than `
 
 ## Keyboard shortcuts
 
+⌘ on macOS, Ctrl elsewhere. The full list is in the app under Help → Keyboard Shortcuts (⌘/).
+
 | Key | What |
 | --- | --- |
-| ⌘K | Command palette |
+| ⌘K | Command palette — branches, repos, files, actions, help |
+| ⌘O | Add repositories |
 | ⌘, | Settings |
 | ⌘\ | Toggle sidebar |
 | ⌘R | Refresh current pane |
+| ⌘/ or `?` | Keyboard shortcuts |
 | ⌘B | Branch picker (in a repo) |
-| ⌘N | New branch (across a workset's repos) |
-| ⌘1 – 4 | Repo tabs: Changes / History / Files / Graph |
+| ⌘N | New branch (in a repo, or across a workset's repos) |
+| ⌘⏎ | Commit (in a repo) |
+| ⌘P / ⌘F | Push / fetch (in a repo) |
+| ⌘1 – 5 | Repo tabs: Changes / History / Files / Stash / Branches |
 | ⌘S | Save open file |
 | ↑↓⏎ | Navigate picker / palette |
 

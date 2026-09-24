@@ -437,6 +437,31 @@ export interface CliPresence {
 
 export type LlmTool = 'claude' | 'codex' | 'gemini';
 
+/// What `git --version` said. Probed separately from `CliPresence`
+/// because git is the one tool overgit cannot run without — the first-run
+/// screen blocks on it, and Landing Check needs a minimum version.
+export interface GitInfo {
+  installed: boolean;
+  /// "2.45.0" — null when git is missing or printed something we can't parse.
+  version: string | null;
+  /// Git 2.38+ (`merge-tree --write-tree`), which Landing Check is built on.
+  landingCheck: boolean;
+}
+
+/// Native menu items that can't act on their own: the menu lives in main,
+/// the sheets and pickers live in the renderer, so each one arrives as a
+/// `menu:command` event.
+export type MenuCommand =
+  | 'about'
+  | 'basics'
+  | 'setup'
+  | 'shortcuts'
+  | 'settings'
+  | 'addRepos'
+  | 'cloneRepo'
+  | 'palette'
+  | 'toggleSidebar';
+
 export interface ReviewResult {
   ok: boolean;
   /// Plain-text response from the LLM. For codex this is the post-extraction
@@ -713,6 +738,10 @@ export interface AppSettings {
   /// from GitHub / Bitbucket. Defaults to https because that's the form
   /// that works with the credential the browse step already used.
   clonePreferredProtocol?: 'https' | 'ssh';
+  /// "Hide" on the sidebar's getting-started checklist. The checklist also
+  /// retires itself once every step is done, so this only records a user
+  /// who wanted it gone early.
+  gettingStartedDismissed?: boolean;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -1250,6 +1279,10 @@ export interface IPCInvokeMap {
   };
 
   'cli:detect': () => CliPresence;
+  /// Re-probes every call (unlike the landing check's memoized probe) so
+  /// the first-run screen notices git being installed without a restart.
+  'git:info': () => GitInfo;
+  'app:version': () => string;
   'cli:reviewChanges': (args: {
     repoId: UUID;
     scope: 'staged' | 'working';
@@ -1452,6 +1485,7 @@ export interface StoreSnapshot {
 /// status updates (e.g. progress during a workset fetch).
 export type MainToRendererEvent =
   | { kind: 'repo:statusUpdated'; status: RepoStatus }
+  | { kind: 'menu:command'; command: MenuCommand }
   | { kind: 'workset:checkoutProgress'; worksetId: UUID; outcome: CheckoutOutcome }
   | {
       kind: 'repo:cloneProgress';

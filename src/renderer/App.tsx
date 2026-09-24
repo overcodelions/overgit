@@ -7,6 +7,9 @@ import { CommandPalette } from './CommandPalette';
 import { Explain } from './Explain';
 import { Spinner } from './Spinner';
 import { relativeTime } from './BranchPicker';
+import { Welcome } from './onboarding/Welcome';
+import { GettingStarted } from './onboarding/GettingStartedCard';
+import { shortcutText } from './onboarding/shortcuts';
 import type {
   ChangedFile,
   CheckoutOutcome,
@@ -50,12 +53,18 @@ export function App(): JSX.Element {
   const loaded = useStore((s) => s.loaded);
   const hydrate = useStore((s) => s.hydrate);
   const sidebarVisible = useStore((s) => s.settings.sidebarVisible);
+  // First run is derived, not flagged: nothing registered means the
+  // welcome screen, in place of an empty sidebar and a blank pane.
+  const onboarding = useStore(
+    (s) => s.repos.length === 0 && s.workspaces.length === 0 && s.worksets.length === 0,
+  );
 
   useEffect(() => {
     hydrate();
   }, [hydrate]);
 
   useGlobalShortcuts();
+  useMenuCommands();
   useSidebarStatusRefresh();
   useSidebarBackgroundFetch();
 
@@ -72,8 +81,14 @@ export function App(): JSX.Element {
     <div className="flex flex-col h-full">
       <TitleBar />
       <div className="flex flex-1 min-h-0">
-        {sidebarVisible && <SidebarWithResize />}
-        <Main />
+        {onboarding ? (
+          <Welcome />
+        ) : (
+          <>
+            {sidebarVisible && <SidebarWithResize />}
+            <Main />
+          </>
+        )}
       </div>
       <LearningBar />
       <SheetHost />
@@ -432,6 +447,38 @@ function useSidebarBackgroundFetch(): void {
 /// repo tab, even while you're typing. We do skip alphabetic shortcuts
 /// (Cmd+B, Cmd+N) inside text fields so they don't steal browser
 /// behavior in the search box / commit message.
+/// The native menu (src/main/menu.ts) can't open a sheet or a picker
+/// itself; each such item arrives here as a `menu:command` event.
+function useMenuCommands(): void {
+  useEffect(() => {
+    return window.overgit.onMainEvent((evt) => {
+      if (evt.kind !== 'menu:command') return;
+      const s = useStore.getState();
+      switch (evt.command) {
+        case 'addRepos':
+          void s.pickAndAddRepo();
+          return;
+        case 'cloneRepo':
+          s.setSheet({ kind: 'cloneRepo' });
+          return;
+        case 'palette':
+          s.togglePalette(true);
+          return;
+        case 'toggleSidebar':
+          s.toggleSidebar();
+          return;
+        case 'about':
+        case 'basics':
+        case 'setup':
+        case 'shortcuts':
+        case 'settings':
+          s.setSheet({ kind: evt.command });
+          return;
+      }
+    });
+  }, []);
+}
+
 function useGlobalShortcuts(): void {
   const setSheet = useStore((s) => s.setSheet);
   const toggleSidebar = useStore((s) => s.toggleSidebar);
@@ -446,13 +493,26 @@ function useGlobalShortcuts(): void {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
-      if (!mod) return;
       const target = e.target as HTMLElement | null;
       const inField =
         !!target &&
         (target.tagName === 'INPUT' ||
           target.tagName === 'TEXTAREA' ||
           target.isContentEditable);
+      // `?` → shortcuts cheat sheet. The one unmodified global key, so it
+      // only fires outside text fields, where nobody is typing a `?`.
+      if (!mod && e.key === '?' && !inField && !e.altKey) {
+        e.preventDefault();
+        setSheet({ kind: 'shortcuts' });
+        return;
+      }
+      if (!mod) return;
+      // Cmd+/ → shortcuts cheat sheet (Help → Keyboard Shortcuts).
+      if (e.key === '/') {
+        e.preventDefault();
+        setSheet({ kind: 'shortcuts' });
+        return;
+      }
 
       // Cmd+K → command palette. Wins over the inField guard so the
       // user can summon it from anywhere, including the search box.
@@ -1083,6 +1143,8 @@ function Sidebar(): JSX.Element {
           </>
         )}
       </nav>
+
+      <GettingStarted />
 
       <div className="border-t border-card px-2 py-2 flex flex-col gap-1">
         <button
@@ -1722,19 +1784,55 @@ function Main(): JSX.Element {
   if (!ws) {
     return (
       <main className="flex-1 flex items-center justify-center text-ink-muted">
-        <div className="text-center max-w-sm">
-          <div className="text-base font-medium mb-1">Pick a repo, workspace, or workset</div>
-          <p className="text-xs text-ink-faint">
-            Workspaces are durable groups (an org / client / initiative) with
-            a health overview and bulk actions. Worksets are units of in-flight
-            work across repos. Repos are the per-repo working pane.
-          </p>
-        </div>
+        <NothingSelected />
       </main>
     );
   }
 
   return <WorksetView key={ws.id} worksetId={ws.id} />;
+}
+
+/// The main pane with nothing picked — usually after removing whatever was
+/// open. Says what each sidebar section is and offers the two ways in.
+function NothingSelected(): JSX.Element {
+  const repoCount = useStore((s) => s.repos.length);
+  const pickAndAddRepo = useStore((s) => s.pickAndAddRepo);
+  const setSheet = useStore((s) => s.setSheet);
+  const togglePalette = useStore((s) => s.togglePalette);
+  return (
+    <div className="max-w-md text-center">
+      <div className="text-base font-medium text-ink">Pick something from the sidebar</div>
+      <p className="mt-1.5 text-xs leading-relaxed text-ink-faint">
+        A <span className="text-ink-muted">repo</span> opens its changes, history and branches. A{' '}
+        <span className="text-ink-muted">workspace</span> is a lasting group with fetch-all and
+        reset-all. A <span className="text-ink-muted">workset</span> is one piece of work across
+        several repos — branch, commit and push them together.
+      </p>
+      <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
+        {repoCount === 0 ? (
+          <button
+            onClick={() => void pickAndAddRepo()}
+            className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong"
+          >
+            Add repos…
+          </button>
+        ) : (
+          <button
+            onClick={() => togglePalette()}
+            className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong"
+          >
+            Jump to… ({shortcutText(['Mod', 'K'])})
+          </button>
+        )}
+        <button
+          onClick={() => setSheet({ kind: 'basics' })}
+          className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
+        >
+          How overgit works
+        </button>
+      </div>
+    </div>
+  );
 }
 
 /// Workspace detail page. A durable-group overview: per-repo status

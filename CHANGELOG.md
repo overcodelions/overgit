@@ -6,6 +6,38 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- A first-run welcome screen. With nothing added yet, overgit explains repos,
+  workspaces and worksets, offers Add repos and Clone, and checks this machine
+  for git and the optional CLIs (gh, claude, codex, gemini), with a
+  copyable install command for anything missing. Add repos and Clone wait for
+  git, and the screen notices git being installed without a restart.
+- A Getting started checklist in the sidebar: add repos, make a workspace,
+  start a workset. It is derived from what you have, retires itself once
+  every step is done, and can be hidden.
+- Help sheets: How Overgit Works, Setup — Git and CLIs (live re-check), and
+  Keyboard Shortcuts (⌘/ or `?`). Each is reachable from a new native Help
+  menu and from the command palette, and each links to the others.
+- A native app menu, replacing Electron's default one: File → Add
+  Repositories… (⌘O) and Clone Repository… (⇧⌘O), View → Command Palette and
+  Toggle Sidebar, plus Documentation and Report an Issue under Help.
+- Command palette entries for Add repos, Clone a repo, New workspace and the
+  help sheets.
+- Settings → AI & Forges shows the git version and whether it is new
+  enough for Landing Check.
+
+### Changed
+
+- One shortcut list drives the Shortcuts sheet, Settings → Shortcuts and the
+  About sheet. Settings had been listing four repo tabs and missing ⌘P, ⌘F
+  and ⌘⏎.
+- The About sheet shows the real app version instead of a fixed "v0.1.0".
+- The empty main pane now says what each sidebar section is and offers a way
+  in, instead of a paragraph with no actions.
+- The menu no longer has View → Reload. Electron's default menu bound it to
+  ⌘R, the key overgit uses to refresh a pane.
+
 ## [0.3.0] - 2026-09-13
 
 ### Added

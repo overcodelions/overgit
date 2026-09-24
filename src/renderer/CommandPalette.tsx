@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import type { KeyboardEvent as ReactKeyboardEvent, Ref } from 'react';
 import { useStore } from './store';
 import type { BranchSummary, Repo, UUID, Workset } from '@shared/types';
+import { shortcutText } from './onboarding/shortcuts';
 
 // See App.tsx — stable empty fallback for Zustand selectors so React's
 // useSyncExternalStore snapshot equality holds across renders.
@@ -274,7 +275,7 @@ export function CommandPalette(): JSX.Element | null {
         <div className="flex-1 min-h-0 overflow-y-auto">
           {flat.length === 0 ? (
             <div className="px-4 py-6 text-xs text-ink-faint text-center">
-              No matches.
+              No matches. Try “help”, “shortcuts” or “add”.
             </div>
           ) : (
             sections.map((s) => (
@@ -701,8 +702,39 @@ function buildSections(args: BuildArgs): PaletteSection[] {
       },
     },
     {
+      id: 'add-repos',
+      title: 'Add repos…',
+      hint: `${shortcutText(['Mod', 'O'])} · a repo, or a folder of repos`,
+      glyph: '+',
+      perform: async () => {
+        actions.close();
+        await useStore.getState().pickAndAddRepo();
+      },
+    },
+    {
+      id: 'clone-repo',
+      title: 'Clone a repo…',
+      hint: 'From a URL, GitHub, GitLab or Bitbucket',
+      glyph: '⤓',
+      perform: () => {
+        actions.setSheet({ kind: 'cloneRepo' });
+        actions.close();
+      },
+    },
+    {
+      id: 'new-workspace',
+      title: 'New workspace…',
+      hint: 'A lasting group of repos',
+      glyph: '+',
+      perform: () => {
+        actions.setSheet({ kind: 'newWorkspace' });
+        actions.close();
+      },
+    },
+    {
       id: 'new-workset',
       title: 'New workset…',
+      hint: 'One piece of work across repos',
       glyph: '+',
       perform: () => {
         actions.setSheet({ kind: 'newWorkset' });
@@ -730,8 +762,60 @@ function buildSections(args: BuildArgs): PaletteSection[] {
       },
     },
   ];
-  for (const a of builtins) if (matches(a.title)) builtinItems.push(a);
+  for (const a of builtins) if (matches(a.title) || (a.hint && matches(a.hint))) builtinItems.push(a);
   if (builtinItems.length) sections.push({ label: 'App', items: builtinItems });
+
+  // Help. Hints double as search keywords, so "help", "guide", "install"
+  // or "keys" all find their way here.
+  const helpItems: PaletteItem[] = [];
+  const help: PaletteItem[] = [
+    {
+      id: 'help-basics',
+      title: 'How overgit works',
+      hint: 'help · guide · repos, workspaces and worksets',
+      glyph: '?',
+      perform: () => {
+        actions.setSheet({ kind: 'basics' });
+        actions.close();
+      },
+    },
+    {
+      id: 'help-setup',
+      title: 'Setup — git and CLIs',
+      hint: 'help · install · gh, claude, codex, gemini',
+      glyph: '⚒',
+      perform: () => {
+        actions.setSheet({ kind: 'setup' });
+        actions.close();
+      },
+    },
+    {
+      id: 'help-shortcuts',
+      title: 'Keyboard shortcuts',
+      hint: `${shortcutText(['Mod', '/'])} · help · keys`,
+      glyph: '⌨',
+      perform: () => {
+        actions.setSheet({ kind: 'shortcuts' });
+        actions.close();
+      },
+    },
+    {
+      id: 'help-about',
+      title: 'About overgit',
+      hint: 'help · version',
+      glyph: 'ⓘ',
+      perform: () => {
+        actions.setSheet({ kind: 'about' });
+        actions.close();
+      },
+    },
+  ];
+  // Unfiltered, the list is for jumping around; help only joins it once
+  // the user types, or when there's nothing else to jump to yet.
+  if (q || repos.length === 0) {
+    for (const a of help) if (matches(a.title) || (a.hint && matches(a.hint))) helpItems.push(a);
+  }
+  if (helpItems.length) sections.push({ label: 'Help', items: helpItems });
 
   // Files in the open repo. The full list can be 10k+ entries, so we
   // only render this section when the user has typed at least 2 chars —
