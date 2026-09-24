@@ -46,6 +46,8 @@ function repoStatus(id: string, dirtyCount: number): RepoStatus {
     aheadDefault: null,
     behindDefault: null,
     defaultRef: null,
+    inProgress: null,
+    conflicts: [],
   };
 }
 

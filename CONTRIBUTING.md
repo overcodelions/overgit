@@ -32,7 +32,7 @@ If you're hacking on overgit *in* overgit, prefer `npm start` over `npm run dev`
 
 1. Fork and branch from `main`.
 2. Keep PRs focused — one logical change per PR.
-3. Run `npm run build` and `npm test` before pushing.
+3. Run `npm run typecheck`, `npm run build` and `npm test` before pushing.
 4. Match existing style (TypeScript strict mode, no comments-for-comments-sake, prefer editing existing files).
 5. New IPC channels go through `IPCInvokeMap` in `src/shared/types.ts` so the preload stays type-safe.
 

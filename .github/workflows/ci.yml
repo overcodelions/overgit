@@ -54,7 +54,12 @@ jobs:
 
       - run: npm ci
 
-      - name: Typecheck + build
+      # Vite builds the renderer without type-checking it, and test files
+      # aren't in either build, so type-check the whole tree separately.
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
         run: npm run build
 
       - name: Tests
