@@ -1034,6 +1034,12 @@ function SettingsGeneralPanel(): JSX.Element {
     await window.overgit.invoke('store:saveSettings', next);
   };
 
+  const updateChannel = async (updateChannel: 'stable' | 'nightly') => {
+    const next = { ...settings, updateChannel };
+    useStore.setState({ settings: next });
+    await window.overgit.invoke('store:saveSettings', next);
+  };
+
   const updateExplainMode = async (explainMode: boolean) => {
     const next = { ...settings, explainMode };
     useStore.setState({ settings: next });
@@ -1105,6 +1111,28 @@ function SettingsGeneralPanel(): JSX.Element {
               }`}
             >
               {m[0].toUpperCase() + m.slice(1)}
+            </button>
+          ))}
+        </div>
+      </SettingsGroup>
+
+      <SettingsGroup
+        eyebrow="Updates"
+        title="Update channel"
+        subtitle="Overgit updates itself in the background and installs on quit. Stable follows tagged releases; Nightly follows the daily prerelease builds."
+      >
+        <div className="flex gap-2">
+          {(['stable', 'nightly'] as const).map((c) => (
+            <button
+              key={c}
+              onClick={() => updateChannel(c)}
+              className={`px-3 py-1.5 rounded-md border text-xs ${
+                (settings.updateChannel ?? 'stable') === c
+                  ? 'bg-accent text-white border-accent'
+                  : 'border-card hover:bg-card'
+              }`}
+            >
+              {c[0].toUpperCase() + c.slice(1)}
             </button>
           ))}
         </div>

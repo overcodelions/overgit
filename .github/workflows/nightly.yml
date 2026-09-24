@@ -14,6 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       should-build: ${{ steps.decide.outputs.should-build }}
+      nightly-version: ${{ steps.version.outputs.nightly-version }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -34,6 +35,20 @@ jobs:
             echo "No commits in last 24h — skipping nightly."
             echo "should-build=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - id: version
+        shell: bash
+        run: |
+          # Semver sorts a prerelease BELOW its own release: 0.4.1-nightly.x
+          # < 0.4.1. Stamping package.json's current version therefore builds
+          # a nightly that the matching stable release overtakes the moment it
+          # ships, and an installed nightly quietly walks back to stable on the
+          # next check. Bump the patch first so nightly always sorts above the
+          # newest tagged release: 0.4.2-nightly.x > 0.4.1.
+          NEXT_VERSION=$(node -p "const v=require('./package.json').version.split('-')[0].split('.').map(Number); v[2]+=1; v.join('.')")
+          DATE=$(date -u +%Y%m%d)
+          SHA=$(git rev-parse --short "${GITHUB_SHA}")
+          echo "nightly-version=${NEXT_VERSION}-nightly.${DATE}.${SHA}" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build (${{ matrix.os }})
@@ -68,16 +83,20 @@ jobs:
 
       - run: npm ci
 
-      - name: Stamp nightly version
+      - name: Stamp nightly version and publish channel
         shell: bash
         run: |
-          SHA=$(git rev-parse --short HEAD)
-          DATE=$(date -u +%Y%m%d)
+          # `channel` has to be set on the publish config, not inferred.
+          # electron-builder only derives a channel from the version's
+          # prerelease tag for the `generic` provider; for github it falls
+          # back to `latest`. Without this the nightly release ships
+          # latest*.yml — claiming to be the stable feed — and no
+          # nightly*.yml at all.
           node -e "
             const fs = require('fs');
             const p = require('./package.json');
-            const base = p.version.split('-')[0];
-            p.version = base + '-nightly.' + '${DATE}' + '.' + '${SHA}';
+            p.version = '${{ needs.check.outputs.nightly-version }}';
+            p.build.publish = p.build.publish.map((e) => ({ ...e, channel: 'nightly' }));
             fs.writeFileSync('package.json', JSON.stringify(p, null, 2) + '\n');
             console.log('version =', p.version);
           "
@@ -111,9 +130,9 @@ jobs:
             export CSC_IDENTITY_AUTO_DISCOVERY=false
           fi
           if [ "$RUNNER_OS" = "macOS" ]; then
-            npm run ${{ matrix.dist_script }} -- -c.mac.notarize=false
+            npm run ${{ matrix.dist_script }} -- -c.mac.notarize=false --publish never
           else
-            npm run ${{ matrix.dist_script }}
+            npm run ${{ matrix.dist_script }} -- --publish never
           fi
 
       - name: Upload artifacts (workflow run)
@@ -126,12 +145,13 @@ jobs:
             release/*.exe
             release/*.AppImage
             release/*.deb
+            release/*.yml
           if-no-files-found: ignore
           retention-days: 1
 
   release:
     name: Publish nightly release
-    needs: build
+    needs: [check, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -173,20 +193,23 @@ jobs:
 
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          tag_name: nightly
+          # A semver tag per build: electron-updater reads the version off
+          # the release tag, so a bare `nightly` tag is invisible to it.
+          # The movable `nightly` git tag above still marks the source.
+          tag_name: v${{ needs.check.outputs.nightly-version }}
           name: Nightly
           prerelease: true
           fail_on_unmatched_files: false
           body: |
             Auto-built nightly from commit `${{ github.sha }}`.
 
-            **Stable download links** (always point at the latest nightly):
-            - macOS (Apple Silicon): [`Overgit-nightly-mac-arm64.dmg`](https://github.com/${{ github.repository }}/releases/download/nightly/Overgit-nightly-mac-arm64.dmg)
-            - macOS (Intel): [`Overgit-nightly-mac-x64.dmg`](https://github.com/${{ github.repository }}/releases/download/nightly/Overgit-nightly-mac-x64.dmg)
-            - Windows (x64): [`Overgit-nightly-win-x64.exe`](https://github.com/${{ github.repository }}/releases/download/nightly/Overgit-nightly-win-x64.exe)
-            - Windows (ARM64): [`Overgit-nightly-win-arm64.exe`](https://github.com/${{ github.repository }}/releases/download/nightly/Overgit-nightly-win-arm64.exe)
-            - Linux (x64 AppImage): [`Overgit-nightly-linux-x64.AppImage`](https://github.com/${{ github.repository }}/releases/download/nightly/Overgit-nightly-linux-x64.AppImage)
-            - Linux (ARM64 AppImage): [`Overgit-nightly-linux-arm64.AppImage`](https://github.com/${{ github.repository }}/releases/download/nightly/Overgit-nightly-linux-arm64.AppImage)
+            **Downloads** for this nightly:
+            - macOS (Apple Silicon): [`Overgit-nightly-mac-arm64.dmg`](https://github.com/${{ github.repository }}/releases/download/v${{ needs.check.outputs.nightly-version }}/Overgit-nightly-mac-arm64.dmg)
+            - macOS (Intel): [`Overgit-nightly-mac-x64.dmg`](https://github.com/${{ github.repository }}/releases/download/v${{ needs.check.outputs.nightly-version }}/Overgit-nightly-mac-x64.dmg)
+            - Windows (x64): [`Overgit-nightly-win-x64.exe`](https://github.com/${{ github.repository }}/releases/download/v${{ needs.check.outputs.nightly-version }}/Overgit-nightly-win-x64.exe)
+            - Windows (ARM64): [`Overgit-nightly-win-arm64.exe`](https://github.com/${{ github.repository }}/releases/download/v${{ needs.check.outputs.nightly-version }}/Overgit-nightly-win-arm64.exe)
+            - Linux (x64 AppImage): [`Overgit-nightly-linux-x64.AppImage`](https://github.com/${{ github.repository }}/releases/download/v${{ needs.check.outputs.nightly-version }}/Overgit-nightly-linux-x64.AppImage)
+            - Linux (ARM64 AppImage): [`Overgit-nightly-linux-arm64.AppImage`](https://github.com/${{ github.repository }}/releases/download/v${{ needs.check.outputs.nightly-version }}/Overgit-nightly-linux-arm64.AppImage)
 
             > Pre-release. On macOS, nightlies are signed with the Developer ID when the
             > signing secrets are configured, but not notarized, so Gatekeeper may still
@@ -194,3 +217,19 @@ jobs:
           files: |
             artifacts/*
             stable/*
+
+      # Only the newest nightly should exist, so the nightly feed resolves to
+      # exactly one build. Also removes the pre-updater release that lived on
+      # the bare `nightly` tag (deleting a release leaves its git tag alone).
+      - name: Remove older nightly prereleases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_TAG: v${{ needs.check.outputs.nightly-version }}
+        run: |
+          gh release delete nightly --repo "${{ github.repository }}" --yes 2>/dev/null || true
+          gh release list --repo "${{ github.repository }}" --limit 100 --json tagName,isDraft,isPrerelease --jq '.[] | select(.isPrerelease == true and .isDraft == false) | .tagName' \
+            | while read -r tag; do
+                if [[ "$tag" == v*-nightly.* && "$tag" != "$CURRENT_TAG" ]]; then
+                  gh release delete "$tag" --repo "${{ github.repository }}" --yes --cleanup-tag
+                fi
+              done

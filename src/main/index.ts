@@ -118,6 +118,7 @@ import {
 } from './cli';
 import { listForgeRepos } from './forge';
 import { installAppMenu } from './menu';
+import { initAutoUpdater, quitAndInstall, refreshUpdateChannel } from './updater';
 import { ForgeKind, Identity, Repo, ResolvedIdentity } from '../shared/types';
 
 /// Resolve which identity should be applied (via env override) when
@@ -252,7 +253,11 @@ function registerIpc(): void {
   ipcMain.handle('store:saveRepos', (_e, repos) => Store.saveRepos(repos));
   ipcMain.handle('store:saveWorksets', (_e, worksets) => Store.saveWorksets(worksets));
   ipcMain.handle('store:saveWorkspaces', (_e, workspaces) => Store.saveWorkspaces(workspaces));
-  ipcMain.handle('store:saveSettings', (_e, settings) => Store.saveSettings(settings));
+  ipcMain.handle('store:saveSettings', (_e, settings) => {
+    Store.saveSettings(settings);
+    refreshUpdateChannel();
+  });
+  ipcMain.handle('update:quitAndInstall', () => quitAndInstall());
 
   // Async helper: add a repo and seed its `defaultBranch` from
   // `origin/HEAD` if available. Detection is best-effort — a fresh
@@ -1527,6 +1532,9 @@ app.whenReady().then(() => {
     mainWindow?.webContents.send('main:event', { kind: 'menu:command', command });
   });
   createWindow();
+  // Self-update from the GitHub Releases feed. No-op in dev and on
+  // unpackaged runs.
+  initAutoUpdater(() => mainWindow);
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
