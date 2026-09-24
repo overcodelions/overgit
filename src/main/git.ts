@@ -16,6 +16,7 @@ import {
   Commit,
   FileDiff,
   FileLogCommit,
+  GitInfo,
   GraphCommit,
   Identity,
   LfsStatus,
@@ -81,6 +82,16 @@ let gitVersionProbe: Promise<GitVersion | null> | null = null;
 export function gitVersion(): Promise<GitVersion | null> {
   gitVersionProbe ??= run(os.tmpdir(), ['--version']).then((r) => parseGitVersion(r.stdout));
   return gitVersionProbe;
+}
+
+/// Fresh probe for the first-run and Setup screens, which poll while git
+/// is missing. A found version also replaces the memo, so Landing Check
+/// picks up a git installed mid-session.
+export async function probeGitInfo(): Promise<GitInfo> {
+  const r = await run(os.tmpdir(), ['--version']);
+  const v = parseGitVersion(r.stdout);
+  if (v) gitVersionProbe = Promise.resolve(v);
+  return { installed: !!v, version: v?.text ?? null, landingCheck: supportsMergeTree(v) };
 }
 
 // A crashed or SIGKILL'd git leaves behind `<path>.lock` files

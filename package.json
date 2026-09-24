@@ -33,6 +33,7 @@
     "dist:mac": "npm run build && electron-builder --mac",
     "dist:win": "npm run build && electron-builder --win",
     "dist:linux": "npm run build && electron-builder --linux",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.main.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "security:aws-account-ids": "node scripts/check-no-aws-account-ids.mjs",

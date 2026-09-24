@@ -12,7 +12,7 @@
 
 ## Checklist
 
-- [ ] `npm run build` passes
+- [ ] `npm run typecheck` and `npm run build` pass
 - [ ] `npm test` passes
 - [ ] One logical change per PR
 - [ ] If this touches an IPC channel, it's wired through `IPCInvokeMap` in `src/shared/types.ts`

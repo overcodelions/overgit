@@ -11,6 +11,7 @@ import type {
   BranchSummary,
   CheckoutOutcome,
   CliPresence,
+  GitInfo,
   Commit,
   CommitAllOutcome,
   FileDiff,
@@ -41,6 +42,11 @@ import type {
 export type Sheet =
   | { kind: 'settings' }
   | { kind: 'about' }
+  /// Help → How overgit works: the three nouns and the safety model.
+  | { kind: 'basics' }
+  /// Help → Setup: git plus the optional CLIs, with install commands.
+  | { kind: 'setup' }
+  | { kind: 'shortcuts' }
   | { kind: 'newWorkset' }
   | { kind: 'editWorkset'; worksetId: UUID }
   | { kind: 'reviewChanges'; repoId: UUID; scope: 'staged' | 'working' }
@@ -175,6 +181,11 @@ interface UiState {
   /// an override in one has to move the banner in the other immediately.
   repoIdentity: Record<UUID, ResolvedIdentity>;
   cliPresence: CliPresence | null;
+  /// Null until the first probe answers. The first-run screen reads
+  /// "not probed yet" as "checking", never as "missing".
+  gitInfo: GitInfo | null;
+  /// From `app.getVersion()`, for the About sheet. Empty until hydrate.
+  appVersion: string;
 
   /// Currently open file in the in-app editor. Per-repo we'd allow many
   /// open files in the future; for v1 a single open slot keeps the UI
@@ -212,6 +223,11 @@ interface UiState {
   learningHint: { command: string; plain: string } | null;
 
   hydrate: () => Promise<void>;
+  /// Re-probe git and every optional CLI. The Setup sheet and the
+  /// first-run screen call it on focus and on "Check again" so a tool
+  /// installed in a terminal shows up without restarting overgit.
+  refreshTooling: () => Promise<void>;
+  dismissGettingStarted: () => Promise<void>;
   pickAndAddRepo: () => Promise<void>;
   /// Run `git init` at `path` (with optional initial branch) and add the
   /// resulting repo to the library. Used by the InitRepo sheet that the
@@ -595,6 +611,8 @@ export const useStore = create<UiState>((set, get) => ({
   repoStashes: {},
   repoIdentity: {},
   cliPresence: null,
+  gitInfo: null,
+  appVersion: '',
   lastCheckout: null,
   learningHint: null,
   openFile: null,
@@ -610,7 +628,11 @@ export const useStore = create<UiState>((set, get) => ({
 
   hydrate: async () => {
     const snap: StoreSnapshot = await window.overgit.invoke('store:load');
-    const cli = await window.overgit.invoke('cli:detect');
+    const [cli, gitInfo, appVersion] = await Promise.all([
+      window.overgit.invoke('cli:detect'),
+      window.overgit.invoke('git:info'),
+      window.overgit.invoke('app:version'),
+    ]);
     // Auto-select something on launch so a fresh user doesn't land on
     // the empty "Pick a …" pane when there's clearly content. Order:
     //   1. keep the user's last selection if it still exists,
@@ -631,6 +653,8 @@ export const useStore = create<UiState>((set, get) => ({
       workspaces,
       settings: snap.settings,
       cliPresence: cli,
+      gitInfo,
+      appVersion,
     });
     if (!haveSelection) {
       if (workspaces.length > 0) {
@@ -652,6 +676,20 @@ export const useStore = create<UiState>((set, get) => ({
     window.setTimeout(() => {
       void get().refreshAllRepoStatuses(true);
     }, 600);
+  },
+
+  refreshTooling: async () => {
+    const [cli, gitInfo] = await Promise.all([
+      window.overgit.invoke('cli:detect'),
+      window.overgit.invoke('git:info'),
+    ]);
+    set({ cliPresence: cli, gitInfo });
+  },
+
+  dismissGettingStarted: async () => {
+    const next = { ...get().settings, gettingStartedDismissed: true };
+    set({ settings: next });
+    await window.overgit.invoke('store:saveSettings', next);
   },
 
   pickAndAddRepo: async () => {

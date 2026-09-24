@@ -9,6 +9,7 @@ import { randomUUID } from 'node:crypto';
 import { Store } from './store';
 import {
   abandonLocalPreview,
+  probeGitInfo,
   abortCherryPick,
   abortMerge,
   abortRebase,
@@ -116,6 +117,7 @@ import {
   suggestCommitMessage,
 } from './cli';
 import { listForgeRepos } from './forge';
+import { installAppMenu } from './menu';
 import { ForgeKind, Identity, Repo, ResolvedIdentity } from '../shared/types';
 
 /// Resolve which identity should be applied (via env override) when
@@ -1382,6 +1384,8 @@ function registerIpc(): void {
   });
 
   ipcMain.handle('cli:detect', () => detectCliPresence());
+  ipcMain.handle('git:info', () => probeGitInfo());
+  ipcMain.handle('app:version', () => app.getVersion());
 
   ipcMain.handle(
     'cli:reviewChanges',
@@ -1519,6 +1523,9 @@ app.whenReady().then(() => {
     }
   }
   registerIpc();
+  installAppMenu((command) => {
+    mainWindow?.webContents.send('main:event', { kind: 'menu:command', command });
+  });
   createWindow();
 
   app.on('activate', () => {
