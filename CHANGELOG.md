@@ -6,6 +6,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-23
+
+### Fixed
+
+- The macOS app icon showed as coloured noise in Finder's list view and the
+  Applications folder. electron-builder's conversion of `icon.png` garbled
+  the 16×16 and 32×32 images; the app now ships an `.icns` built with
+  Apple's `iconutil`, correct at every size.
+
 ## [0.4.0] - 2026-09-23
 
 ### Added
@@ -171,7 +180,8 @@ Initial public release. Building in the open from here.
 - Per-lane colored branch graph with ref labels.
 - Resizable sidebar, light / dark / system theme, keyboard shortcuts.
 
-[Unreleased]: https://github.com/overcodelions/overgit/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/overcodelions/overgit/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/overcodelions/overgit/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/overcodelions/overgit/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/overcodelions/overgit/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/overcodelions/overgit/compare/v0.1.0...v0.2.0
