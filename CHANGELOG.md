@@ -6,6 +6,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- The app mark still broke up at the smallest sizes: the branch graph's
+  ring nodes closed up and its strokes thinned to about two device pixels.
+  16–32px icons now use a heavier cut with solid nodes
+  (`build/icon-small.svg`), and the in-app mark switches to heavier strokes
+  below 64px. The dock icon gains the family's shade, rim and drop shadow,
+  and the in-app mark is now the app icon's white tile instead of a purple
+  one, so the window and the Dock match.
+
 ## [0.4.2] - 2026-09-23
 
 ### Added

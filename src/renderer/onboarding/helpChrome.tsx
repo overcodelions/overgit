@@ -5,30 +5,48 @@
 import { useState } from 'react';
 import { keyLabel } from './shortcuts';
 
+/// The app mark: the branch graph on the white tile. Same drawing as
+/// build/icon.svg, minus the dock finish (shade, rim, drop shadow): in the
+/// UI a CSS shadow does that job. The viewBox is cropped to the tile so the
+/// shadow hugs it.
+/// Below 64px the dock drawing's strokes fall to about two device pixels
+/// on a 1x screen and break up, so small marks use a heavier cut of the
+/// same shape.
 export function AppMark({ size = 80 }: { size?: number }): JSX.Element {
-  const glyph = Math.round(size * 0.525);
+  const small = size < 64;
   return (
-    <div
-      className="relative flex items-center justify-center rounded-[25%] border border-card bg-gradient-to-br from-accent/55 via-accent/20 to-accent/5 shadow-[0_12px_24px_rgba(0,0,0,0.28)] flex-shrink-0"
-      style={{ width: size, height: size }}
+    <svg
+      width={size}
+      height={size}
+      viewBox="100 100 824 824"
+      className="flex-shrink-0 rounded-[22%] shadow-sm"
+      aria-label="overgit"
     >
-      <div className="absolute inset-[6%] rounded-[20%] border border-ink/5 bg-surface/30" />
-      <svg width={glyph} height={glyph} viewBox="0 0 42 42" fill="none" className="relative">
-        {/* Stylized branch glyph: trunk + fork. Reads as "git" without
-            being literal. White-on-purple keeps it punchy in dark mode. */}
-        <circle cx="13" cy="11" r="3.5" stroke="currentColor" strokeWidth="2.5" className="text-ink" />
-        <circle cx="13" cy="31" r="3.5" stroke="currentColor" strokeWidth="2.5" className="text-ink" />
-        <circle cx="29" cy="21" r="3.5" stroke="currentColor" strokeWidth="2.5" className="text-ink" />
-        <path d="M13 14.5 V 27.5" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" className="text-ink" />
-        <path
-          d="M13 21 Q 21 21 25.5 21"
-          stroke="currentColor"
+      <rect x="100" y="100" width="824" height="824" rx="185" ry="185" fill="#ffffff" />
+      {small ? (
+        <g fill="none" stroke="#111113" strokeWidth="64" strokeLinecap="round">
+          <circle cx="360" cy="320" r="74" />
+          <circle cx="360" cy="704" r="74" />
+          <circle cx="672" cy="512" r="74" />
+          <path d="M360 394 V 630" />
+          <path d="M360 512 H 598" />
+        </g>
+      ) : (
+        <g
+          transform="translate(134 134) scale(18)"
+          fill="none"
+          stroke="#111113"
           strokeWidth="2.5"
           strokeLinecap="round"
-          className="text-ink"
-        />
-      </svg>
-    </div>
+        >
+          <circle cx="13" cy="11" r="3.5" />
+          <circle cx="13" cy="31" r="3.5" />
+          <circle cx="29" cy="21" r="3.5" />
+          <path d="M13 14.5 V 27.5" />
+          <path d="M13 21 Q 21 21 25.5 21" />
+        </g>
+      )}
+    </svg>
   );
 }
 
