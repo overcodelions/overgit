@@ -1,6 +1,5 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useStore } from './store';
-import { FileEditor } from './FileEditor';
 import { BranchPicker } from './BranchPicker';
 import { Explain } from './Explain';
 import { Spinner } from './Spinner';
@@ -42,6 +41,13 @@ function joinRepoPath(repoRoot: string, relPath: string): string {
 }
 
 type Tab = 'changes' | 'history' | 'files' | 'stash' | 'branches';
+
+// Deferred: the Files tab pulls in CodeMirror and its 34 language
+// grammars, and most sessions never open it — the default tab is
+// `changes`. Lazy-loading keeps that weight out of the entry chunk.
+const FileEditor = lazy(() =>
+  import('./FileEditor').then((m) => ({ default: m.FileEditor })),
+);
 
 /// Plain-English mapping for the per-file row action buttons in
 /// FileGroup. Centralized here because the FileGroup is generic over
@@ -121,7 +127,11 @@ export function RepoDetail({ repoId }: { repoId: UUID }): JSX.Element {
       <Tabs tab={tab} onChange={setTab} />
       {tab === 'changes' && <ChangesTab repoId={repoId} />}
       {tab === 'history' && <HistoryTab repoId={repoId} />}
-      {tab === 'files' && <FileEditor repoId={repoId} />}
+      {tab === 'files' && (
+        <Suspense fallback={<Spinner />}>
+          <FileEditor repoId={repoId} />
+        </Suspense>
+      )}
       {tab === 'stash' && <StashTab repoId={repoId} />}
       {tab === 'branches' && <BranchesTab repoId={repoId} />}
     </main>
