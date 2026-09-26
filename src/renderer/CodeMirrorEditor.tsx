@@ -14,130 +14,94 @@ import {
 import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
 import { tags as t } from '@lezer/highlight';
 
-// Tier 1: dedicated language packages (full Lezer parsers).
-import { cpp } from '@codemirror/lang-cpp';
-import { css } from '@codemirror/lang-css';
-import { go } from '@codemirror/lang-go';
-import { html } from '@codemirror/lang-html';
-import { java } from '@codemirror/lang-java';
-import { javascript } from '@codemirror/lang-javascript';
-import { json } from '@codemirror/lang-json';
-import { markdown } from '@codemirror/lang-markdown';
-import { php } from '@codemirror/lang-php';
-import { python } from '@codemirror/lang-python';
-import { rust } from '@codemirror/lang-rust';
-import { sql } from '@codemirror/lang-sql';
-import { vue } from '@codemirror/lang-vue';
-import { xml } from '@codemirror/lang-xml';
-import { yaml } from '@codemirror/lang-yaml';
-
-// Tier 2: legacy stream modes for the long tail. Each is a tiny tokenizer,
-// not a full parser, but the highlighting is still significantly better
-// than the old hljs overlay + a real caret instead of a layered fake.
-import { clojure } from '@codemirror/legacy-modes/mode/clojure';
-import { cmake } from '@codemirror/legacy-modes/mode/cmake';
-import { dockerFile } from '@codemirror/legacy-modes/mode/dockerfile';
-import { erlang } from '@codemirror/legacy-modes/mode/erlang';
-import { groovy } from '@codemirror/legacy-modes/mode/groovy';
-import { haskell } from '@codemirror/legacy-modes/mode/haskell';
-import { lua } from '@codemirror/legacy-modes/mode/lua';
-import { perl } from '@codemirror/legacy-modes/mode/perl';
-import { powerShell } from '@codemirror/legacy-modes/mode/powershell';
-import { properties } from '@codemirror/legacy-modes/mode/properties';
-import { protobuf } from '@codemirror/legacy-modes/mode/protobuf';
-import { r } from '@codemirror/legacy-modes/mode/r';
-import { ruby } from '@codemirror/legacy-modes/mode/ruby';
-import { sCSS as sassMode, less as lessMode } from '@codemirror/legacy-modes/mode/css';
-import { shell } from '@codemirror/legacy-modes/mode/shell';
-import { swift } from '@codemirror/legacy-modes/mode/swift';
-import { toml } from '@codemirror/legacy-modes/mode/toml';
-
 /// Map our extension-derived language ids (see LANGUAGE_BY_EXT in
 /// FileEditor) to a CodeMirror Extension. Unknown ids return [], which is
 /// CM's idiomatic "no language" — the file still renders, just without
-/// syntax colors.
-function languageExtension(id: string | null): Extension {
+/// syntax colors. Each grammar is its own dynamic import so opening a file
+/// only pulls in the one language package it needs, instead of bundling
+/// all 34 into the entry chunk.
+async function languageExtension(id: string | null): Promise<Extension> {
   if (!id) return [];
   switch (id) {
     // Tier 1 — full parsers
     case 'typescript':
-      return javascript({ typescript: true, jsx: true });
+      return (await import('@codemirror/lang-javascript')).javascript({ typescript: true, jsx: true });
     case 'javascript':
-      return javascript({ jsx: true });
+      return (await import('@codemirror/lang-javascript')).javascript({ jsx: true });
     case 'json':
-      return json();
+      return (await import('@codemirror/lang-json')).json();
     case 'yaml':
-      return yaml();
+      return (await import('@codemirror/lang-yaml')).yaml();
     case 'html':
-      return html();
+      return (await import('@codemirror/lang-html')).html();
     case 'css':
-      return css();
+      return (await import('@codemirror/lang-css')).css();
     case 'markdown':
-      return markdown();
+      return (await import('@codemirror/lang-markdown')).markdown();
     case 'python':
-      return python();
+      return (await import('@codemirror/lang-python')).python();
     case 'rust':
-      return rust();
+      return (await import('@codemirror/lang-rust')).rust();
     case 'go':
-      return go();
+      return (await import('@codemirror/lang-go')).go();
     case 'java':
-      return java();
+      return (await import('@codemirror/lang-java')).java();
     case 'cpp':
     case 'c':
-      return cpp();
+      return (await import('@codemirror/lang-cpp')).cpp();
     case 'csharp':
-      return cpp(); // close enough syntactically; no dedicated CM6 C# pkg
+      return (await import('@codemirror/lang-cpp')).cpp(); // close enough syntactically; no dedicated CM6 C# pkg
     case 'sql':
-      return sql();
+      return (await import('@codemirror/lang-sql')).sql();
     case 'xml':
-      return xml();
+      return (await import('@codemirror/lang-xml')).xml();
     case 'php':
-      return php();
+      return (await import('@codemirror/lang-php')).php();
     case 'vue':
     case 'svelte':
-      return vue();
+      return (await import('@codemirror/lang-vue')).vue();
     // Tier 2 — stream modes
     case 'bash':
-      return new LanguageSupport(StreamLanguage.define(shell));
+      return new LanguageSupport(StreamLanguage.define((await import('@codemirror/legacy-modes/mode/shell')).shell));
     case 'powershell':
-      return new LanguageSupport(StreamLanguage.define(powerShell));
+      return new LanguageSupport(StreamLanguage.define((await import('@codemirror/legacy-modes/mode/powershell')).powerShell));
     case 'ruby':
-      return new LanguageSupport(StreamLanguage.define(ruby));
+      return new LanguageSupport(StreamLanguage.define((await import('@codemirror/legacy-modes/mode/ruby')).ruby));
     case 'perl':
-      return new LanguageSupport(StreamLanguage.define(perl));
+      return new LanguageSupport(StreamLanguage.define((await import('@codemirror/legacy-modes/mode/perl')).perl));
     case 'lua':
-      return new LanguageSupport(StreamLanguage.define(lua));
+      return new LanguageSupport(StreamLanguage.define((await import('@codemirror/legacy-modes/mode/lua')).lua));
     case 'swift':
-      return new LanguageSupport(StreamLanguage.define(swift));
+      return new LanguageSupport(StreamLanguage.define((await import('@codemirror/legacy-modes/mode/swift')).swift));
     case 'kotlin':
     case 'scala':
     case 'groovy':
-      return new LanguageSupport(StreamLanguage.define(groovy));
+      return new LanguageSupport(StreamLanguage.define((await import('@codemirror/legacy-modes/mode/groovy')).groovy));
     case 'ini':
-      return new LanguageSupport(StreamLanguage.define(properties));
+      return new LanguageSupport(StreamLanguage.define((await import('@codemirror/legacy-modes/mode/properties')).properties));
     case 'toml':
-      return new LanguageSupport(StreamLanguage.define(toml));
+      return new LanguageSupport(StreamLanguage.define((await import('@codemirror/legacy-modes/mode/toml')).toml));
     case 'dockerfile':
-      return new LanguageSupport(StreamLanguage.define(dockerFile));
+      return new LanguageSupport(StreamLanguage.define((await import('@codemirror/legacy-modes/mode/dockerfile')).dockerFile));
     case 'cmake':
-      return new LanguageSupport(StreamLanguage.define(cmake));
+      return new LanguageSupport(StreamLanguage.define((await import('@codemirror/legacy-modes/mode/cmake')).cmake));
     case 'makefile':
-      return new LanguageSupport(StreamLanguage.define(shell));
+      return new LanguageSupport(StreamLanguage.define((await import('@codemirror/legacy-modes/mode/shell')).shell));
     case 'r':
-      return new LanguageSupport(StreamLanguage.define(r));
+      return new LanguageSupport(StreamLanguage.define((await import('@codemirror/legacy-modes/mode/r')).r));
     case 'erlang':
-      return new LanguageSupport(StreamLanguage.define(erlang));
+      return new LanguageSupport(StreamLanguage.define((await import('@codemirror/legacy-modes/mode/erlang')).erlang));
     case 'haskell':
-      return new LanguageSupport(StreamLanguage.define(haskell));
+      return new LanguageSupport(StreamLanguage.define((await import('@codemirror/legacy-modes/mode/haskell')).haskell));
     case 'clojure':
-      return new LanguageSupport(StreamLanguage.define(clojure));
+      return new LanguageSupport(StreamLanguage.define((await import('@codemirror/legacy-modes/mode/clojure')).clojure));
     case 'protobuf':
-      return new LanguageSupport(StreamLanguage.define(protobuf));
+      return new LanguageSupport(StreamLanguage.define((await import('@codemirror/legacy-modes/mode/protobuf')).protobuf));
     case 'scss':
     case 'sass':
-      return new LanguageSupport(StreamLanguage.define(sassMode));
+      return new LanguageSupport(StreamLanguage.define((await import('@codemirror/legacy-modes/mode/css')).sCSS));
     case 'less':
-      return new LanguageSupport(StreamLanguage.define(lessMode));
+      return new LanguageSupport(StreamLanguage.define((await import('@codemirror/legacy-modes/mode/css')).less));
     default:
       return [];
   }
@@ -337,6 +301,9 @@ export function CodeMirrorEditor({
   // undo history, scroll position, and the caret.
   useEffect(() => {
     if (!containerRef.current) return;
+    // The compartment starts empty — the initial grammar arrives via the
+    // language-swap effect below, which also runs on mount, so the first
+    // file still gets highlighted once its chunk resolves.
     const state = EditorState.create({
       doc: content,
       extensions: [
@@ -363,7 +330,7 @@ export function CodeMirrorEditor({
           ...historyKeymap,
           indentWithTab,
         ]),
-        languageCompartment.current.of(languageExtension(language)),
+        languageCompartment.current.of([]),
         EditorView.updateListener.of((u) => {
           if (u.docChanged) onChangeRef.current(u.state.doc.toString());
         }),
@@ -394,13 +361,23 @@ export function CodeMirrorEditor({
   }, [content]);
 
   // Language swap — reconfigure the compartment in place so the editor
-  // keeps its scroll/selection state.
+  // keeps its scroll/selection state. The grammar itself now loads via a
+  // dynamic import, so guard the dispatch: a fast file switch can let a
+  // stale grammar resolve after a newer one has already started loading,
+  // and the view can be destroyed (unmount) before the import settles.
   useEffect(() => {
     const view = viewRef.current;
     if (!view) return;
-    view.dispatch({
-      effects: languageCompartment.current.reconfigure(languageExtension(language)),
+    let cancelled = false;
+    languageExtension(language).then((ext) => {
+      if (cancelled || viewRef.current !== view) return;
+      view.dispatch({
+        effects: languageCompartment.current.reconfigure(ext),
+      });
     });
+    return () => {
+      cancelled = true;
+    };
   }, [language]);
 
   return <div ref={containerRef} className="h-full w-full overflow-hidden" />;
