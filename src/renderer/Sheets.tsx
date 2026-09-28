@@ -5650,6 +5650,17 @@ function AbandonLocalSheet({ repoId }: { repoId: UUID }): JSX.Element {
   );
 }
 
+/// A skip-worktree / assume-unchanged flag cleared during recovery
+/// couldn't be restored, so a normally hidden file now shows in Changes.
+function PullForceWarning({ text }: { text: string }): JSX.Element {
+  return (
+    <div className="rounded border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
+      <div className="font-semibold mb-1">Hidden file is now visible</div>
+      <pre className="whitespace-pre-wrap font-mono">{text}</pre>
+    </div>
+  );
+}
+
 function PullConflictSheet({
   repoId,
   conflicts,
@@ -5666,6 +5677,7 @@ function PullConflictSheet({
   const [busy, setBusy] = useState<'stash' | 'discard' | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<{ stashed: boolean } | null>(null);
+  const [warning, setWarning] = useState<string | null>(null);
 
   const fileWord = conflicts.length === 1 ? 'file' : 'files';
 
@@ -5681,8 +5693,10 @@ function PullConflictSheet({
     }
     setBusy(strategy);
     setError(null);
+    setWarning(null);
     try {
       const res = await pullForce(repoId, conflicts, strategy);
+      setWarning(res.warning ?? null);
       if (!res.ok) {
         setError(res.error ?? 'Pull failed');
         return;
@@ -5721,6 +5735,7 @@ function PullConflictSheet({
               Stash tab when you're ready to bring those edits back.
             </p>
           )}
+          {warning && <PullForceWarning text={warning} />}
         </div>
         <div className="px-5 py-3 border-t border-card flex justify-end">
           <button
@@ -5812,6 +5827,8 @@ function PullConflictSheet({
             <pre className="whitespace-pre-wrap font-mono">{error}</pre>
           </div>
         )}
+
+        {warning && <PullForceWarning text={warning} />}
 
         <details className="text-[10px] text-ink-faint">
           <summary className="cursor-pointer hover:text-ink-muted">

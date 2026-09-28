@@ -2905,6 +2905,105 @@ export async function pull(
   };
 }
 
+export type IndexFlags = { path: string; skipWorktree: boolean; assumeUnchanged: boolean };
+
+/// Index entries for `paths` with their skip-worktree / assume-unchanged
+/// bits. `ls-files -v` tags skip-worktree entries "S" (or "s") and
+/// assume-unchanged ones with a lowercase letter. Paths not in the
+/// index are absent from the result.
+async function indexFlags(repoPath: string, paths: string[]): Promise<IndexFlags[] | null> {
+  const res = await run(repoPath, [
+    'ls-files',
+    '-v',
+    '-z',
+    '--',
+    ...paths.map((p) => `:(literal)${p}`),
+  ]);
+  if (!res.ok) return null;
+  const out: IndexFlags[] = [];
+  for (const entry of res.stdout.split('\0')) {
+    if (entry.length < 3) continue;
+    const tag = entry[0];
+    out.push({
+      path: entry.slice(2),
+      skipWorktree: tag === 'S' || tag === 's',
+      assumeUnchanged: tag !== tag.toUpperCase(),
+    });
+  }
+  return out;
+}
+
+/// Which of `paths` carry skip-worktree or assume-unchanged — files
+/// whose local edits git hides from status, stash and checkout.
+export async function hiddenIndexFlags(repoPath: string, paths: string[]): Promise<IndexFlags[]> {
+  const entries = await indexFlags(repoPath, paths);
+  return (entries ?? []).filter((e) => e.skipWorktree || e.assumeUnchanged);
+}
+
+/// Set (`on`) or clear the flags in `flagged`. One call per flag —
+/// `update-index` applies only the last mode flag it's given. Returns
+/// git's error, or null on success.
+async function setIndexFlags(
+  repoPath: string,
+  flagged: IndexFlags[],
+  on: boolean,
+): Promise<string | null> {
+  const calls: [string, string[]][] = [
+    ['skip-worktree', flagged.filter((f) => f.skipWorktree).map((f) => f.path)],
+    ['assume-unchanged', flagged.filter((f) => f.assumeUnchanged).map((f) => f.path)],
+  ];
+  for (const [flag, paths] of calls) {
+    if (!paths.length) continue;
+    const res = await run(repoPath, ['update-index', `--${on ? '' : 'no-'}${flag}`, '--', ...paths]);
+    if (!res.ok) return res.stderr.trim() || `git update-index exited ${res.code}`;
+  }
+  return null;
+}
+
+/// Quote a path for a copy-pasteable shell command, only when needed.
+function shellQuote(p: string): string {
+  return /^[\w./@+-]+$/.test(p) ? p : `'${p.replace(/'/g, `'\\''`)}'`;
+}
+
+/// Re-apply flags cleared by `pullForce`, touching only the ones that
+/// are actually missing now — so a clear that never happened (index
+/// locked) isn't reported as a failed restore. A path the pull removed
+/// from the index has nothing to flag and is skipped. Returns a
+/// user-facing warning when git refuses, since the file then shows up
+/// in Changes and could be committed by accident.
+export async function restoreIndexFlags(
+  repoPath: string,
+  flagged: IndexFlags[],
+): Promise<string | null> {
+  if (!flagged.length) return null;
+  const current = await indexFlags(repoPath, flagged.map((f) => f.path));
+  const now = new Map((current ?? []).map((e) => [e.path, e]));
+  const missing: IndexFlags[] = [];
+  for (const f of flagged) {
+    const cur = now.get(f.path);
+    if (current && !cur) continue;
+    const skipWorktree = f.skipWorktree && !cur?.skipWorktree;
+    const assumeUnchanged = f.assumeUnchanged && !cur?.assumeUnchanged;
+    if (skipWorktree || assumeUnchanged) missing.push({ path: f.path, skipWorktree, assumeUnchanged });
+  }
+  if (!missing.length) return null;
+  const err = await setIndexFlags(repoPath, missing, true);
+  if (!err) return null;
+  const fix = (
+    [
+      ['skip-worktree', missing.filter((f) => f.skipWorktree)],
+      ['assume-unchanged', missing.filter((f) => f.assumeUnchanged)],
+    ] as const
+  )
+    .filter(([, fs]) => fs.length)
+    .map(([flag, fs]) => `git update-index --${flag} -- ${fs.map((f) => shellQuote(f.path)).join(' ')}`)
+    .join('\n');
+  return (
+    `Couldn't re-hide ${missing.map((f) => f.path).join(', ')} from git — ` +
+    `local edits will now show in Changes. To hide again, run:\n${fix}\n\n${err}`
+  );
+}
+
 /// Recovery flow when pull is blocked by local changes. Two strategies:
 ///   stash    → `git stash push --include-untracked -m "auto: pull" -- <paths>`
 ///              then pull. The stash stays around so the user can pop
@@ -2912,11 +3011,20 @@ export async function pull(
 ///   discard  → `git checkout HEAD -- <paths>` then pull. Destructive
 ///              (the local changes are gone), so the renderer must
 ///              confirm before calling.
+export type PullForceResult = {
+  ok: boolean;
+  error?: string;
+  stashed?: boolean;
+  /// Set when a skip-worktree / assume-unchanged flag cleared for the
+  /// recovery couldn't be put back.
+  warning?: string;
+};
+
 export async function pullForce(
   repoPath: string,
   conflicts: string[],
   strategy: 'stash' | 'discard',
-): Promise<{ ok: boolean; error?: string; stashed?: boolean }> {
+): Promise<PullForceResult> {
   if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
   if (conflicts.length === 0) return { ok: false, error: 'No conflicting paths' };
   // Validate paths against the repo root the same way applyStashForce
@@ -2929,6 +3037,29 @@ export async function pullForce(
     }
   }
 
+  // A path flagged skip-worktree or assume-unchanged hides its local
+  // edits from status/stash/checkout, yet merge still refuses to
+  // overwrite it — so neither strategy could touch it. Clear the flags
+  // for the duration of the recovery and put them back afterwards.
+  const flagged = await hiddenIndexFlags(repoPath, conflicts);
+  let result: PullForceResult;
+  const clearErr = await setIndexFlags(repoPath, flagged, false);
+  if (clearErr) {
+    result = { ok: false, error: clearErr };
+  } else {
+    result = await pullForceUnflagged(repoPath, conflicts, strategy);
+  }
+  // Restore even when clearing failed partway — one flag may already
+  // be off.
+  const warning = await restoreIndexFlags(repoPath, flagged);
+  return warning ? { ...result, warning } : result;
+}
+
+async function pullForceUnflagged(
+  repoPath: string,
+  conflicts: string[],
+  strategy: 'stash' | 'discard',
+): Promise<PullForceResult> {
   if (strategy === 'stash') {
     const stash = await run(repoPath, [
       'stash',

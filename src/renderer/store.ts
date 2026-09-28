@@ -437,7 +437,7 @@ interface UiState {
     id: UUID,
     conflicts: string[],
     strategy: 'stash' | 'discard',
-  ) => Promise<{ ok: boolean; error?: string; stashed?: boolean }>;
+  ) => Promise<{ ok: boolean; error?: string; stashed?: boolean; warning?: string }>;
   fetchRepo: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
   checkoutRepo: (id: UUID, branch: string, createIfMissing: boolean) => Promise<CheckoutOutcome>;
   createRepoBranch: (
