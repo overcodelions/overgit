@@ -1050,13 +1050,28 @@ export async function status(
   // rides along in the same wave even though we only *use* it when
   // HEAD isn't the default branch. Resolving it separately would add
   // a whole extra round-trip to every repo on the hot path.
-  const [porcelainRes, shortstatRes, resolvedDefaultRef] = await Promise.all([
-    run(repoPath, ['status', '--porcelain=v2', '--branch']),
-    run(repoPath, ['diff', '--shortstat', 'HEAD']),
-    defaultBranch
-      ? resolveDefaultRef(repoPath, defaultBranch)
-      : Promise.resolve(null),
-  ]);
+  // Speculative ahead/behind-default: `origin/<default>` is the common
+  // case resolveDefaultRef lands on, so fire the comparison against it in
+  // the same wave instead of waiting on that resolution first. When HEAD
+  // *is* the default branch (or the ref turns out to be local-only) this
+  // result is discarded below — cheap relative to the round trip it saves
+  // everywhere else.
+  const [porcelainRes, shortstatRes, resolvedDefaultRef, speculativeRevList] =
+    await Promise.all([
+      run(repoPath, ['status', '--porcelain=v2', '--branch']),
+      run(repoPath, ['diff', '--shortstat', 'HEAD']),
+      defaultBranch
+        ? resolveDefaultRef(repoPath, defaultBranch)
+        : Promise.resolve(null),
+      defaultBranch && isSafeRefArg(defaultBranch)
+        ? run(repoPath, [
+            'rev-list',
+            '--left-right',
+            '--count',
+            `origin/${defaultBranch}...HEAD`,
+          ])
+        : Promise.resolve(null),
+    ]);
 
   const parsed = parsePorcelainV2(porcelainRes.stdout);
   const branch = parsed.branch;
@@ -1095,12 +1110,19 @@ export async function status(
   if (defaultBranch && branch && branch !== defaultBranch) {
     const ref = resolvedDefaultRef;
     if (ref) {
-      const cmp = await run(repoPath, [
-        'rev-list',
-        '--left-right',
-        '--count',
-        `${ref}...HEAD`,
-      ]);
+      // The speculative rev-list above already covers the common case
+      // (origin/<default>); only spawn the sequential fallback when the
+      // resolved ref is the local default instead (no origin/<default>,
+      // e.g. a local-only repo).
+      const cmp =
+        ref === `origin/${defaultBranch}` && speculativeRevList
+          ? speculativeRevList
+          : await run(repoPath, [
+              'rev-list',
+              '--left-right',
+              '--count',
+              `${ref}...HEAD`,
+            ]);
       if (cmp.ok) {
         const [b, a] = cmp.stdout
           .trim()
