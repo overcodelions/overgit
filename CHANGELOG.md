@@ -6,6 +6,23 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-09-27
+
+### Added
+
+- A loading screen shows the app mark while Overgit starts, instead of an
+  empty window.
+
+### Changed
+
+- The window now opens maximized.
+- Repo status loads faster: the ahead/behind count against the default
+  branch now runs alongside the other status checks instead of after them.
+- The app starts faster: the Files tab editor and its 34 language grammars
+  load only when you first open that tab.
+- In development, DevTools no longer open on launch. Set `OPEN_DEVTOOLS=1`
+  to open them automatically.
+
 ### Fixed
 
 - The app mark still broke up at the smallest sizes: the branch graph's
@@ -208,7 +225,8 @@ Initial public release. Building in the open from here.
 - Per-lane colored branch graph with ref labels.
 - Resizable sidebar, light / dark / system theme, keyboard shortcuts.
 
-[Unreleased]: https://github.com/overcodelions/overgit/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/overcodelions/overgit/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/overcodelions/overgit/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/overcodelions/overgit/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/overcodelions/overgit/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/overcodelions/overgit/compare/v0.3.0...v0.4.0
