@@ -193,10 +193,14 @@ function createWindow(): void {
       sandbox: true,
     },
   });
+  // Open maximized (fills the screen, stays on the desktop).
+  mainWindow.maximize();
 
   if (isDev && DEV_URL) {
     mainWindow.loadURL(DEV_URL);
-    mainWindow.webContents.openDevTools({ mode: 'undocked' });
+    // DevTools stay closed by default (View > Toggle Developer Tools, Cmd+Opt+I);
+    // set OPEN_DEVTOOLS=1 to have them open on launch.
+    if (process.env.OPEN_DEVTOOLS === '1') mainWindow.webContents.openDevTools({ mode: 'undocked' });
   } else {
     mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
   }
