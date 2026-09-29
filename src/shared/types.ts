@@ -1041,7 +1041,7 @@ export interface IPCInvokeMap {
     repoId: UUID;
     conflicts: string[];
     strategy: 'stash' | 'discard';
-  }) => { ok: boolean; error?: string; stashed?: boolean };
+  }) => { ok: boolean; error?: string; stashed?: boolean; warning?: string };
   'repo:detectDefaultBranch': (repoId: UUID) => string | null;
   /// Refresh `origin/HEAD` via `git remote set-head origin --auto`
   /// and persist the new default into the repo's stored
