@@ -454,6 +454,11 @@ function useSidebarBackgroundFetch(): void {
 function useMenuCommands(): void {
   useEffect(() => {
     return window.overgit.onMainEvent((evt) => {
+      if (evt.kind === 'settings:uiScale') {
+        // Main already saved and applied it; just keep our copy current.
+        useStore.setState((s) => ({ settings: { ...s.settings, uiScale: evt.uiScale } }));
+        return;
+      }
       if (evt.kind !== 'menu:command') return;
       const s = useStore.getState();
       switch (evt.command) {

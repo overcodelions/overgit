@@ -675,6 +675,10 @@ export type ForgeListResult =
 
 export interface AppSettings {
   theme: 'light' | 'dark' | 'system';
+  /// Interface size as a zoom factor (1 = 100%). Main applies it with
+  /// webContents.setZoomFactor; see src/shared/uiScale.ts. Clamped on
+  /// load so a hand-edited value can't make the window unusable.
+  uiScale: number;
   /// User-controlled visibility of the left sidebar. Persisted so the
   /// title-bar toggle survives relaunch.
   sidebarVisible: boolean;
@@ -750,6 +754,7 @@ export interface AppSettings {
 
 export const DEFAULT_SETTINGS: AppSettings = {
   theme: 'system',
+  uiScale: 1,
   sidebarVisible: true,
   sidebarWidth: 288,
   historyAsideWidth: 480,
@@ -1493,6 +1498,9 @@ export interface StoreSnapshot {
 export type MainToRendererEvent =
   | { kind: 'repo:statusUpdated'; status: RepoStatus }
   | { kind: 'menu:command'; command: MenuCommand }
+  /// ⌘/Ctrl +/−/0 changed the interface size in main; the renderer
+  /// folds it into its cached settings so the next save doesn't undo it.
+  | { kind: 'settings:uiScale'; uiScale: number }
   | { kind: 'workset:checkoutProgress'; worksetId: UUID; outcome: CheckoutOutcome }
   | {
       kind: 'repo:cloneProgress';

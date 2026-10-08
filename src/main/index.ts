@@ -118,6 +118,7 @@ import {
 } from './cli';
 import { listForgeRepos } from './forge';
 import { installAppMenu } from './menu';
+import { clampUiScale, stepUiScale, UI_SCALE_DEFAULT } from '../shared/uiScale';
 import { initAutoUpdater, quitAndInstall, refreshUpdateChannel } from './updater';
 import { ForgeKind, Identity, Repo, ResolvedIdentity } from '../shared/types';
 
@@ -209,6 +210,11 @@ function createWindow(): void {
     mainWindow = null;
   });
 
+  // Zoom can reset on a reload or navigation, so re-apply the interface
+  // size after every load rather than once at creation.
+  const win = mainWindow;
+  win.webContents.on('did-finish-load', () => applyUiScale(win));
+
   // Lock the renderer to its initial origin: any navigation (rogue link,
   // redirect, window.open) is denied and bounced to the user's default
   // browser if the URL is plain http(s).
@@ -222,6 +228,30 @@ function createWindow(): void {
     if (isSafeExternalUrl(url)) shell.openExternal(url);
     return { action: 'deny' };
   });
+}
+
+function applyUiScale(win: BrowserWindow): void {
+  if (win.isDestroyed()) return;
+  win.webContents.setZoomFactor(clampUiScale(Store.load().settings.uiScale));
+}
+
+function applyUiScaleEverywhere(): void {
+  for (const win of BrowserWindow.getAllWindows()) applyUiScale(win);
+}
+
+/// ⌘/Ctrl +/−/0 from the menu. Main owns the change here (the renderer
+/// may not have focus, or may be mid-reload), persists it, then tells the
+/// renderer so Settings shows the new value and its cached copy stays
+/// current.
+function changeUiScale(direction: 1 | -1 | 0): void {
+  const settings = Store.load().settings;
+  const uiScale = direction === 0 ? UI_SCALE_DEFAULT : stepUiScale(settings.uiScale, direction);
+  if (uiScale === settings.uiScale) return;
+  Store.saveSettings({ ...settings, uiScale });
+  applyUiScaleEverywhere();
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) win.webContents.send('main:event', { kind: 'settings:uiScale', uiScale });
+  }
 }
 
 function isSafeExternalUrl(url: string): boolean {
@@ -258,8 +288,10 @@ function registerIpc(): void {
   ipcMain.handle('store:saveWorksets', (_e, worksets) => Store.saveWorksets(worksets));
   ipcMain.handle('store:saveWorkspaces', (_e, workspaces) => Store.saveWorkspaces(workspaces));
   ipcMain.handle('store:saveSettings', (_e, settings) => {
-    Store.saveSettings(settings);
+    const prevScale = Store.load().settings.uiScale;
+    Store.saveSettings({ ...settings, uiScale: clampUiScale(settings.uiScale) });
     refreshUpdateChannel();
+    if (Store.load().settings.uiScale !== prevScale) applyUiScaleEverywhere();
   });
   ipcMain.handle('update:quitAndInstall', () => quitAndInstall());
 
@@ -1532,9 +1564,12 @@ app.whenReady().then(() => {
     }
   }
   registerIpc();
-  installAppMenu((command) => {
-    mainWindow?.webContents.send('main:event', { kind: 'menu:command', command });
-  });
+  installAppMenu(
+    (command) => {
+      mainWindow?.webContents.send('main:event', { kind: 'menu:command', command });
+    },
+    changeUiScale,
+  );
   createWindow();
   // Self-update from the GitHub Releases feed. No-op in dev and on
   // unpackaged runs.

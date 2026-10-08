@@ -13,6 +13,7 @@ import {
   Workset,
   Workspace,
 } from '../shared/types';
+import { clampUiScale } from '../shared/uiScale';
 
 function storePath(): string {
   return path.join(app.getPath('userData'), 'overgit.json');
@@ -46,10 +47,12 @@ function loadFromDisk(): StoreSnapshot {
       parsedSettings.worksetLastSeen = parsedSettings.workspaceLastSeen;
       delete parsedSettings.workspaceLastSeen;
     }
+    const settings = { ...DEFAULT_SETTINGS, ...parsedSettings };
+    settings.uiScale = clampUiScale(settings.uiScale);
     return {
       ...emptyState(),
       ...parsed,
-      settings: { ...DEFAULT_SETTINGS, ...parsedSettings },
+      settings,
     };
   } catch (err) {
     console.error('Failed to load overgit.json, starting fresh:', err);

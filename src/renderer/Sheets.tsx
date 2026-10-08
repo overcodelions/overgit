@@ -29,6 +29,7 @@ import type {
   WorksetResetOutcome,
 } from '@shared/types';
 import { sanitizeBranchName } from '@shared/branch-name';
+import { UI_SCALE_STEPS } from '@shared/uiScale';
 
 /// Stable empty-array reference used as the fallback for selectors that
 /// read `s.worksetStatuses[id]`. Returning a fresh `[]` from a zustand
@@ -1028,6 +1029,12 @@ function SettingsGeneralPanel(): JSX.Element {
     applyTheme(theme);
   };
 
+  const updateUiScale = async (uiScale: number) => {
+    const next = { ...settings, uiScale };
+    useStore.setState({ settings: next });
+    await window.overgit.invoke('store:saveSettings', next);
+  };
+
   const updateStagingMode = async (stagingMode: 'simple' | 'advanced') => {
     const next = { ...settings, stagingMode };
     useStore.setState({ settings: next });
@@ -1067,6 +1074,28 @@ function SettingsGeneralPanel(): JSX.Element {
               }`}
             >
               {t[0].toUpperCase() + t.slice(1)}
+            </button>
+          ))}
+        </div>
+      </SettingsGroup>
+
+      <SettingsGroup
+        eyebrow="Display"
+        title="Interface size"
+        subtitle={`Scales all text and controls. ${shortcutText(['Mod'])} + and − change it from anywhere, ${shortcutText(['Mod', '0'])} resets it.`}
+      >
+        <div className="flex gap-2">
+          {UI_SCALE_STEPS.map((step) => (
+            <button
+              key={step}
+              onClick={() => updateUiScale(step)}
+              className={`px-3 py-1.5 rounded-md border text-xs ${
+                settings.uiScale === step
+                  ? 'bg-accent text-white border-accent'
+                  : 'border-card hover:bg-card'
+              }`}
+            >
+              {Math.round(step * 100)}%
             </button>
           ))}
         </div>

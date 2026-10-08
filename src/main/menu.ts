@@ -4,6 +4,9 @@
 // picker can't do it from main, so they send a `menu:command` event and the
 // renderer acts on it.
 //
+// Zoom goes through the "Interface size" setting rather than Electron's
+// zoom roles, so ⌘/Ctrl +/−/0 persist and Settings shows the same value.
+//
 // Keys the renderer already handles (⌘K, ⌘,, ⌘\, ⌘/) are shown here with
 // `registerAccelerator: false`: the menu advertises them, the renderer's
 // keydown handler stays the single owner.
@@ -13,7 +16,10 @@ import type { MenuCommand } from '../shared/types';
 
 const REPO_URL = 'https://github.com/overcodelions/overgit';
 
-export function installAppMenu(send: (command: MenuCommand) => void): void {
+export function installAppMenu(
+  send: (command: MenuCommand) => void,
+  zoom: (direction: 1 | -1 | 0) => void,
+): void {
   const isMac = process.platform === 'darwin';
   const item = (
     label: string,
@@ -67,9 +73,11 @@ export function installAppMenu(send: (command: MenuCommand) => void): void {
         item('Command Palette…', 'palette', 'CmdOrCtrl+K'),
         item('Toggle Sidebar', 'toggleSidebar', 'CmdOrCtrl+\\'),
         { type: 'separator' },
-        { role: 'resetZoom' },
-        { role: 'zoomIn' },
-        { role: 'zoomOut' },
+        { label: 'Actual Size', accelerator: 'CmdOrCtrl+0', click: () => zoom(0) },
+        { label: 'Zoom In', accelerator: 'CmdOrCtrl+=', click: () => zoom(1) },
+        // ⌘+ on keyboards where + needs Shift; hidden so the menu shows one Zoom In.
+        { label: 'Zoom In', accelerator: 'CmdOrCtrl+Plus', visible: false, click: () => zoom(1) },
+        { label: 'Zoom Out', accelerator: 'CmdOrCtrl+-', click: () => zoom(-1) },
         { type: 'separator' },
         { role: 'togglefullscreen' },
         { type: 'separator' },
