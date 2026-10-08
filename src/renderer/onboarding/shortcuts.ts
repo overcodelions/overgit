@@ -27,6 +27,7 @@ export const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { keys: ['Mod', '\\'], label: 'Show or hide the sidebar', essential: true },
       { keys: ['Mod', 'R'], label: 'Refresh the repo or workset you’re looking at', essential: true },
       { keys: ['Mod', '/'], label: 'This list (or ? outside a text field)' },
+      { keys: ['Mod', '+ / − / 0'], label: 'Interface size: bigger, smaller, back to 100%' },
     ],
   },
   {

@@ -584,6 +584,7 @@ export const useStore = create<UiState>((set, get) => ({
   workspaces: [],
   settings: {
     theme: 'system',
+    uiScale: 1,
     sidebarVisible: true,
     sidebarWidth: 288,
     historyAsideWidth: 480,

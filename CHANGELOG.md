@@ -6,6 +6,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Interface size, in Settings → General: 85% to 150%, scaling all text and
+  controls. ⌘+ / ⌘− / ⌘0 (Ctrl on Windows and Linux) change it from
+  anywhere, and it is kept across restarts. Chromium on Linux does not
+  follow the desktop's text scaling, which left overgit small there.
+
 ## [0.4.3] - 2026-09-27
 
 ### Added
