@@ -1342,6 +1342,10 @@ export const useStore = create<UiState>((set, get) => ({
     try {
       const outcomes = await get().resetAllReposToDefault();
       get().dismissToast(progressId);
+      // Forced per repo: the sweep below would otherwise reuse any
+      // status read that started mid-reset and still shows the old
+      // branch.
+      for (const o of outcomes) void get().refreshRepoStatus(o.repoId, true);
       const reposById = new Map(get().repos.map((r) => [r.id, r] as const));
       const failed = outcomes.filter((o) => o.result !== 'reset');
       if (failed.length === 0) {
@@ -1713,7 +1717,9 @@ export const useStore = create<UiState>((set, get) => ({
 
   fetchRepo: async (id) => {
     const res = await window.overgit.invoke('repo:fetch', id);
-    if (res.ok) await get().refreshRepoStatus(id);
+    // Forced: a status read that started before the fetch would
+    // otherwise be reused and report pre-fetch ahead/behind.
+    if (res.ok) await get().refreshRepoStatus(id, true);
     return res;
   },
 
