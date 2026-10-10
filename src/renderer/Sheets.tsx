@@ -3441,6 +3441,9 @@ function ResetWorkspaceProgressSheet({
         setRows((prev) => ({ ...prev, [id]: { phase: 'running' } }));
         try {
           const outcome = await resetRepoToDefault(id);
+          // Forced so it can't reuse a status read that started before
+          // the switch and still reports the old branch.
+          void useStore.getState().refreshRepoStatus(id, true);
           if (cancelledRef.current) return;
           outcomes.push(outcome);
           useStore.getState().advanceBackgroundJob(jobId, outcomes.length);
@@ -3634,6 +3637,7 @@ function ResetWorkspaceProgressSheet({
         }
       }
       const outcome = await resetRepoToDefault(id, kind === 'force');
+      void useStore.getState().refreshRepoStatus(id, true);
       setRows((prev) => ({ ...prev, [id]: { phase: 'done', outcome } }));
     } catch (err) {
       setRows((prev) => ({
