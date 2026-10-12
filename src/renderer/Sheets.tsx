@@ -3372,7 +3372,6 @@ function ResetWorkspaceProgressSheet({
   const workspaces = useStore((s) => s.workspaces);
   const setSheet = useStore((s) => s.setSheet);
   const resetRepoToDefault = useStore((s) => s.resetRepoToDefault);
-  const refreshAllRepoStatuses = useStore((s) => s.refreshAllRepoStatuses);
   const pushToast = useStore((s) => s.pushToast);
   const workspace = workspaces.find((w) => w.id === workspaceId);
   const reposById = useMemo(() => {
@@ -3452,6 +3451,7 @@ function ResetWorkspaceProgressSheet({
             [id]: { phase: 'done', outcome },
           }));
         } catch (err) {
+          void useStore.getState().refreshRepoStatus(id, true);
           if (cancelledRef.current) return;
           const outcome: WorksetResetOutcome = {
             repoId: id,
@@ -3475,7 +3475,6 @@ function ResetWorkspaceProgressSheet({
       useStore.getState().endBackgroundJob(jobId);
       if (cancelledRef.current) return;
       setAllDone(true);
-      void refreshAllRepoStatuses(true);
       // Background mode: the React effect-tied toast won't fire
       // because the component is unmounted. Push from here directly
       // via the store so the user still gets notified.
