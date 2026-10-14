@@ -6,11 +6,25 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-10-14
+
 ### Added
+
 - Interface size, in Settings → General: 85% to 150%, scaling all text and
   controls. ⌘+ / ⌘− / ⌘0 (Ctrl on Windows and Linux) change it from
   anywhere, and it is kept across restarts. Chromium on Linux does not
   follow the desktop's text scaling, which left overgit small there.
+
+### Fixed
+
+- Stash & retry and Discard & retry now work when a file blocking a pull is
+  flagged `skip-worktree` or `assume-unchanged`. Previously both failed with
+  a `pathspec … did not match` error. The flags are restored afterwards, and
+  if one can't be, the dialog shows the `git update-index` command to re-hide
+  the file.
+- After a workspace Reset all, each row now shows the repo's new branch, and
+  rows update as each repo finishes instead of all at the end. A repo could
+  previously keep showing its old branch until you opened it.
 
 ## [0.4.3] - 2026-09-27
 
@@ -231,7 +245,8 @@ Initial public release. Building in the open from here.
 - Per-lane colored branch graph with ref labels.
 - Resizable sidebar, light / dark / system theme, keyboard shortcuts.
 
-[Unreleased]: https://github.com/overcodelions/overgit/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/overcodelions/overgit/compare/v0.4.4...HEAD
+[0.4.4]: https://github.com/overcodelions/overgit/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/overcodelions/overgit/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/overcodelions/overgit/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/overcodelions/overgit/compare/v0.4.0...v0.4.1
