@@ -1,5 +1,11 @@
 import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useStore } from './store';
+import {
+  clearQueuedCommit,
+  clearQueuedRepoTab,
+  peekQueuedCommit,
+  peekQueuedRepoTab,
+  useStore,
+} from './store';
 import { BranchPicker } from './BranchPicker';
 import { Explain } from './Explain';
 import { Spinner } from './Spinner';
@@ -90,7 +96,10 @@ export function RepoDetail({ repoId }: { repoId: UUID }): JSX.Element {
   const refreshChanges = useStore((s) => s.refreshRepoChanges);
   const refreshStatus = useStore((s) => s.refreshRepoStatus);
 
-  const [tab, setTab] = useState<Tab>('changes');
+  const [tab, setTab] = useState<Tab>(() => peekQueuedRepoTab() ?? 'changes');
+  useEffect(() => {
+    clearQueuedRepoTab(true);
+  }, []);
 
   useEffect(() => {
     refreshChanges(repoId);
@@ -106,6 +115,9 @@ export function RepoDetail({ repoId }: { repoId: UUID }): JSX.Element {
   // boolean ping that RepoHeader subscribes to.
   useEffect(() => {
     const onTab = (e: Event) => {
+      // Already mounted, so the event is enough — drop the queued copy
+      // so it can't leak into the next mount.
+      clearQueuedRepoTab();
       const detail = (e as CustomEvent).detail;
       if (
         detail === 'changes' ||
@@ -3994,6 +4006,53 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
     setFilter('');
   }, [refreshGraph, refreshGraphFast, refreshDiff, repoId, isList]);
 
+  // A commit picked elsewhere (cross-repo search) to show on arrival.
+  // Declared after the mount effect so its reset to 'working' runs
+  // first. When the commit isn't in the loaded list — another branch,
+  // or past the list's limit — fetch it on its own so the detail pane
+  // still has something to render.
+  const [outsideCommit, setOutsideCommit] = useState<GraphCommit | null>(null);
+  const scrollToSha = useRef<string | null>(null);
+  const focusCommit = useCallback(
+    (sha: string) => {
+      scrollToSha.current = sha;
+      setFilter('');
+      setSelected(sha);
+      refreshDiff(repoId, sha);
+      setOutsideCommit(null);
+      void window.overgit.invoke('repo:commitInfo', { repoId, sha }).then((c) => {
+        if (c) setOutsideCommit(c);
+      });
+    },
+    [refreshDiff, repoId],
+  );
+  useEffect(() => {
+    const sha = peekQueuedCommit(repoId);
+    if (sha) {
+      focusCommit(sha);
+      clearQueuedCommit(true);
+    }
+    const onFocus = (e: Event) => {
+      const detail = (e as CustomEvent<{ repoId: UUID; sha: string }>).detail;
+      if (detail?.repoId !== repoId) return;
+      clearQueuedCommit();
+      focusCommit(detail.sha);
+    };
+    window.addEventListener('overgit:focusCommit', onFocus);
+    return () => window.removeEventListener('overgit:focusCommit', onFocus);
+  }, [focusCommit, repoId]);
+  // Bring a focused commit's row into view once the list has it. One
+  // shot: cleared after the first loaded render either way, so a later
+  // graph refresh that happens to include the commit doesn't jump.
+  useEffect(() => {
+    const sha = scrollToSha.current;
+    if (!sha || !graphLoaded) return;
+    scrollToSha.current = null;
+    listRef.current
+      ?.querySelector(`[data-sha="${sha}"]`)
+      ?.scrollIntoView({ block: 'center' });
+  }, [graphLoaded, commits, selected]);
+
   // Re-fetch the graph when HEAD moves (branch switch, pull, reset,
   // amend, etc.) so the History list reflects the new branch
   // immediately. Without this, switching branches while sitting on
@@ -4168,8 +4227,10 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
   // SVG draws lines/circles for filtered commits at rows 1..N.
   const totalHeight = (filteredCommits.length + 1) * ROW_HEIGHT;
 
-  const selectedCommit =
+  const listedCommit =
     selected === 'working' ? null : commits.find((c) => c.sha === selected) ?? null;
+  const selectedCommit =
+    listedCommit ?? (outsideCommit && outsideCommit.sha === selected ? outsideCommit : null);
 
   return (
     <div className="flex overflow-hidden">
@@ -4274,6 +4335,7 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
                   plain={`Inspect this commit: ${c.subject || '(no subject)'}`}
                 >
                   <button
+                    data-sha={c.sha}
                     onClick={() => onPickCommit(c.sha)}
                     onContextMenu={(e) => openContextMenu(e, c.sha)}
                     style={{

@@ -620,6 +620,74 @@ export interface PullRequest {
   /// ISO-8601 timestamp from gh.
   updatedAt: string;
   state: 'OPEN' | 'CLOSED' | 'MERGED';
+  /// Rolled-up CI state from gh's `statusCheckRollup`. Absent when gh
+  /// didn't return the field (older gh, or a forge without checks).
+  checks?: PRChecks;
+  /// gh's `reviewDecision`. null when the repo has no review rules
+  /// and nobody has reviewed yet.
+  reviewDecision?: 'APPROVED' | 'CHANGES_REQUESTED' | 'REVIEW_REQUIRED' | null;
+}
+
+/// Summary of every check run and commit status on a PR's head.
+/// `state` is the worst of them: any failure → failure, else any
+/// pending → pending, else success. `none` means no checks configured.
+export interface PRChecks {
+  state: 'success' | 'failure' | 'pending' | 'none';
+  passed: number;
+  failed: number;
+  pending: number;
+  total: number;
+  /// Names of the failing checks, for the badge tooltip.
+  failing: string[];
+}
+
+/// Per-repo result of cross-linking a workset's PRs. Each PR body gets
+/// a marker-delimited "Related PRs" block listing its siblings; re-runs
+/// replace the block in place, so `unchanged` means the body already
+/// had the current list.
+export interface WorksetLinkPROutcome {
+  repoId: UUID;
+  result: 'linked' | 'unchanged' | 'no-pr' | 'skipped' | 'failed';
+  number?: number;
+  url?: string;
+  message?: string;
+}
+
+/// What a repo search looks at: tracked file contents in the working
+/// tree (`git grep`), or commits across all refs — by message
+/// (`git log --grep`) or, when the query looks like one, by SHA.
+export type RepoSearchMode = 'code' | 'commits';
+
+/// Which repos a search fans out over: a workspace, a workset, or one repo.
+export interface RepoSearchScope {
+  kind: 'workspace' | 'workset' | 'repo';
+  id: UUID;
+}
+
+export interface SearchCodeHit {
+  /// Repo-relative path.
+  path: string;
+  line: number;
+  text: string;
+}
+
+export interface SearchCommitHit {
+  sha: string;
+  shortSha: string;
+  subject: string;
+  author: string;
+  /// ISO-8601 author date.
+  date: string;
+}
+
+/// One repo's hits. `truncated` means the per-repo cap cut results
+/// short — the renderer says so rather than implying it found them all.
+export interface RepoSearchResult {
+  repoId: UUID;
+  code: SearchCodeHit[];
+  commits: SearchCommitHit[];
+  truncated: boolean;
+  error?: string;
 }
 
 /// Result of asking gh for PRs in a single repo. Repos without a GitHub
@@ -945,6 +1013,9 @@ export interface IPCInvokeMap {
   /// Every commit comes back with `lane: 0` and `parentLanes: [0,…]`
   /// since the rail isn't rendered in list mode.
   'repo:graphFast': (args: { repoId: UUID; limit?: number }) => GraphCommit[];
+  /// One commit by SHA (abbreviations accepted), or null if it doesn't
+  /// resolve to a commit. For showing a commit outside the loaded list.
+  'repo:commitInfo': (args: { repoId: UUID; sha: string }) => GraphCommit | null;
   'repo:listStashes': (repoId: UUID) => Stash[];
   'repo:applyStash': (args: {
     repoId: UUID;
@@ -1232,6 +1303,21 @@ export interface IPCInvokeMap {
     body: string;
     draft: boolean;
   }) => WorksetOpenPROutcome[];
+  /// Cross-link the open PRs for each member's current branch: every PR
+  /// body gets a "Related PRs" block listing the others. Needs at least
+  /// two PRs; otherwise every row comes back `skipped`.
+  'workset:linkPRs': (worksetId: UUID) => WorksetLinkPROutcome[];
+  /// Search tracked files (`git grep`) or commit messages across every
+  /// repo in a workspace or workset. Fixed-string match; results are
+  /// capped per repo.
+  'repos:search': (args: {
+    scope: RepoSearchScope;
+    query: string;
+    mode: RepoSearchMode;
+    caseSensitive: boolean;
+    /// Commits mode only: leave out merge commits.
+    noMerges?: boolean;
+  }) => RepoSearchResult[];
   /// Reset every member of a workset to its default branch with a fresh
   /// pull. Used by the Archive flow so worksets close out with each repo
   /// in a clean "ready for next work" state on its trunk, not parked on

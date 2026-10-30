@@ -1,5 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
-import { useStore } from './store';
+import { openRepoCommit, openRepoTab, useStore } from './store';
+import { Spinner } from './Spinner';
 import { AppMark, KeyCombo } from './onboarding/helpChrome';
 import { BasicsSheet, SetupSheet, ShortcutsSheet } from './onboarding/HelpSheets';
 import { SHORTCUT_GROUPS, shortcutText } from './onboarding/shortcuts';
@@ -16,6 +17,9 @@ import type {
   LlmTool,
   Remote,
   Repo,
+  RepoSearchMode,
+  RepoSearchResult,
+  RepoSearchScope,
   RepoStatus,
   ResolvedIdentity,
   ReviewResult,
@@ -79,7 +83,7 @@ export function SheetHost(): JSX.Element | null {
                     ? 'w-[1100px] max-w-[96vw] h-[85vh]'
                   : sheet.kind === 'abandonLocal'
                     ? 'w-[720px] max-w-[92vw] max-h-[85vh]'
-                  : sheet.kind === 'fileHistory'
+                  : sheet.kind === 'fileHistory' || sheet.kind === 'searchRepos'
                     ? 'w-[860px] max-w-[94vw] h-[82vh]'
                     : sheet.kind === 'manageRepo'
                       ? 'w-[720px] max-w-[92vw] h-[78vh]'
@@ -132,6 +136,7 @@ export function SheetHost(): JSX.Element | null {
         {sheet.kind === 'openPRsInWorkset' && (
           <WorksetOpenPRsSheet worksetId={sheet.worksetId} />
         )}
+        {sheet.kind === 'searchRepos' && <SearchReposSheet scope={sheet.scope} />}
         {sheet.kind === 'fileHistory' && (
           <FileHistorySheet
             repoId={sheet.repoId}
@@ -6790,6 +6795,8 @@ function WorksetOpenPRsSheet({ worksetId }: { worksetId: UUID }): JSX.Element {
   const cli = useStore((s) => s.cliPresence);
   const refreshStatus = useStore((s) => s.refreshWorksetStatus);
   const openPRsWorkset = useStore((s) => s.openPRsWorkset);
+  const linkWorksetPRs = useStore((s) => s.linkWorksetPRs);
+  const pushToast = useStore((s) => s.pushToast);
   const setSheet = useStore((s) => s.setSheet);
 
   const [title, setTitle] = useState('');
@@ -6802,6 +6809,7 @@ function WorksetOpenPRsSheet({ worksetId }: { worksetId: UUID }): JSX.Element {
   // write the description themselves.
   const [titleEdited, setTitleEdited] = useState(false);
   const [draft, setDraft] = useState(false);
+  const [crossLink, setCrossLink] = useState(true);
   const [busy, setBusy] = useState(false);
   const [outcomes, setOutcomes] = useState<WorksetOpenPROutcome[] | null>(null);
 
@@ -6853,6 +6861,19 @@ function WorksetOpenPRsSheet({ worksetId }: { worksetId: UUID }): JSX.Element {
       // to the system browser, so each becomes a tab in Safari/Chrome.
       for (const o of res) {
         if (o.result === 'opened-in-browser' && o.url) window.open(o.url);
+      }
+      // Cross-link only counts gh PRs: Bitbucket ones don't exist until
+      // the user finishes the browser form.
+      const ghPRs = res.filter((o) => o.result === 'created' || o.result === 'already-open');
+      if (crossLink && ghPRs.length >= 2) {
+        const linked = await linkWorksetPRs(worksetId);
+        const failed = linked.filter((o) => o.result === 'failed').length;
+        if (failed > 0) {
+          pushToast({
+            kind: 'warn',
+            message: `PRs opened, but cross-linking failed on ${failed} ${failed === 1 ? 'repo' : 'repos'}. Retry from the workset's PR list.`,
+          });
+        }
       }
     } finally {
       setBusy(false);
@@ -6908,6 +6929,15 @@ function WorksetOpenPRsSheet({ worksetId }: { worksetId: UUID }): JSX.Element {
             disabled={busy}
           />
           Open as draft
+        </label>
+        <label className="flex items-center gap-2 text-[12px] text-ink-muted">
+          <input
+            type="checkbox"
+            checked={crossLink}
+            onChange={(e) => setCrossLink(e.target.checked)}
+            disabled={busy}
+          />
+          Cross-link the PRs (adds a Related PRs list to each description)
         </label>
 
         <div>
@@ -6995,6 +7025,282 @@ function WorksetOpenPRsSheet({ worksetId }: { worksetId: UUID }): JSX.Element {
       </div>
     </>
   );
+}
+
+/// Search across a workspace's or workset's repos. Runs on Enter rather
+/// than per keystroke: each search is a `git grep` per repo, and firing
+/// one on every key would queue a wave of them behind the user's typing.
+function SearchReposSheet({ scope }: { scope: RepoSearchScope }): JSX.Element {
+  const groupName = useStore((s) =>
+    scope.kind === 'workspace'
+      ? s.workspaces.find((w) => w.id === scope.id)?.name
+      : scope.kind === 'workset'
+        ? s.worksets.find((w) => w.id === scope.id)?.name
+        : s.repos.find((r) => r.id === scope.id)?.name,
+  );
+  const repos = useStore((s) => s.repos);
+  const selectRepo = useStore((s) => s.selectRepo);
+  const openRepoFile = useStore((s) => s.openRepoFile);
+  const setSheet = useStore((s) => s.setSheet);
+
+  const [query, setQuery] = useState('');
+  const [mode, setMode] = useState<RepoSearchMode>('code');
+  const [caseSensitive, setCaseSensitive] = useState(false);
+  const [noMerges, setNoMerges] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [results, setResults] = useState<RepoSearchResult[] | null>(null);
+  /// The query `results` answers — highlights use it, not the live
+  /// input, so editing the box doesn't re-highlight stale rows.
+  const [searched, setSearched] = useState('');
+  const reqId = useRef(0);
+
+  const reposById = useMemo(() => new Map(repos.map((r) => [r.id, r])), [repos]);
+
+  const runSearch = async (opts?: {
+    mode?: RepoSearchMode;
+    caseSensitive?: boolean;
+    noMerges?: boolean;
+  }) => {
+    const q = query.trim();
+    if (!q) return;
+    const m = opts?.mode ?? mode;
+    const cs = opts?.caseSensitive ?? caseSensitive;
+    const nm = opts?.noMerges ?? noMerges;
+    const id = ++reqId.current;
+    setBusy(true);
+    try {
+      const res = await window.overgit.invoke('repos:search', {
+        scope,
+        query: q,
+        mode: m,
+        caseSensitive: cs,
+        noMerges: nm,
+      });
+      if (id !== reqId.current) return;
+      setResults(res);
+      setSearched(q);
+    } finally {
+      if (id === reqId.current) setBusy(false);
+    }
+  };
+
+  // Changing mode or case re-runs the last search so the toggle feels
+  // like a filter rather than a setting the user has to re-submit.
+  const onMode = (m: RepoSearchMode) => {
+    setMode(m);
+    if (searched) void runSearch({ mode: m });
+  };
+  const onCase = (cs: boolean) => {
+    setCaseSensitive(cs);
+    if (searched) void runSearch({ caseSensitive: cs });
+  };
+  const onNoMerges = (nm: boolean) => {
+    setNoMerges(nm);
+    if (searched) void runSearch({ noMerges: nm });
+  };
+
+  const openCodeHit = (repoId: UUID, relPath: string) => {
+    const repo = reposById.get(repoId);
+    if (!repo) return;
+    selectRepo(repoId);
+    openRepoTab('files');
+    void openRepoFile(repoId, `${repo.path.replace(/\/+$/, '')}/${relPath}`);
+    setSheet(null);
+  };
+  const openCommitHit = (repoId: UUID, sha: string) => {
+    selectRepo(repoId);
+    openRepoCommit(repoId, sha);
+    setSheet(null);
+  };
+
+  const withHits = (results ?? []).filter(
+    (r) => r.code.length > 0 || r.commits.length > 0 || r.error,
+  );
+  const totalHits = (results ?? []).reduce((n, r) => n + r.code.length + r.commits.length, 0);
+  const repoHits = (results ?? []).filter((r) => r.code.length > 0 || r.commits.length > 0).length;
+
+  return (
+    <>
+      <SheetHeader
+        title={`Search · ${groupName ?? scope.kind}`}
+        onClose={() => setSheet(null)}
+      />
+      <div className="px-5 pt-4 pb-3 border-b border-card flex flex-col gap-2">
+        <div className="flex items-center gap-2">
+          <input
+            autoFocus
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') void runSearch();
+            }}
+            placeholder={mode === 'code' ? 'Text in tracked files…' : 'Commit message text or SHA…'}
+            className="field px-2 py-1.5 text-sm flex-1"
+          />
+          <button
+            onClick={() => void runSearch()}
+            disabled={busy || !query.trim()}
+            className="text-xs px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50 inline-flex items-center gap-1.5"
+          >
+            {busy && <Spinner size={11} />}
+            Search
+          </button>
+        </div>
+        <div className="flex items-center gap-3 text-[11px] text-ink-muted">
+          <div className="inline-flex rounded border border-card overflow-hidden">
+            {(['code', 'commits'] as const).map((m) => (
+              <button
+                key={m}
+                onClick={() => onMode(m)}
+                className={`px-2.5 py-0.5 ${mode === m ? 'bg-accent text-white' : 'hover:bg-card'}`}
+              >
+                {m === 'code' ? 'Code' : 'Commits'}
+              </button>
+            ))}
+          </div>
+          <label className="flex items-center gap-1.5">
+            <input
+              type="checkbox"
+              checked={caseSensitive}
+              onChange={(e) => onCase(e.target.checked)}
+            />
+            Match case
+          </label>
+          {mode === 'commits' && (
+            <label className="flex items-center gap-1.5">
+              <input
+                type="checkbox"
+                checked={noMerges}
+                onChange={(e) => onNoMerges(e.target.checked)}
+              />
+              Hide merges
+            </label>
+          )}
+          <span className="text-ink-faint ml-auto">
+            {mode === 'code'
+              ? 'Tracked files in each working tree · git grep'
+              : 'Messages or SHA, every branch · git log --all --grep'}
+          </span>
+        </div>
+      </div>
+      <div className="flex-1 min-h-0 overflow-y-auto p-5 text-xs">
+        {results === null ? (
+          <div className="text-ink-faint text-[12px]">
+            {scope.kind === 'repo'
+              ? 'Press Enter to search. '
+              : 'Press Enter to search every repo at once. '}
+            Matches are literal text, not regex.
+          </div>
+        ) : withHits.length === 0 ? (
+          <div className="text-ink-faint text-[12px]">No matches for “{searched}”.</div>
+        ) : (
+          <>
+            <div className="text-[11px] text-ink-muted mb-3">
+              <span className="text-ink font-semibold">{totalHits}</span>{' '}
+              {totalHits === 1 ? 'match' : 'matches'} in{' '}
+              <span className="text-ink font-semibold">{repoHits}</span>{' '}
+              {repoHits === 1 ? 'repo' : 'repos'}
+            </div>
+            <div className="flex flex-col gap-4">
+              {withHits.map((r) => {
+                const name = reposById.get(r.repoId)?.name ?? r.repoId;
+                const count = r.code.length + r.commits.length;
+                return (
+                  <section key={r.repoId}>
+                    <div className="sticky -top-5 z-10 -mx-5 px-5 py-1.5 mb-1 flex items-center gap-2 bg-surface-elevated border-b border-card">
+                      <span className="w-1 h-3.5 rounded-full bg-accent" aria-hidden />
+                      <span className="font-semibold text-ink">{name}</span>
+                      <span className="text-[10px] font-medium px-1.5 rounded-full bg-accent/15 text-accent">
+                        {count}
+                        {r.truncated ? '+' : ''}
+                      </span>
+                      {r.truncated && (
+                        <span className="text-[10px] text-ink-faint">
+                          first {count} shown, narrow the query for the rest
+                        </span>
+                      )}
+                    </div>
+                    {r.error && <div className="text-[11px] text-red-400 mb-1">{r.error}</div>}
+                    <ul className="flex flex-col">
+                      {r.code.map((h, i) => (
+                        <li key={`${h.path}:${h.line}:${i}`}>
+                          <button
+                            onClick={() => openCodeHit(r.repoId, h.path)}
+                            className="w-full text-left flex gap-3 px-2 py-1 rounded hover:bg-accent/10"
+                            title={`Open ${h.path}`}
+                          >
+                            <span className="font-mono shrink-0 w-64 truncate">
+                              <span className="text-sky-400">{h.path}</span>
+                              <span className="text-ink-faint">:{h.line}</span>
+                            </span>
+                            <span className="font-mono truncate">
+                              <SearchHighlight text={h.text.trim()} query={searched} caseSensitive={caseSensitive} />
+                            </span>
+                          </button>
+                        </li>
+                      ))}
+                      {r.commits.map((c) => {
+                        // Merge commits are mostly "Merged in <branch>"
+                        // noise next to real work, so they read quieter.
+                        const isMerge = /^Merge(d)?\b/.test(c.subject);
+                        return (
+                          <li key={c.sha}>
+                            <button
+                              onClick={() => openCommitHit(r.repoId, c.sha)}
+                              className="w-full text-left flex gap-3 px-2 py-1 rounded hover:bg-accent/10"
+                              title={`Show ${c.sha} in the repo's history`}
+                            >
+                              <span className="font-mono text-sky-400 shrink-0">{c.shortSha}</span>
+                              <span className={`truncate flex-1 ${isMerge ? 'text-ink-faint' : 'text-ink'}`}>
+                                <SearchHighlight text={c.subject} query={searched} caseSensitive={caseSensitive} />
+                              </span>
+                              <span className="text-ink-muted shrink-0">{c.author}</span>
+                              <span className="text-ink-faint font-mono shrink-0">{c.date.slice(0, 10)}</span>
+                            </button>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </section>
+                );
+              })}
+            </div>
+          </>
+        )}
+      </div>
+    </>
+  );
+}
+
+/// Mark every literal occurrence of `query` in `text`. A commit-message
+/// hit can match in the body rather than the subject, so no mark is fine.
+function SearchHighlight({
+  text,
+  query,
+  caseSensitive,
+}: {
+  text: string;
+  query: string;
+  caseSensitive: boolean;
+}): JSX.Element {
+  if (!query) return <>{text}</>;
+  const hay = caseSensitive ? text : text.toLowerCase();
+  const needle = caseSensitive ? query : query.toLowerCase();
+  const parts: JSX.Element[] = [];
+  let from = 0;
+  let at = hay.indexOf(needle);
+  while (at !== -1) {
+    if (at > from) parts.push(<span key={`t${from}`}>{text.slice(from, at)}</span>);
+    parts.push(
+      <mark key={`m${at}`} className="bg-amber-400/35 text-ink font-semibold rounded-sm px-0.5">
+        {text.slice(at, at + needle.length)}
+      </mark>,
+    );
+    from = at + needle.length;
+    at = hay.indexOf(needle, from);
+  }
+  if (from < text.length) parts.push(<span key={`t${from}`}>{text.slice(from)}</span>);
+  return <>{parts}</>;
 }
 
 function OpenPROutcomeBadge({

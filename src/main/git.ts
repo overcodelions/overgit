@@ -4003,8 +4003,15 @@ export async function commitGraphFast(
 
   const res = await run(repoPath, args);
   if (!res.ok) return [];
+  return parseGraphRecords(res.stdout);
+}
+
+/// Parse `GRAPH_FORMAT` records into single-lane commits. Lanes are
+/// placeholders: list mode doesn't draw a rail, and the full
+/// `commitGraph` call overwrites them when it does.
+function parseGraphRecords(stdout: string): GraphCommit[] {
   const out: GraphCommit[] = [];
-  for (const record of res.stdout.split('\x1e')) {
+  for (const record of stdout.split('\x1e')) {
     const t = record.replace(/^\s+|\s+$/g, '');
     if (!t) continue;
     const [sha, shortSha, parents, subject, author, authorEmail, date, refs, body] =
@@ -4023,13 +4030,31 @@ export async function commitGraphFast(
       refs: refs
         ? refs.split(',').map((r) => r.trim()).filter(Boolean)
         : [],
-      // Single-lane placeholder. The full `commitGraph` call that
-      // races alongside this one will overwrite with real lane data.
       lane: 0,
       parentLanes: parentShas.map(() => 0),
     });
   }
   return out;
+}
+
+/// Resolve a commit-ish (full or abbreviated SHA, ref) to its full SHA,
+/// or null when it doesn't name a commit — including an abbreviation
+/// that's ambiguous.
+export async function resolveCommit(repoPath: string, rev: string): Promise<string | null> {
+  if (!looksLikeRepo(repoPath) || !isSafeRefArg(rev)) return null;
+  const res = await run(repoPath, ['rev-parse', '--verify', '--quiet', `${rev.trim()}^{commit}`]);
+  return res.ok ? res.stdout.trim() || null : null;
+}
+
+/// One commit by SHA, in the shape the History tab renders. Used to
+/// show a commit that isn't in the loaded list — another branch, or
+/// older than the list's limit.
+export async function commitInfo(repoPath: string, sha: string): Promise<GraphCommit | null> {
+  const full = await resolveCommit(repoPath, sha);
+  if (!full) return null;
+  const res = await run(repoPath, ['log', '-1', '--no-walk', `--pretty=format:${GRAPH_FORMAT}`, full]);
+  if (!res.ok) return null;
+  return parseGraphRecords(res.stdout)[0] ?? null;
 }
 
 /// Build a small commit graph for the branch visualization. Pulls

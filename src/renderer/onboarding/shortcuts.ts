@@ -26,6 +26,7 @@ export const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { keys: ['Mod', ','], label: 'Settings', essential: true },
       { keys: ['Mod', '\\'], label: 'Show or hide the sidebar', essential: true },
       { keys: ['Mod', 'R'], label: 'Refresh the repo or workset you’re looking at', essential: true },
+      { keys: ['Mod', 'Shift', 'F'], label: 'Search the repo, workset or workspace you’re looking at' },
       { keys: ['Mod', '/'], label: 'This list (or ? outside a text field)' },
       { keys: ['Mod', '+ / − / 0'], label: 'Interface size: bigger, smaller, back to 100%' },
     ],
@@ -64,6 +65,7 @@ export function isMacPlatform(): boolean {
 
 export function keyLabel(key: string, mac = isMacPlatform()): string {
   if (key === 'Mod') return mac ? '⌘' : 'Ctrl';
+  if (key === 'Shift') return mac ? '⇧' : 'Shift';
   return key;
 }
 

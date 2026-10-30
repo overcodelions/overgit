@@ -31,6 +31,7 @@ import {
   commitAll,
   commitGraph,
   commitGraphFast,
+  commitInfo,
   commitStaged,
   createBranch,
   deleteBranch,
@@ -96,6 +97,7 @@ import {
   worksetCheckout,
   worksetCommitAll,
   worksetFetch,
+  worksetLinkPRs,
   worksetListPRs,
   worksetOpenPRs,
   resetRepoToDefault,
@@ -117,10 +119,18 @@ import {
   suggestCommitMessage,
 } from './cli';
 import { listForgeRepos } from './forge';
+import { searchRepos } from './search';
 import { installAppMenu } from './menu';
 import { clampUiScale, stepUiScale, UI_SCALE_DEFAULT } from '../shared/uiScale';
 import { initAutoUpdater, quitAndInstall, refreshUpdateChannel } from './updater';
-import { ForgeKind, Identity, Repo, ResolvedIdentity } from '../shared/types';
+import {
+  ForgeKind,
+  Identity,
+  Repo,
+  RepoSearchMode,
+  RepoSearchScope,
+  ResolvedIdentity,
+} from '../shared/types';
 
 /// Resolve which identity should be applied (via env override) when
 /// committing in this repo. Mirrors the precedence the renderer
@@ -915,6 +925,12 @@ function registerIpc(): void {
     return commitGraphFast(repo.path, repo.defaultBranch, args.limit ?? 100);
   });
 
+  ipcMain.handle('repo:commitInfo', async (_e, args: { repoId: string; sha: string }) => {
+    const repo = repoFromArg(args);
+    if (!repo) return null;
+    return commitInfo(repo.path, args.sha);
+  });
+
   ipcMain.handle('repo:listStashes', async (_e, repoId: string) => {
     const repo = repoFromArg(repoId);
     if (!repo) return [];
@@ -1295,6 +1311,36 @@ function registerIpc(): void {
         worksets,
         repos,
       );
+    },
+  );
+
+  ipcMain.handle('workset:linkPRs', async (_e, worksetId: string) => {
+    const { worksets, repos } = Store.load();
+    return worksetLinkPRs(worksetId, worksets, repos);
+  });
+
+  ipcMain.handle(
+    'repos:search',
+    async (
+      _e,
+      args: {
+        scope: RepoSearchScope;
+        query: string;
+        mode: RepoSearchMode;
+        caseSensitive: boolean;
+        noMerges?: boolean;
+      },
+    ) => {
+      const { workspaces, worksets, repos } = Store.load();
+      const { kind, id } = args.scope;
+      const repoIds =
+        kind === 'repo'
+          ? [id]
+          : (kind === 'workspace' ? workspaces : worksets).find((w) => w.id === id)?.repoIds;
+      if (!repoIds) return [];
+      return searchRepos(repoIds, repos, args.query, args.mode, args.caseSensitive, {
+        noMerges: args.noMerges,
+      });
     },
   );
 

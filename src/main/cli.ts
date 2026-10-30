@@ -4,7 +4,7 @@
 // renderer gates UI on presence.
 
 import { spawn } from 'node:child_process';
-import { CliPresence, LlmTool, PullRequest, ReviewResult } from '../shared/types';
+import { CliPresence, LlmTool, PRChecks, PullRequest, ReviewResult } from '../shared/types';
 
 interface RunResult {
   ok: boolean;
@@ -420,6 +420,59 @@ interface GhPrJson {
   author?: { login?: string };
   updatedAt: string;
   state: string;
+  statusCheckRollup?: GhCheckJson[] | null;
+  reviewDecision?: string | null;
+}
+
+/// One entry of gh's `statusCheckRollup`: either an Actions-style check
+/// run (status + conclusion) or a legacy commit status (state only).
+export interface GhCheckJson {
+  __typename?: string;
+  name?: string;
+  context?: string;
+  status?: string;
+  conclusion?: string;
+  state?: string;
+}
+
+const PASSING_CONCLUSIONS = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED']);
+
+/// Fold a PR's check runs and commit statuses into one badge-sized
+/// summary. A check run that hasn't completed is pending regardless of
+/// conclusion; a commit status is pending while PENDING or EXPECTED.
+/// Everything else that isn't a pass counts as a failure (cancelled and
+/// timed-out runs block merges just like failed ones).
+export function summarizeChecks(rollup: GhCheckJson[] | null | undefined): PRChecks {
+  const out: PRChecks = { state: 'none', passed: 0, failed: 0, pending: 0, total: 0, failing: [] };
+  for (const c of rollup ?? []) {
+    out.total++;
+    const isStatus = c.__typename === 'StatusContext' || (c.state !== undefined && c.status === undefined);
+    if (isStatus) {
+      const st = (c.state ?? '').toUpperCase();
+      if (st === 'SUCCESS') out.passed++;
+      else if (st === 'PENDING' || st === 'EXPECTED' || st === '') out.pending++;
+      else {
+        out.failed++;
+        out.failing.push(c.context ?? c.name ?? 'status');
+      }
+      continue;
+    }
+    if ((c.status ?? '').toUpperCase() !== 'COMPLETED') out.pending++;
+    else if (PASSING_CONCLUSIONS.has((c.conclusion ?? '').toUpperCase())) out.passed++;
+    else {
+      out.failed++;
+      out.failing.push(c.name ?? c.context ?? 'check');
+    }
+  }
+  out.state =
+    out.failed > 0 ? 'failure' : out.pending > 0 ? 'pending' : out.total > 0 ? 'success' : 'none';
+  return out;
+}
+
+function parseReviewDecision(raw: string | null | undefined): PullRequest['reviewDecision'] {
+  return raw === 'APPROVED' || raw === 'CHANGES_REQUESTED' || raw === 'REVIEW_REQUIRED'
+    ? raw
+    : null;
 }
 
 /// Find the open PR for a repo's current branch via `gh pr view`. We
@@ -431,18 +484,30 @@ interface GhPrJson {
 export async function findOpenPRForCurrentBranch(
   repoPath: string,
 ): Promise<
-  | { kind: 'found'; number: number; url: string }
+  | { kind: 'found'; number: number; url: string; title: string; body: string }
   | { kind: 'none' }
   | { kind: 'no-remote' }
   | { kind: 'no-gh' }
   | { kind: 'error'; message: string }
 > {
-  const res = await run('gh', ['pr', 'view', '--json', 'number,url,state'], repoPath);
+  const res = await run('gh', ['pr', 'view', '--json', 'number,url,state,title,body'], repoPath);
   if (res.ok) {
     try {
-      const parsed = JSON.parse(res.stdout) as { number: number; url: string; state: string };
+      const parsed = JSON.parse(res.stdout) as {
+        number: number;
+        url: string;
+        state: string;
+        title?: string;
+        body?: string;
+      };
       if (parsed.state === 'OPEN') {
-        return { kind: 'found', number: parsed.number, url: parsed.url };
+        return {
+          kind: 'found',
+          number: parsed.number,
+          url: parsed.url,
+          title: parsed.title ?? '',
+          body: parsed.body ?? '',
+        };
       }
       // A merged or closed PR shouldn't block creating a new one.
       return { kind: 'none' };
@@ -510,6 +575,20 @@ export async function createPRWithGh(
   return { ok: false, kind: 'error', error: res.stderr.trim() || `gh exited ${res.code}` };
 }
 
+/// Replace a PR's body via `gh pr edit`. Used by the workset cross-link
+/// action, which rewrites only its own marker block and keeps the rest
+/// of the body as the author wrote it.
+export async function editPRBody(
+  repoPath: string,
+  number: number,
+  body: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const res = await run('gh', ['pr', 'edit', String(number), '--body', body], repoPath);
+  if (res.ok) return { ok: true };
+  if (res.code === null) return { ok: false, error: 'gh not installed' };
+  return { ok: false, error: res.stderr.trim() || `gh exited ${res.code}` };
+}
+
 /// List open PRs for a single repo via `gh pr list --json`. Returns
 /// `null` (with a reason) for repos with no GitHub remote, no gh auth,
 /// or any other gh error — those are not failures of overgit, just
@@ -528,6 +607,8 @@ export async function listOpenPRs(
     'author',
     'updatedAt',
     'state',
+    'statusCheckRollup',
+    'reviewDecision',
   ].join(',');
   const res = await run('gh', ['pr', 'list', '--state', 'open', '--json', fields], repoPath);
   if (!res.ok) {
@@ -545,6 +626,8 @@ export async function listOpenPRs(
       author: p.author?.login ?? '',
       updatedAt: p.updatedAt,
       state: p.state === 'MERGED' || p.state === 'CLOSED' ? p.state : 'OPEN',
+      checks: p.statusCheckRollup === undefined ? undefined : summarizeChecks(p.statusCheckRollup),
+      reviewDecision: parseReviewDecision(p.reviewDecision),
     }));
     return { prs };
   } catch (err: unknown) {

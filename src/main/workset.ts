@@ -18,6 +18,7 @@ import {
   Workset,
   WorksetActivity,
   WorksetDiffTruncation,
+  WorksetLinkPROutcome,
   WorksetOpenPROutcome,
   WorksetPushOutcome,
   WorksetResetOutcome,
@@ -97,7 +98,7 @@ async function pickIdentityFor(repo: Repo, settings: AppSettings): Promise<Ident
   if (local.name && local.email) return undefined;
   return settings.defaultIdentity;
 }
-import { createPRWithGh, findOpenPRForCurrentBranch, listOpenPRs } from './cli';
+import { createPRWithGh, editPRBody, findOpenPRForCurrentBranch, listOpenPRs } from './cli';
 
 /// Identify the hosting provider for a remote URL. Used by the Open
 /// PRs flow to dispatch: GitHub → `gh pr create`, Bitbucket → web URL,
@@ -1325,6 +1326,99 @@ export async function worksetOpenPRs(
       });
     }
   }
+  return out;
+}
+
+const RELATED_START = '<!-- overgit:related-prs -->';
+const RELATED_END = '<!-- /overgit:related-prs -->';
+
+/// Put (or refresh) the "Related PRs" block in a PR body. The block is
+/// fenced by HTML comments so re-runs replace it in place and never
+/// touch what the author wrote around it. Bare PR URLs in a list render
+/// on GitHub as `owner/repo#N` with live state, so we don't need titles.
+export function withRelatedPRs(
+  body: string,
+  worksetName: string,
+  urls: string[],
+  selfUrl: string,
+): string {
+  const lines = urls.map((u) => (u === selfUrl ? `- ${u} (this PR)` : `- ${u}`));
+  const block = [
+    RELATED_START,
+    `### Related PRs · ${worksetName}`,
+    '',
+    ...lines,
+    RELATED_END,
+  ].join('\n');
+  const start = body.indexOf(RELATED_START);
+  const end = start === -1 ? -1 : body.indexOf(RELATED_END, start);
+  if (start !== -1 && end !== -1) {
+    return body.slice(0, start) + block + body.slice(end + RELATED_END.length);
+  }
+  const trimmed = body.trimEnd();
+  return trimmed ? `${trimmed}\n\n${block}` : block;
+}
+
+/// Cross-link the open PRs for each member's current branch. Sequential
+/// for the same reasons as `worksetOpenPRs` (gh auth prompts, readable
+/// per-repo failures). Two passes: collect every PR first so each body
+/// can list the full set, then rewrite only the bodies that changed.
+export async function worksetLinkPRs(
+  worksetId: UUID,
+  worksets: Workset[],
+  repos: Repo[],
+): Promise<WorksetLinkPROutcome[]> {
+  const ws = worksets.find((w) => w.id === worksetId);
+  if (!ws) return [];
+  const members = reposFor(ws, repos);
+  const out: WorksetLinkPROutcome[] = [];
+  const found: { repoId: UUID; path: string; number: number; url: string; body: string }[] = [];
+  for (const r of members) {
+    if (!(await hasGitHubRemote(r.path))) {
+      out.push({ repoId: r.id, result: 'skipped', message: 'No GitHub remote' });
+      continue;
+    }
+    const pr = await findOpenPRForCurrentBranch(r.path);
+    if (pr.kind === 'found') {
+      found.push({ repoId: r.id, path: r.path, number: pr.number, url: pr.url, body: pr.body });
+    } else if (pr.kind === 'none') {
+      out.push({ repoId: r.id, result: 'no-pr', message: 'No open PR for the current branch' });
+    } else {
+      const message =
+        pr.kind === 'no-gh' ? 'gh not installed' : pr.kind === 'no-remote' ? 'No GitHub remote' : pr.message;
+      out.push({ repoId: r.id, result: 'failed', message });
+    }
+  }
+
+  if (found.length < 2) {
+    for (const f of found) {
+      out.push({
+        repoId: f.repoId,
+        result: 'skipped',
+        number: f.number,
+        url: f.url,
+        message: 'Need at least two open PRs to cross-link',
+      });
+    }
+  } else {
+    const urls = found.map((f) => f.url);
+    for (const f of found) {
+      const next = withRelatedPRs(f.body, ws.name, urls, f.url);
+      if (next === f.body) {
+        out.push({ repoId: f.repoId, result: 'unchanged', number: f.number, url: f.url });
+        continue;
+      }
+      const res = await editPRBody(f.path, f.number, next);
+      out.push(
+        res.ok
+          ? { repoId: f.repoId, result: 'linked', number: f.number, url: f.url }
+          : { repoId: f.repoId, result: 'failed', number: f.number, url: f.url, message: res.error },
+      );
+    }
+  }
+
+  const order = new Map(members.map((r, i) => [r.id, i] as const));
+  out.sort((a, b) => (order.get(a.repoId) ?? 0) - (order.get(b.repoId) ?? 0));
   return out;
 }
 

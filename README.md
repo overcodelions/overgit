@@ -38,6 +38,7 @@ Help is always one step away: the **Help** menu (How Overgit Works, Setup — Gi
 - **Sidebar grouping.** Each workspace is a collapsible section. Repos can appear in many workspaces.
 - **Workspace-wide actions.** Fetch all, status all, *reset all repos to default* (fetch → switch → hard-reset to `origin/<default>` across every member).
 - **Workspace-wide PR list.** `gh pr list --json` per member, merged into one view.
+- **Search across repos.** File contents (`git grep`) or commit messages across every repo in a workspace or workset, grouped by repo; click a hit to open it.
 - **Smart reset safety.** Any repo with commits not on `origin/<default>` stops and asks before the hard-reset would erase them — per-repo `[force reset (lose N)]` / `[skip]` outcomes, never a silent disaster.
 
 ### Worksets (tickets across repos)
@@ -48,6 +49,8 @@ Landing Check continuously answers whether every committed workset branch will l
 
 - **A workset is a ticket.** Name it ("rate-limiter rollout"), pick the repos it touches, optionally bind it to a feature branch (`feat/rate-limit`). Resume it any time — the sidebar surfaces active worksets above the workspace list.
 - **Workset-wide branching.** Sync each member repo to its default → pull → branch, all in one workflow. Per-repo outcomes if any of them fail.
+- **CI and reviews at a glance.** The workset's own PRs show check status (passing / failing / running) and review state, rolled up in the section header.
+- **Cross-linked PRs.** One click adds a Related PRs list to every PR in the workset, refreshed in place on re-run.
 - **Archive when shipped.** Workset done — committed and pushed across all repos? Archive it. It vanishes from the active list into the collapsed "Archived" section. Repos on disk are unchanged. Reactivate any time.
 - **Workset reset.** One action fans out fetch → switch back to `origin/<default>` → hard-reset → delete the workset's bound branch across every member. Same safety checks as workspace reset.
 

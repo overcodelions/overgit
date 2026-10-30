@@ -6,6 +6,26 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- CI and review status on pull requests. Each PR in a workset shows whether
+  its checks pass, fail or are still running (hover a failure for the check
+  names) and whether it is approved, and the section header rolls that up
+  across the workset.
+- A workset's own PRs (those on a member's current branch or the workset's
+  pinned branch) are listed apart from other open PRs in the same repos.
+- Cross-link PRs: adds a Related PRs list to each of the workset's PR
+  descriptions, so reviewers can move between them. Re-running refreshes the
+  list and leaves the rest of each description alone. Open PRs does it
+  automatically unless you untick the option.
+- Search in a repo, or across a workspace or workset: file contents (`git grep`) or commit
+  messages on every branch, as literal text, with Match case. Commit search
+  also matches a full or abbreviated SHA. Clicking a code result opens the
+  file; clicking a commit opens it in the repo's History, even when it is on
+  another branch or older than the loaded list. From the Search button on the
+  workspace and workset pages, the command palette, or ⌘⇧F (Ctrl+Shift+F)
+  for whatever is open.
+
 ## [0.4.4] - 2026-10-14
 
 ### Added
