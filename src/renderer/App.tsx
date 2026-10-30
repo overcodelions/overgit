@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useStore } from './store';
+import { openRepoCommit, useStore } from './store';
 import { RepoDetail, FileDiffBlock } from './RepoDetail';
 import { TitleBar } from './TitleBar';
 import { SheetHost, ReviewBody, formatBytes } from './Sheets';
@@ -16,6 +16,7 @@ import type {
   CliPresence,
   FileDiff,
   LlmTool,
+  PRChecks,
   PullRequest,
   Repo,
   RepoPRs,
@@ -492,6 +493,7 @@ function useGlobalShortcuts(): void {
   const togglePalette = useStore((s) => s.togglePalette);
   const selectedRepoId = useStore((s) => s.selectedRepoId);
   const selectedWsId = useStore((s) => s.selectedWorksetId);
+  const selectedWorkspaceId = useStore((s) => s.selectedWorkspaceId);
   const refreshRepoStatus = useStore((s) => s.refreshRepoStatus);
   const refreshRepoChanges = useStore((s) => s.refreshRepoChanges);
   const refreshWsStatus = useStore((s) => s.refreshWorksetStatus);
@@ -537,6 +539,22 @@ function useGlobalShortcuts(): void {
         e.preventDefault();
         if (selectedRepoId) {
           window.dispatchEvent(new CustomEvent('overgit:repoPush'));
+        }
+        return;
+      }
+      // Cmd+Shift+F → search whatever is open: the repo, the workset,
+      // or the workspace. Works from text fields too, like Cmd+K.
+      if ((e.key === 'f' || e.key === 'F') && e.shiftKey) {
+        const scope = selectedRepoId
+          ? ({ kind: 'repo', id: selectedRepoId } as const)
+          : selectedWsId
+            ? ({ kind: 'workset', id: selectedWsId } as const)
+            : selectedWorkspaceId
+              ? ({ kind: 'workspace', id: selectedWorkspaceId } as const)
+              : null;
+        if (scope) {
+          e.preventDefault();
+          setSheet({ kind: 'searchRepos', scope });
         }
         return;
       }
@@ -625,6 +643,7 @@ function useGlobalShortcuts(): void {
     toggleSidebar,
     selectedRepoId,
     selectedWsId,
+    selectedWorkspaceId,
     refreshRepoStatus,
     refreshRepoChanges,
     refreshWsStatus,
@@ -2012,6 +2031,16 @@ function WorkspaceDetail({ workspaceId }: { workspaceId: UUID }): JSX.Element {
               </button>
             )}
             <button
+              onClick={() =>
+                setSheet({ kind: 'searchRepos', scope: { kind: 'workspace', id: workspaceId } })
+              }
+              disabled={members.length === 0}
+              className="text-xs px-3 py-1.5 rounded border border-card text-ink-muted hover:text-ink hover:bg-card disabled:opacity-50"
+              title="Search file contents or commit messages across every repo in this workspace."
+            >
+              Search
+            </button>
+            <button
               onClick={() => setSheet({ kind: 'editWorkspace', workspaceId })}
               className="text-xs px-3 py-1.5 rounded border border-card text-ink-muted hover:text-ink hover:bg-card"
               title="Rename or change members."
@@ -2517,6 +2546,17 @@ function WorksetView({ worksetId }: { worksetId: UUID }): JSX.Element {
             </Explain>
           )}
           <Explain
+            command="git grep -F <text>"
+            plain="Search file contents or commit messages in every repo of this workset."
+          >
+            <button
+              onClick={() => setSheet({ kind: 'searchRepos', scope: { kind: 'workset', id: worksetId } })}
+              className="text-xs px-3 py-1.5 rounded border border-card hover:bg-card"
+            >
+              Search
+            </button>
+          </Explain>
+          <Explain
             command=""
             plain="Add or remove repos in this workset, rename it, or pick a default branch."
           >
@@ -2784,7 +2824,14 @@ function WorksetView({ worksetId }: { worksetId: UUID }): JSX.Element {
           GitHub remote, gh not authenticated), we can't *determine*
           PRs — better to hide than misleadingly say "No open PRs". */}
       {cli?.gh && prs.some((p) => p.prs !== null) && (
-        <PRSection prs={prs} reposById={reposById} cli={cli} />
+        <PRSection
+          worksetId={worksetId}
+          prs={prs}
+          statuses={statuses}
+          preferredBranch={ws?.preferredBranch}
+          reposById={reposById}
+          cli={cli}
+        />
       )}
 
       <LandingSection
@@ -4461,64 +4508,172 @@ function QuietCollisionsLine({ groups }: { groups: CollisionGroup[] }): JSX.Elem
 }
 
 function PRSection({
+  worksetId,
   prs,
+  statuses,
+  preferredBranch,
   reposById,
   cli,
 }: {
+  worksetId: UUID;
   prs: RepoPRs[];
+  statuses: RepoStatus[];
+  preferredBranch?: string;
   reposById: Map<UUID, { name: string }>;
   cli: CliPresence | null;
 }): JSX.Element {
-  const flat: { repoId: UUID; repoName: string; pr: PullRequest }[] = [];
+  const linkPRs = useStore((s) => s.linkWorksetPRs);
+  const pushToast = useStore((s) => s.pushToast);
+  const [linking, setLinking] = useState(false);
+
+  // A PR is "this workset's" when its head is the branch the member repo
+  // is on right now, or the workset's pinned branch. Everything else is
+  // somebody else's open work in the same repos — useful context, but
+  // not what the CI / approval roll-up should count.
+  const branchByRepo = new Map(statuses.map((st) => [st.repoId, st.branch] as const));
+  const mine: { repoId: UUID; repoName: string; pr: PullRequest }[] = [];
+  const others: { repoId: UUID; repoName: string; pr: PullRequest }[] = [];
   for (const entry of prs) {
     if (!entry.prs) continue;
     const repoName = reposById.get(entry.repoId)?.name ?? entry.repoId;
-    for (const pr of entry.prs) flat.push({ repoId: entry.repoId, repoName, pr });
+    const current = branchByRepo.get(entry.repoId);
+    for (const pr of entry.prs) {
+      const ours = pr.headBranch === current || (!!preferredBranch && pr.headBranch === preferredBranch);
+      (ours ? mine : others).push({ repoId: entry.repoId, repoName, pr });
+    }
   }
-  flat.sort((a, b) => (a.pr.updatedAt < b.pr.updatedAt ? 1 : -1));
+  mine.sort((a, b) => a.repoName.localeCompare(b.repoName));
+  others.sort((a, b) => (a.pr.updatedAt < b.pr.updatedAt ? 1 : -1));
   const errored = prs.filter((p) => p.error && p.prs === null);
+
+  const rollup = { passing: 0, failing: 0, pending: 0, approved: 0 };
+  for (const { pr } of mine) {
+    if (pr.checks?.state === 'success') rollup.passing++;
+    else if (pr.checks?.state === 'failure') rollup.failing++;
+    else if (pr.checks?.state === 'pending') rollup.pending++;
+    if (pr.reviewDecision === 'APPROVED') rollup.approved++;
+  }
+
+  const onLink = async () => {
+    if (linking) return;
+    setLinking(true);
+    try {
+      const res = await linkPRs(worksetId);
+      const linked = res.filter((o) => o.result === 'linked').length;
+      const unchanged = res.filter((o) => o.result === 'unchanged').length;
+      const failed = res.filter((o) => o.result === 'failed');
+      const skipped = res.find((o) => o.result === 'skipped' && o.number);
+      if (failed.length > 0) {
+        pushToast({
+          kind: 'error',
+          message: `Cross-linked ${linked} ${linked === 1 ? 'PR' : 'PRs'}; ${failed.length} failed.`,
+          details: failed.map(
+            (o) => `${reposById.get(o.repoId)?.name ?? o.repoId}: ${o.message ?? 'failed'}`,
+          ),
+        });
+      } else if (linked === 0 && unchanged === 0) {
+        pushToast({ kind: 'warn', message: skipped?.message ?? 'No open PRs to cross-link.' });
+      } else {
+        pushToast({
+          kind: 'success',
+          message:
+            linked > 0
+              ? `Cross-linked ${linked} ${linked === 1 ? 'PR' : 'PRs'}.`
+              : 'PRs were already cross-linked.',
+        });
+      }
+    } finally {
+      setLinking(false);
+    }
+  };
+
+  const row = ({ repoId, repoName, pr }: { repoId: UUID; repoName: string; pr: PullRequest }) => (
+    <li
+      key={`${repoId}:${pr.number}`}
+      className="flex items-center gap-3 px-3 py-2 rounded border border-card bg-card text-xs"
+    >
+      <span className="text-ink-faint w-40 truncate">{repoName}</span>
+      <a
+        href={pr.url}
+        target="_blank"
+        rel="noreferrer"
+        className="font-medium hover:underline truncate flex-1"
+      >
+        #{pr.number} {pr.title}
+      </a>
+      {pr.isDraft && (
+        <span className="text-[10px] uppercase font-mono text-ink-faint">draft</span>
+      )}
+      <ChecksBadge checks={pr.checks} />
+      <ReviewBadge decision={pr.reviewDecision} />
+      <span className="text-[11px] text-ink-faint font-mono">
+        {pr.headBranch} → {pr.baseBranch}
+      </span>
+      <span className="text-[11px] text-ink-faint">{pr.author}</span>
+    </li>
+  );
 
   return (
     <section className="mb-6">
-      <h2 className="text-[10px] uppercase tracking-wide text-ink-faint mb-2">
-        Open pull requests
-      </h2>
+      <div className="mb-2 flex items-center gap-3">
+        <h2 className="text-[10px] uppercase tracking-wide text-ink-faint">
+          Pull requests
+        </h2>
+        {mine.length > 0 && (
+          <span className="text-[11px] text-ink-faint flex items-center gap-2">
+            <span>
+              {mine.length} in this workset
+            </span>
+            {rollup.failing > 0 && <span className="text-red-400">✗ {rollup.failing} failing</span>}
+            {rollup.pending > 0 && <span className="text-amber-400">● {rollup.pending} running</span>}
+            {rollup.passing > 0 && <span className="text-emerald-400">✓ {rollup.passing} passing</span>}
+            <span className={rollup.approved === mine.length ? 'text-emerald-400' : ''}>
+              {rollup.approved}/{mine.length} approved
+            </span>
+          </span>
+        )}
+        {mine.length >= 2 && (
+          <Explain
+            command="gh pr edit <n> --body …"
+            plain="Add a Related PRs list to each of this workset's PR descriptions so reviewers can jump between them. Re-running refreshes the list; the rest of each description is left alone."
+          >
+            <button
+              onClick={onLink}
+              disabled={linking}
+              className="ml-auto text-[11px] px-2 py-1 rounded border border-card hover:bg-card disabled:opacity-50 inline-flex items-center gap-1.5"
+            >
+              {linking && <Spinner size={10} />}
+              {linking ? 'Linking…' : 'Cross-link PRs'}
+            </button>
+          </Explain>
+        )}
+      </div>
       {!cli?.gh ? (
         <div className="text-[11px] text-ink-faint p-3 rounded border border-card bg-card">
           Install <span className="font-mono">gh</span> to surface PRs across the workset.
         </div>
-      ) : flat.length === 0 ? (
+      ) : mine.length === 0 && others.length === 0 ? (
         <div className="text-[11px] text-ink-faint p-3 rounded border border-card bg-card">
           No open PRs in this workset.
         </div>
       ) : (
-        <ul className="flex flex-col gap-1">
-          {flat.map(({ repoId, repoName, pr }) => (
-            <li
-              key={`${repoId}:${pr.number}`}
-              className="flex items-center gap-3 px-3 py-2 rounded border border-card bg-card text-xs"
-            >
-              <span className="text-ink-faint w-40 truncate">{repoName}</span>
-              <a
-                href={pr.url}
-                target="_blank"
-                rel="noreferrer"
-                className="font-medium hover:underline truncate flex-1"
-              >
-                #{pr.number} {pr.title}
-              </a>
-              {pr.isDraft && (
-                <span className="text-[10px] uppercase font-mono text-ink-faint">
-                  draft
-                </span>
-              )}
-              <span className="text-[11px] text-ink-faint font-mono">
-                {pr.headBranch} → {pr.baseBranch}
-              </span>
-              <span className="text-[11px] text-ink-faint">{pr.author}</span>
-            </li>
-          ))}
-        </ul>
+        <>
+          {mine.length === 0 ? (
+            <div className="text-[11px] text-ink-faint p-3 rounded border border-card bg-card">
+              No open PRs for this workset&apos;s branches yet.
+            </div>
+          ) : (
+            <ul className="flex flex-col gap-1">{mine.map(row)}</ul>
+          )}
+          {others.length > 0 && (
+            <details className="mt-2">
+              <summary className="text-[11px] text-ink-faint cursor-pointer select-none">
+                {others.length} other open {others.length === 1 ? 'PR' : 'PRs'} in these repos
+              </summary>
+              <ul className="flex flex-col gap-1 mt-1 opacity-80">{others.map(row)}</ul>
+            </details>
+          )}
+        </>
       )}
       {errored.length > 0 && cli?.gh && (
         <p className="text-[10px] text-ink-faint mt-1">
@@ -4528,6 +4683,50 @@ function PRSection({
       )}
     </section>
   );
+}
+
+/// CI roll-up for one PR. Nothing renders when the repo has no checks —
+/// a grey "no checks" chip on every row of a CI-less repo is noise.
+function ChecksBadge({ checks }: { checks?: PRChecks }): JSX.Element | null {
+  if (!checks || checks.state === 'none') return null;
+  if (checks.state === 'failure') {
+    return (
+      <span
+        className="text-[11px] text-red-400 whitespace-nowrap"
+        title={`Failing: ${checks.failing.join(', ')}`}
+      >
+        ✗ {checks.failed}/{checks.total} failing
+      </span>
+    );
+  }
+  if (checks.state === 'pending') {
+    return (
+      <span
+        className="text-[11px] text-amber-400 whitespace-nowrap"
+        title={`${checks.passed} passed, ${checks.pending} still running`}
+      >
+        ● {checks.pending} running
+      </span>
+    );
+  }
+  return (
+    <span className="text-[11px] text-emerald-400 whitespace-nowrap" title={`${checks.total} checks passed`}>
+      ✓ checks
+    </span>
+  );
+}
+
+function ReviewBadge({ decision }: { decision?: PullRequest['reviewDecision'] }): JSX.Element | null {
+  if (decision === 'APPROVED') {
+    return <span className="text-[11px] text-emerald-400 whitespace-nowrap">approved</span>;
+  }
+  if (decision === 'CHANGES_REQUESTED') {
+    return <span className="text-[11px] text-red-400 whitespace-nowrap">changes requested</span>;
+  }
+  if (decision === 'REVIEW_REQUIRED') {
+    return <span className="text-[11px] text-ink-faint whitespace-nowrap">review needed</span>;
+  }
+  return null;
 }
 
 /// "Recent" feed across the workset. Merges commits and PR events
@@ -4600,12 +4799,19 @@ function ActivitySection({
             </button>
             {it.kind === 'commit' ? (
               <>
-                <span className="font-mono text-[10px] text-ink-faint shrink-0">
-                  {it.shortSha}
-                </span>
-                <span className="truncate flex-1" title={it.subject}>
-                  {it.subject}
-                </span>
+                <button
+                  onClick={() => {
+                    onSelectRepo(it.repoId);
+                    openRepoCommit(it.repoId, it.sha);
+                  }}
+                  className="flex items-center gap-3 flex-1 min-w-0 text-left hover:text-ink group"
+                  title={`Show ${it.shortSha} in ${it.repoName}'s history`}
+                >
+                  <span className="font-mono text-[10px] text-ink-faint shrink-0">
+                    {it.shortSha}
+                  </span>
+                  <span className="truncate flex-1 group-hover:underline">{it.subject}</span>
+                </button>
                 <span className="text-[10px] text-ink-faint shrink-0 truncate max-w-[160px]">
                   {it.author}
                 </span>

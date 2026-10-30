@@ -28,6 +28,7 @@ export function CommandPalette(): JSX.Element | null {
   const worksets = useStore((s) => s.worksets);
   const selectedRepoId = useStore((s) => s.selectedRepoId);
   const selectedWsId = useStore((s) => s.selectedWorksetId);
+  const selectedWorkspaceId = useStore((s) => s.selectedWorkspaceId);
   const branchSummaries = useStore((s) =>
     selectedRepoId
       ? s.repoBranchSummaries[selectedRepoId] ?? EMPTY_BRANCHES
@@ -122,6 +123,7 @@ export function CommandPalette(): JSX.Element | null {
         cli,
         selectedRepoId,
         selectedWsId,
+        selectedWorkspaceId,
         lastCommitUnpushed,
         actions: {
           close: () => close(false),
@@ -153,6 +155,7 @@ export function CommandPalette(): JSX.Element | null {
       cli,
       selectedRepoId,
       selectedWsId,
+      selectedWorkspaceId,
       lastCommitUnpushed,
       close,
       selectRepo,
@@ -406,6 +409,7 @@ interface BuildArgs {
   cli: { gh?: boolean; claude?: boolean; codex?: boolean; gemini?: boolean } | null;
   selectedRepoId: UUID | null;
   selectedWsId: UUID | null;
+  selectedWorkspaceId: UUID | null;
   lastCommitUnpushed: boolean;
   actions: {
     close: () => void;
@@ -443,6 +447,7 @@ function buildSections(args: BuildArgs): PaletteSection[] {
     cli,
     selectedRepoId,
     selectedWsId,
+    selectedWorkspaceId,
     lastCommitUnpushed,
     actions,
   } = args;
@@ -670,6 +675,16 @@ function buildSections(args: BuildArgs): PaletteSection[] {
         perform: () => { void useStore.getState().runLandingCheck(selectedWsId); actions.close(); },
       },
       {
+        id: 'search-ws',
+        title: 'Search across workset',
+        hint: 'Code or commit messages in every member repo',
+        glyph: '⌕',
+        perform: () => {
+          actions.setSheet({ kind: 'searchRepos', scope: { kind: 'workset', id: selectedWsId } });
+          actions.close();
+        },
+      },
+      {
         id: 'open-prs-ws',
         title: 'Open PRs across workset',
         hint: cli?.gh ? 'Shared title and body · gh pr create per repo' : 'Install gh first',
@@ -683,6 +698,35 @@ function buildSections(args: BuildArgs): PaletteSection[] {
     for (const a of wsActions) {
       if (matches(a.title) || (a.hint && matches(a.hint))) repoActionItems.push(a);
     }
+  }
+  if (selectedRepoId) {
+    const a: PaletteItem = {
+      id: 'search-repo',
+      title: 'Search in this repo',
+      hint: `Code, commit messages or SHA · ${shortcutText(['Mod', 'Shift', 'F'])}`,
+      glyph: '⌕',
+      perform: () => {
+        actions.setSheet({ kind: 'searchRepos', scope: { kind: 'repo', id: selectedRepoId } });
+        actions.close();
+      },
+    };
+    if (matches(a.title) || matches('search code commits sha')) repoActionItems.push(a);
+  }
+  if (selectedWorkspaceId) {
+    const a: PaletteItem = {
+      id: 'search-workspace',
+      title: 'Search across workspace',
+      hint: 'Code or commit messages in every repo of this workspace',
+      glyph: '⌕',
+      perform: () => {
+        actions.setSheet({
+          kind: 'searchRepos',
+          scope: { kind: 'workspace', id: selectedWorkspaceId },
+        });
+        actions.close();
+      },
+    };
+    if (matches(a.title) || (a.hint && matches(a.hint))) repoActionItems.push(a);
   }
   if (repoActionItems.length)
     sections.push({ label: selectedRepoId ? 'Repo actions' : 'Actions', items: repoActionItems });

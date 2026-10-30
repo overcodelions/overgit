@@ -19,6 +19,7 @@ import type {
   Repo,
   RepoChanges,
   RepoPRs,
+  RepoSearchScope,
   RepoStatus,
   ResolvedIdentity,
   SquashMergeLink,
@@ -28,6 +29,7 @@ import type {
   Workset,
   WorksetLandingReport,
   WorksetActivity,
+  WorksetLinkPROutcome,
   WorksetOpenPROutcome,
   WorksetPushOutcome,
   WorksetResetOutcome,
@@ -54,6 +56,7 @@ export type Sheet =
   | { kind: 'commitAllInWorkset'; worksetId: UUID }
   | { kind: 'pushAllInWorkset'; worksetId: UUID }
   | { kind: 'openPRsInWorkset'; worksetId: UUID }
+  | { kind: 'searchRepos'; scope: RepoSearchScope }
   | { kind: 'newWorkspace' }
   | { kind: 'editWorkspace'; workspaceId: UUID }
   | { kind: 'resetWorkspaceProgress'; workspaceId: UUID; repoIds: UUID[] }
@@ -273,6 +276,9 @@ interface UiState {
     id: UUID,
     args: { title: string; body: string; draft: boolean },
   ) => Promise<WorksetOpenPROutcome[]>;
+  /// Rewrite each workset PR's "Related PRs" block so every PR links
+  /// its siblings, then refresh the PR list.
+  linkWorksetPRs: (id: UUID) => Promise<WorksetLinkPROutcome[]>;
   checkoutWorksetBranch: (id: UUID, branch: string, createIfMissing: boolean) => Promise<void>;
   /// "Pick up where you left off." If the workset's bound branch exists in
   /// at least one member repo, this is a plain checkout (missing-branch
@@ -575,6 +581,60 @@ function invalidateCache(prefix: string): void {
 /// from a Landing row self-heals within one tick.
 function invalidateLanding(): void {
   invalidateCache('worksetLanding:');
+}
+
+/// Tab to show when the next RepoDetail mounts. The `overgit:setRepoTab`
+/// event only reaches a RepoDetail that's already on screen; callers
+/// that select a repo *and* pick its tab in one go (cross-repo search
+/// results) queue the tab here so the freshly mounted view starts on it.
+export type RepoTab = 'changes' | 'history' | 'files' | 'stash' | 'branches';
+let queuedRepoTab: RepoTab | null = null;
+
+export function openRepoTab(tab: RepoTab): void {
+  queuedRepoTab = tab;
+  window.dispatchEvent(new CustomEvent('overgit:setRepoTab', { detail: tab }));
+}
+
+/// Read without clearing: React StrictMode runs state initializers and
+/// mount effects twice in development, so a read-once queue is empty by
+/// the second run and the view falls back to its defaults.
+export function peekQueuedRepoTab(): RepoTab | null {
+  return queuedRepoTab;
+}
+
+/// `deferred` clears after the current mount settles (both StrictMode
+/// passes have read it). Only clears if nothing re-queued in between.
+export function clearQueuedRepoTab(deferred = false): void {
+  const seen = queuedRepoTab;
+  const clear = () => {
+    if (queuedRepoTab === seen) queuedRepoTab = null;
+  };
+  if (deferred) window.setTimeout(clear, 0);
+  else clear();
+}
+
+/// Same idea for a commit the History tab should select on arrival.
+/// Keyed by repo so a History tab still showing the previous repo
+/// (RepoDetail isn't remounted on repo switch) leaves it for the right one.
+let queuedCommit: { repoId: UUID; sha: string } | null = null;
+
+export function openRepoCommit(repoId: UUID, sha: string): void {
+  queuedCommit = { repoId, sha };
+  openRepoTab('history');
+  window.dispatchEvent(new CustomEvent('overgit:focusCommit', { detail: { repoId, sha } }));
+}
+
+export function peekQueuedCommit(repoId: UUID): string | null {
+  return queuedCommit && queuedCommit.repoId === repoId ? queuedCommit.sha : null;
+}
+
+export function clearQueuedCommit(deferred = false): void {
+  const seen = queuedCommit;
+  const clear = () => {
+    if (queuedCommit === seen) queuedCommit = null;
+  };
+  if (deferred) window.setTimeout(clear, 0);
+  else clear();
 }
 
 export const useStore = create<UiState>((set, get) => ({
@@ -1081,6 +1141,12 @@ export const useStore = create<UiState>((set, get) => ({
     // reflected without a manual refresh click.
     await get().refreshWorksetPRs(id, true);
     invalidateLanding();
+    return outcomes;
+  },
+
+  linkWorksetPRs: async (id) => {
+    const outcomes = await window.overgit.invoke('workset:linkPRs', id);
+    await get().refreshWorksetPRs(id, true);
     return outcomes;
   },
 
