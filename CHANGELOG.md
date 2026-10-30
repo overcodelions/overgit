@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-10-29
+
 ### Added
 
 - CI and review status on pull requests. Each PR in a workset shows whether
@@ -266,6 +268,7 @@ Initial public release. Building in the open from here.
 - Resizable sidebar, light / dark / system theme, keyboard shortcuts.
 
 [Unreleased]: https://github.com/overcodelions/overgit/compare/v0.4.4...HEAD
+[0.4.5]: https://github.com/overcodelions/overgit/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/overcodelions/overgit/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/overcodelions/overgit/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/overcodelions/overgit/compare/v0.4.1...v0.4.2
