@@ -269,6 +269,7 @@ interface UiState {
     worktreePath: string,
     force: boolean,
   ) => Promise<{ ok: boolean; error?: string }>;
+  detachWorktree: (id: UUID, worktreePath: string) => Promise<{ ok: boolean; error?: string }>;
   pruneWorktrees: (id: UUID) => Promise<{ ok: boolean; error?: string; output?: string }>;
   commitAllWorkset: (id: UUID, message: string) => Promise<CommitAllOutcome[]>;
   pushAllWorkset: (id: UUID) => Promise<WorksetPushOutcome[]>;
@@ -1069,6 +1070,12 @@ export const useStore = create<UiState>((set, get) => ({
       worktreePath,
       force,
     });
+    if (res.ok) await get().refreshRepoWorktrees(id);
+    return res;
+  },
+
+  detachWorktree: async (id, worktreePath) => {
+    const res = await window.overgit.invoke('repo:detachWorktree', { repoId: id, worktreePath });
     if (res.ok) await get().refreshRepoWorktrees(id);
     return res;
   },

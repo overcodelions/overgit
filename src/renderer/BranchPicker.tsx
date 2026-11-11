@@ -113,6 +113,38 @@ export function BranchPicker({ repoId, anchorRef, initialMode, onClose }: Props)
     if (activeIdx >= flat.length) setActiveIdx(Math.max(0, flat.length - 1));
   }, [flat.length, activeIdx]);
 
+  /// git refuses to check out a branch another worktree already holds.
+  /// Offer to free it by detaching that worktree's HEAD — files and any
+  /// uncommitted work there stay put — then retry the switch here.
+  const detachWorktree = useStore((s) => s.detachWorktree);
+  const resolveWorktreeConflict = async (target: string, worktreePath: string) => {
+    const ok = await requestConfirm({
+      title: `${target} is checked out in another worktree`,
+      body:
+        `git won't check out the same branch in two places, and ${target} is checked out at:\n\n${worktreePath}\n\n` +
+        `Detach that worktree and switch here? Its files and any uncommitted changes stay where they are; ` +
+        `it just stops being on ${target}. To delete the worktree instead, use the Worktrees panel.`,
+      confirmLabel: `Detach & switch to ${target}`,
+    });
+    if (!ok) return;
+    const det = await detachWorktree(repoId, worktreePath);
+    if (!det.ok) {
+      pushToast({ kind: 'error', message: `Couldn't detach worktree: ${det.error ?? 'unknown error'}` });
+      return;
+    }
+    const retry = await checkout(repoId, target, false);
+    if (retry.result === 'switched' || retry.result === 'already-on-branch') {
+      pushToast({ kind: 'success', message: `Switched to ${target}. The worktree at ${worktreePath} is now detached.` });
+    } else if (retry.result === 'dirty') {
+      pushToast({
+        kind: 'warn',
+        message: `Worktree detached, but can't switch to ${target}: working tree has uncommitted changes. Stash, commit, or discard first.`,
+      });
+    } else {
+      pushToast({ kind: 'error', message: retry.message ?? `Checkout of ${target} failed` });
+    }
+  };
+
   const onSwitch = async (b: BranchSummary) => {
     if (b.isCurrent) {
       onClose();
@@ -136,12 +168,11 @@ export function BranchPicker({ repoId, anchorRef, initialMode, onClose }: Props)
           message: `Branch ${target} doesn't exist locally or on origin.`,
         });
       } else if (outcome.result === 'worktree-conflict') {
-        pushToast({
-          kind: 'warn',
-          message: outcome.worktreePath
-            ? `${target} is checked out at ${outcome.worktreePath}. Adopt or remove that worktree first (Worktrees panel).`
-            : `${target} is checked out in a linked worktree.`,
-        });
+        if (!outcome.worktreePath) {
+          pushToast({ kind: 'warn', message: `${target} is checked out in a linked worktree.` });
+        } else {
+          await resolveWorktreeConflict(target, outcome.worktreePath);
+        }
       }
       onClose();
     } finally {
