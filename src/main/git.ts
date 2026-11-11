@@ -1606,7 +1606,7 @@ export async function pruneWorktrees(
   return { ok: false, error: res.stderr.trim() || `git worktree prune exited ${res.code}` };
 }
 
-function classifyFailure(repoId: UUID, branch: string, r: RunResult): CheckoutOutcome {
+export function classifyFailure(repoId: UUID, branch: string, r: RunResult): CheckoutOutcome {
   const combined = `${r.stdout}\n${r.stderr}`;
   const text = combined.toLowerCase();
   // Git's "would be overwritten by checkout" / "local changes" messages
@@ -1620,10 +1620,12 @@ function classifyFailure(repoId: UUID, branch: string, r: RunResult): CheckoutOu
     return { repoId, result: 'dirty', branch, message: r.stderr.trim() };
   }
   // `fatal: 'feature/x' is already checked out at '/path/to/worktree'`
+  // (git < 2.42) or `fatal: 'feature/x' is already used by worktree at
+  // '/path/to/worktree'` (git >= 2.42)
   // — a sibling worktree already owns the branch. We surface the path
   // so the renderer can offer to adopt (remove the worktree, switch in
   // main) without the user hand-running git.
-  const wt = /already checked out at ['"]([^'"]+)['"]/i.exec(combined);
+  const wt = /already (?:checked out|used by worktree) at ['"]([^'"]+)['"]/i.exec(combined);
   if (wt) {
     return {
       repoId,

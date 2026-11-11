@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { checkoutBranch as checkout, detachWorktree } from './git';
+import { checkoutBranch as checkout, classifyFailure, detachWorktree } from './git';
 
 let root: string;
 let repoPath: string;
@@ -56,5 +56,17 @@ describe('detachWorktree', () => {
   it('refuses the main checkout and unknown paths', async () => {
     expect((await detachWorktree(repoPath, repoPath)).ok).toBe(false);
     expect((await detachWorktree(repoPath, path.join(root, 'nope'))).ok).toBe(false);
+  });
+});
+
+describe('classifyFailure worktree conflicts', () => {
+  // Local git may be older or newer than CI's, so pin both wordings.
+  it.each([
+    ["fatal: 'main' is already checked out at '/tmp/wt'", 'git < 2.42'],
+    ["fatal: 'main' is already used by worktree at '/tmp/wt'", 'git >= 2.42'],
+  ])('recognises %s (%s)', (stderr) => {
+    const out = classifyFailure('r', 'main', { ok: false, code: 128, stdout: '', stderr } as never);
+    expect(out.result).toBe('worktree-conflict');
+    expect(out.worktreePath).toBe('/tmp/wt');
   });
 });
