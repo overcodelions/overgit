@@ -1170,6 +1170,14 @@ export interface IPCInvokeMap {
     worktreePath: string;
     force: boolean;
   }) => { ok: boolean; error?: string };
+  /// Detach a linked worktree's HEAD so the branch it holds can be
+  /// checked out elsewhere. Non-destructive: files and uncommitted
+  /// changes in the worktree are left in place. Prunes instead when the
+  /// worktree's directory is already gone.
+  'repo:detachWorktree': (args: {
+    repoId: UUID;
+    worktreePath: string;
+  }) => { ok: boolean; error?: string };
   'repo:pruneWorktrees': (repoId: UUID) => { ok: boolean; error?: string; output?: string };
 
   'fs:listFiles': (repoId: UUID) => string[];

@@ -1565,6 +1565,36 @@ export async function removeWorktree(
   return { ok: false, error: res.stderr.trim() || `git worktree remove exited ${res.code}` };
 }
 
+/// Free a branch held by a linked worktree by detaching that worktree's
+/// HEAD (`git -C <worktree> switch --detach`). Unlike remove/adopt this
+/// is non-destructive: the worktree directory, its files and any
+/// uncommitted changes stay exactly where they are (HEAD keeps pointing
+/// at the same commit, so the working tree doesn't move). Afterwards
+/// the branch can be checked out in the main repo.
+export async function detachWorktree(
+  repoPath: string,
+  worktreePath: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  // Only act on a path git itself lists as a linked worktree of this
+  // repo — never run a switch in an arbitrary directory, and never
+  // detach the main checkout.
+  const wts = await listWorktrees(repoPath);
+  const wt = wts.find((w) => pathsEqual(w.path, worktreePath));
+  if (!wt) return { ok: false, error: `Worktree not found at ${worktreePath}. Refresh and retry.` };
+  if (wt.isMain) return { ok: false, error: 'Refusing to detach the main checkout' };
+  if (wt.prunable) {
+    // Directory is gone; git still has the admin entry holding the
+    // branch. Pruning is the fix and is safe (nothing on disk to lose).
+    const prune = await run(repoPath, ['worktree', 'prune']);
+    if (prune.ok) return { ok: true };
+    return { ok: false, error: prune.stderr.trim() || `git worktree prune exited ${prune.code}` };
+  }
+  const res = await run(wt.path, ['switch', '--detach']);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.stderr.trim() || `git switch --detach exited ${res.code}` };
+}
+
 /// `git worktree prune`. Cleans up administrative entries for
 /// worktrees whose directories were deleted out from under git.
 export async function pruneWorktrees(

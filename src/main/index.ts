@@ -59,6 +59,7 @@ import {
   pushTag,
   removeRemote,
   removeWorktree,
+  detachWorktree,
   initRepo,
   cloneRepo,
   cancelClone,
@@ -1461,6 +1462,15 @@ function registerIpc(): void {
       const repo = Store.load().repos.find((r) => r.id === args.repoId);
       if (!repo) return { ok: false, error: 'Unknown repo' };
       return removeWorktree(repo.path, args.worktreePath, args.force);
+    },
+  );
+
+  ipcMain.handle(
+    'repo:detachWorktree',
+    async (_e, args: { repoId: string; worktreePath: string }) => {
+      const repo = Store.load().repos.find((r) => r.id === args.repoId);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return detachWorktree(repo.path, args.worktreePath);
     },
   );
 
