@@ -108,13 +108,15 @@ type RemoteProvider =
   | { kind: 'bitbucket'; workset: string; repo: string }
   | { kind: 'unknown' };
 
-function parseRemoteUrl(url: string): RemoteProvider {
+export function parseRemoteUrl(url: string): RemoteProvider {
   const trimmed = url.trim().replace(/\.git$/, '');
   // SSH form: git@host:owner/repo  (or :owner/repo for some hosts)
   const sshMatch = /^(?:ssh:\/\/)?(?:[^@\s]+@)?([^:/\s]+)[:/](.+?)$/.exec(trimmed);
   // HTTPS form: https://host/owner/repo
   const httpsMatch = /^https?:\/\/(?:[^@\s]+@)?([^/\s]+)\/(.+?)$/.exec(trimmed);
-  const m = sshMatch ?? httpsMatch;
+  // HTTPS first: the SSH pattern also matches `https://host/...` (it reads
+  // the scheme as the host), which hid PRs and CI for HTTPS clones.
+  const m = httpsMatch ?? sshMatch;
   if (!m) return { kind: 'unknown' };
   const host = m[1].toLowerCase();
   const path = m[2];
