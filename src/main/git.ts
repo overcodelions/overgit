@@ -1270,6 +1270,22 @@ function pathsEqual(a: string, b: string): boolean {
   }
 }
 
+/// Turn `for-each-ref --format=%(refname) refs/remotes` output into
+/// `remote/branch` names. Full refnames are used on purpose: the short
+/// form of `refs/remotes/origin/HEAD` is just `origin`, which slipped
+/// past a `/HEAD` check and showed up in the branch picker as a branch.
+export function parseRemoteBranchRefs(stdout: string): string[] {
+  const out: string[] = [];
+  for (const line of stdout.split('\n')) {
+    const ref = line.trim();
+    if (!ref.startsWith('refs/remotes/')) continue;
+    const name = ref.slice('refs/remotes/'.length);
+    if (!name.includes('/') || name.endsWith('/HEAD')) continue;
+    out.push(name);
+  }
+  return out;
+}
+
 export async function listBranches(
   repoPath: string,
 ): Promise<{ local: string[]; remote: string[] }> {
@@ -1287,18 +1303,10 @@ export async function listBranches(
 
   const remoteRes = await run(repoPath, [
     'for-each-ref',
-    '--format=%(refname:short)',
+    '--format=%(refname)',
     'refs/remotes',
   ]);
-  if (remoteRes.ok) {
-    for (const line of remoteRes.stdout.split('\n')) {
-      const name = line.trim();
-      // Skip "origin/HEAD -> origin/main" alias entries; for-each-ref
-      // doesn't expand the arrow, but the alias itself shows up as
-      // "origin/HEAD" which is never useful for switching to.
-      if (name && !name.endsWith('/HEAD')) remote.push(name);
-    }
-  }
+  if (remoteRes.ok) remote.push(...parseRemoteBranchRefs(remoteRes.stdout));
 
   return { local, remote };
 }

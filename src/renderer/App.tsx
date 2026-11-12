@@ -6,7 +6,8 @@ import { SheetHost, ReviewBody, formatBytes } from './Sheets';
 import { CommandPalette } from './CommandPalette';
 import { Explain } from './Explain';
 import { Spinner } from './Spinner';
-import { relativeTime } from './BranchPicker';
+import { checkedCaption, relativeTime } from './BranchPicker';
+import { followTheme } from './theme';
 import { Welcome } from './onboarding/Welcome';
 import { GettingStarted } from './onboarding/GettingStartedCard';
 import { shortcutText } from './onboarding/shortcuts';
@@ -64,6 +65,9 @@ export function App(): JSX.Element {
   useEffect(() => {
     hydrate();
   }, [hydrate]);
+
+  const theme = useStore((s) => s.settings.theme);
+  useEffect(() => followTheme(theme), [theme]);
 
   useGlobalShortcuts();
   useMenuCommands();
@@ -4132,7 +4136,7 @@ function LandingSection({
   ];
   const caption = [
     ...chips.filter(([n]) => n > 0).map(([n, label]) => `${n} ${label}`),
-    `as of ${relativeTime(report.checkedAt)} ago`,
+    checkedCaption(report.checkedAt),
   ].join(' · ');
   const dirtyMembers = report.outcomes.filter(
     (o) => (statuses.find((s) => s.repoId === o.repoId)?.dirtyCount ?? 0) > 0,

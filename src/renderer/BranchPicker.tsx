@@ -1096,6 +1096,15 @@ function useAnchorRect(ref: React.RefObject<HTMLElement>) {
   return rect;
 }
 
+/// "checked just now" / "as of 5m ago" for the landing check caption.
+/// relativeTime() returns a bare `now` under a minute, so a plain
+/// `${…} ago` read "as of now ago".
+export function checkedCaption(iso: string): string {
+  const t = relativeTime(iso);
+  if (!t) return 'not checked yet';
+  return t === 'now' ? 'checked just now' : `as of ${t} ago`;
+}
+
 export function relativeTime(iso: string): string {
   if (!iso) return '';
   try {

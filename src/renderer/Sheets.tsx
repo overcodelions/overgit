@@ -1,6 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { openRepoCommit, openRepoTab, useStore } from './store';
 import { Spinner } from './Spinner';
+import { applyTheme } from './theme';
 import { AppMark, KeyCombo } from './onboarding/helpChrome';
 import { BasicsSheet, SetupSheet, ShortcutsSheet } from './onboarding/HelpSheets';
 import { SHORTCUT_GROUPS, shortcutText } from './onboarding/shortcuts';
@@ -2068,21 +2069,6 @@ function Section({
       {children}
     </section>
   );
-}
-
-function applyTheme(theme: 'light' | 'dark' | 'system'): void {
-  // Single point of theme application: toggle the `dark` class on <body>.
-  // CSS variables in styles.css read off that class. `system` follows the
-  // OS via prefers-color-scheme.
-  const body = document.body;
-  if (theme === 'dark') {
-    body.classList.add('dark');
-  } else if (theme === 'light') {
-    body.classList.remove('dark');
-  } else {
-    const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-    body.classList.toggle('dark', dark);
-  }
 }
 
 /// About sheet — designed as a real product page, not a "v0.1.0" stub.
