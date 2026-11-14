@@ -1,5 +1,18 @@
 export type ThemeChoice = 'light' | 'dark' | 'system';
 
+/// Accent hues shared by the History graph's lanes and the Branches
+/// tab's per-author branch icons.
+export const LANE_COLORS = [
+  '#8a78ff',
+  '#5eead4',
+  '#fbbf24',
+  '#f472b6',
+  '#60a5fa',
+  '#a3e635',
+  '#fb923c',
+  '#22d3ee',
+];
+
 /// Single point of theme application: toggle the `dark` class on <body>.
 /// CSS variables in styles.css read off that class. `system` follows the
 /// OS via prefers-color-scheme.

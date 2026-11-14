@@ -111,6 +111,7 @@ import {
   worksetSyncAndBranch,
   worksetSyncMemberToBranch,
   worksetWorktrees,
+  repoListPRs,
 } from './workset';
 import {
   detectCliPresence,
@@ -557,7 +558,7 @@ function registerIpc(): void {
   // self-documenting.
   const handleCheckout = async (
     _e: unknown,
-    args: { repoId: string; branch: string; createIfMissing: boolean },
+    args: { repoId: string; branch: string; createIfMissing: boolean; remote?: string },
   ) => {
     const repo = Store.load().repos.find((r) => r.id === args.repoId);
     if (!repo) {
@@ -568,7 +569,7 @@ function registerIpc(): void {
         message: 'Unknown repo',
       };
     }
-    return checkoutBranch(repo.id, repo.path, args.branch, args.createIfMissing);
+    return checkoutBranch(repo.id, repo.path, args.branch, args.createIfMissing, args.remote);
   };
   ipcMain.handle('repo:retryCheckout', handleCheckout);
   ipcMain.handle('repo:checkout', handleCheckout);
@@ -1233,6 +1234,12 @@ function registerIpc(): void {
   ipcMain.handle('workset:listPRs', async (_e, worksetId: string) => {
     const { worksets, repos } = Store.load();
     return worksetListPRs(worksetId, worksets, repos);
+  });
+
+  ipcMain.handle('repo:listPRs', async (_e, repoId: string) => {
+    const repo = repoFromArg(repoId);
+    if (!repo) return { repoId, prs: null, error: 'Unknown repo' };
+    return repoListPRs(repo);
   });
 
   ipcMain.handle(

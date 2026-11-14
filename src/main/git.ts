@@ -1354,9 +1354,14 @@ export async function checkoutBranch(
   repoPath: string,
   branch: string,
   createIfMissing: boolean,
+  /// Remote to create a tracking branch from when no local branch exists.
+  remote = 'origin',
 ): Promise<CheckoutOutcome> {
   if (!looksLikeRepo(repoPath)) {
     return { repoId, result: 'error', branch, message: 'Not a git repo' };
+  }
+  if (!isSafeRefArg(remote)) {
+    return { repoId, result: 'error', branch, message: `Refusing remote name "${remote}"` };
   }
   if (!isSafeRefArg(branch)) {
     return { repoId, result: 'error', branch, message: `Refusing branch name "${branch}"` };
@@ -1377,7 +1382,7 @@ export async function checkoutBranch(
     'show-ref',
     '--verify',
     '--quiet',
-    `refs/remotes/origin/${target}`,
+    `refs/remotes/${remote}/${target}`,
   ]);
 
   // Case-insensitive fallback: if neither the typed-case local nor
@@ -1399,7 +1404,7 @@ export async function checkoutBranch(
         'show-ref',
         '--verify',
         '--quiet',
-        `refs/remotes/origin/${target}`,
+        `refs/remotes/${remote}/${target}`,
       ]);
     }
   }
@@ -1409,15 +1414,15 @@ export async function checkoutBranch(
   // fetched, so without this probe a workset checkout would falsely
   // report `missing-branch` for a branch that exists on origin.
   if (!localExists.ok && !remoteExists.ok) {
-    const ls = await run(repoPath, ['ls-remote', '--heads', 'origin', target], undefined, NETWORK_TIMEOUT_MS);
+    const ls = await run(repoPath, ['ls-remote', '--heads', remote, target], undefined, NETWORK_TIMEOUT_MS);
     if (ls.ok && ls.stdout.trim().length > 0) {
-      const fetchRes = await run(repoPath, ['fetch', 'origin', target], undefined, NETWORK_TIMEOUT_MS);
+      const fetchRes = await run(repoPath, ['fetch', remote, target], undefined, NETWORK_TIMEOUT_MS);
       if (fetchRes.ok) {
         remoteExists = await run(repoPath, [
           'show-ref',
           '--verify',
           '--quiet',
-          `refs/remotes/origin/${target}`,
+          `refs/remotes/${remote}/${target}`,
         ]);
       }
     }
@@ -1443,7 +1448,7 @@ export async function checkoutBranch(
   // with `origin/<branch>` so git doesn't bail with "invalid reference".
   const switchRes = localExists.ok
     ? await run(repoPath, ['switch', target])
-    : await run(repoPath, ['switch', '-c', target, '--track', `origin/${target}`]);
+    : await run(repoPath, ['switch', '-c', target, '--track', `${remote}/${target}`]);
   if (switchRes.ok) return { repoId, result: 'switched', branch: target };
   return classifyFailure(repoId, target, switchRes);
 }
@@ -3396,6 +3401,9 @@ export interface BranchSummary {
   /// Configured upstream tracking ref ("origin/main" for local "main"),
   /// or null if untracked. Lets the picker tag a branch as "tracks X".
   upstream: string | null;
+  /// Commits ahead of / behind `upstream` as of the last fetch, and
+  /// whether the upstream was deleted. All zero/false when untracked.
+  track: { ahead: number; behind: number; gone: boolean };
 }
 
 const BRANCH_FORMAT = [
@@ -3406,7 +3414,18 @@ const BRANCH_FORMAT = [
   '%(authorname)',
   '%(committerdate:iso-strict)',
   '%(upstream:short)',
+  '%(upstream:track)',
 ].join('%1f');
+
+/// Parse `%(upstream:track)`: "[ahead 2, behind 5]", "[ahead 2]",
+/// "[gone]", or "" when in sync or untracked.
+export function parseUpstreamTrack(raw: string): BranchSummary['track'] {
+  return {
+    ahead: Number(/ahead (\d+)/.exec(raw)?.[1] ?? 0),
+    behind: Number(/behind (\d+)/.exec(raw)?.[1] ?? 0),
+    gone: raw.includes('gone'),
+  };
+}
 
 /// Enumerate every branch — local + remote. We hit `for-each-ref` twice
 /// rather than once (heads + remotes in a single call) so we can tag the
@@ -3437,12 +3456,15 @@ export async function branchSummaries(repoPath: string): Promise<BranchSummary[]
   const consume = (raw: string, kind: 'local' | 'remote') => {
     for (const line of raw.split('\n')) {
       if (!line) continue;
-      const [name, sha, shortSha, subject, author, date, upstream] = line.split('\x1f');
+      const [name, sha, shortSha, subject, author, date, upstream, track] = line.split('\x1f');
       if (!name) continue;
       // `<remote>/HEAD` is a symbolic alias to whatever the remote's
       // default branch is — the same commit shows up under its real name
-      // already, so dropping the alias keeps the picker tidy.
+      // already, so dropping the alias keeps the picker tidy. Its short
+      // name is usually just `<remote>` (no `/HEAD`), so a remote ref
+      // with no `/` is that alias too.
       if (name.endsWith('/HEAD')) continue;
+      if (kind === 'remote' && !name.includes('/')) continue;
       const shortName =
         kind === 'remote' ? name.split('/').slice(1).join('/') : name;
       out.push({
@@ -3456,6 +3478,7 @@ export async function branchSummaries(repoPath: string): Promise<BranchSummary[]
         author: author ?? '',
         date: date ?? '',
         upstream: upstream && upstream.length > 0 ? upstream : null,
+        track: parseUpstreamTrack(track ?? ''),
       });
     }
   };

@@ -9,6 +9,7 @@ import type {
   AppSettings,
   BranchPruneCandidate,
   BranchSummary,
+  BranchesSubtab,
   CheckoutOutcome,
   CliPresence,
   GitInfo,
@@ -148,6 +149,8 @@ interface UiState {
   /// about to update rather than stale-and-stuck.
   worksetRefreshing: Record<UUID, boolean>;
   worksetPRs: Record<UUID, RepoPRs[]>;
+  /// Open PRs per repo, for the Branches tab's per-branch PR badges.
+  repoPRs: Record<UUID, RepoPRs>;
   worksetLanding: Record<UUID, WorksetLandingReport>;
   /// Activity-feed cache per workset. Each refresh replaces the full
   /// list; we don't paginate or merge historical fetches because the
@@ -383,6 +386,7 @@ interface UiState {
   /// `refreshAllRepoStatuses` when done so the dots actually move.
   fetchAllReposQuiet: () => Promise<void>;
   refreshRepoBranchSummaries: (id: UUID, force?: boolean) => Promise<void>;
+  refreshRepoPRs: (id: UUID, force?: boolean) => Promise<void>;
   refreshRepoGraph: (id: UUID) => Promise<void>;
   /// Fast-path graph fetch used by the History tab's "List" mode.
   /// Drops `--all` + `--topo-order` + trunk-set walk; just a flat
@@ -390,6 +394,7 @@ interface UiState {
   refreshRepoGraphFast: (id: UUID) => Promise<void>;
   refreshRepoSquashLinks: (id: UUID) => Promise<void>;
   setRepoHistoryMode: (id: UUID, mode: 'graph' | 'list') => Promise<void>;
+  setRepoBranchesSubtab: (id: UUID, subtab: BranchesSubtab) => Promise<void>;
   refreshRepoFileList: (id: UUID) => Promise<void>;
   refreshRepoStashes: (id: UUID, force?: boolean) => Promise<void>;
   applyStash: (
@@ -446,7 +451,12 @@ interface UiState {
     strategy: 'stash' | 'discard',
   ) => Promise<{ ok: boolean; error?: string; stashed?: boolean; warning?: string }>;
   fetchRepo: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
-  checkoutRepo: (id: UUID, branch: string, createIfMissing: boolean) => Promise<CheckoutOutcome>;
+  checkoutRepo: (
+    id: UUID,
+    branch: string,
+    createIfMissing: boolean,
+    remote?: string,
+  ) => Promise<CheckoutOutcome>;
   createRepoBranch: (
     id: UUID,
     name: string,
@@ -659,6 +669,7 @@ export const useStore = create<UiState>((set, get) => ({
   worksetStatuses: {},
   worksetRefreshing: {},
   worksetPRs: {},
+  repoPRs: {},
   worksetLanding: {},
   worksetActivity: {},
   worksetWorktrees: {},
@@ -950,6 +961,19 @@ export const useStore = create<UiState>((set, get) => ({
       async () => {
         const prs = await window.overgit.invoke('workset:listPRs', id);
         set({ worksetPRs: { ...get().worksetPRs, [id]: prs } });
+      },
+      force,
+    );
+  },
+
+  refreshRepoPRs: async (id, force = false) => {
+    // Same 30s TTL as worksetPRs: `gh pr list` is slow and PRs change rarely.
+    await cached(
+      `repoPRs:${id}`,
+      30_000,
+      async () => {
+        const prs = await window.overgit.invoke('repo:listPRs', id);
+        set({ repoPRs: { ...get().repoPRs, [id]: prs } });
       },
       force,
     );
@@ -1796,11 +1820,12 @@ export const useStore = create<UiState>((set, get) => ({
     return res;
   },
 
-  checkoutRepo: async (id, branch, createIfMissing) => {
+  checkoutRepo: async (id, branch, createIfMissing, remote) => {
     const outcome = await window.overgit.invoke('repo:checkout', {
       repoId: id,
       branch,
       createIfMissing,
+      remote,
     });
     if (outcome.result === 'switched' || outcome.result === 'already-on-branch') {
       // Branch summaries carry the `isCurrent` flag the picker uses to
@@ -1918,6 +1943,15 @@ export const useStore = create<UiState>((set, get) => ({
     const next: AppSettings = {
       ...get().settings,
       historyMode: { ...(get().settings.historyMode ?? {}), [id]: mode },
+    };
+    set({ settings: next });
+    await window.overgit.invoke('store:saveSettings', next);
+  },
+
+  setRepoBranchesSubtab: async (id, subtab) => {
+    const next: AppSettings = {
+      ...get().settings,
+      branchesSubtab: { ...(get().settings.branchesSubtab ?? {}), [id]: subtab },
     };
     set({ settings: next });
     await window.overgit.invoke('store:saveSettings', next);

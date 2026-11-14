@@ -6,6 +6,36 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- The Branches tab lists remote branches too, under Local / Remote / Worktrees
+  subtabs with live counts. The filter searches all three, and a subtab with
+  matches lights up. Remote branches are grouped by remote, newest first,
+  100 per remote until Show all. Ones you already have locally are hidden
+  behind "show tracked". The last subtab is remembered per repo.
+- Branch rows show the last commit's age, a "most recent" tag, ↑/↓ commits
+  against their upstream (or "gone"), and the open PR with its CI state.
+  Branches with no commits in three months are dimmed.
+- Each branch icon is colored by the author of its last commit. Click one to
+  show only that person's branches, or use Mine for yours.
+- Click anywhere on a branch row to switch to it. ↑/↓ move between rows and
+  Enter switches.
+- A Fetch button on the Branches tab.
+- The checked-out branch is pinned at the top of the Local list under
+  "Checked out", with Push N / Pull N (or Publish) buttons when it differs
+  from its upstream.
+- Worktree rows lead with the branch name, in the same type as the branch
+  lists, with its age; the path sits underneath, shortened to `~`.
+
+### Fixed
+
+- Switching to a branch on a remote other than origin (from the Branches tab
+  or the ⌘B picker) creates a local branch that tracks that remote. It used
+  to look only at origin.
+- `origin/HEAD` no longer shows up as a branch named "origin/".
+- Switching to a branch another worktree holds explains why instead of
+  failing silently.
+
 ## [0.4.5] - 2026-10-29
 
 ### Added
