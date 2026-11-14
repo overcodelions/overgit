@@ -1,22 +1,13 @@
 import { useEffect, useMemo } from 'react';
 import { useStore } from './store';
 import type { GraphCommit, UUID } from '@shared/types';
+import { LANE_COLORS } from './theme';
 
 const ROW_HEIGHT = 26;
 const LANE_WIDTH = 14;
 const NODE_RADIUS = 4;
 const PADDING_X = 10;
 
-const LANE_COLORS = [
-  '#8a78ff',
-  '#5eead4',
-  '#fbbf24',
-  '#f472b6',
-  '#60a5fa',
-  '#a3e635',
-  '#fb923c',
-  '#22d3ee',
-];
 
 /// Compact branch visualization. Renders a vertical commit graph with a
 /// per-lane color, parent-edge lines, and ref labels. Driven by the

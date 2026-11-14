@@ -548,7 +548,19 @@ export interface BranchSummary {
   author: string;
   date: string;
   upstream: string | null;
+  /// Ahead/behind `upstream` as of the last fetch; all zero when untracked.
+  track: BranchTrack;
 }
+
+export interface BranchTrack {
+  ahead: number;
+  behind: number;
+  /// The upstream branch was deleted on the remote.
+  gone: boolean;
+}
+
+/// The lists the Branches tab switches between.
+export type BranchesSubtab = 'local' | 'remote' | 'worktrees';
 
 /// A local branch that is likely safe to delete. The Prune sheet
 /// surfaces these so the user can review-then-sweep instead of running
@@ -801,6 +813,9 @@ export interface AppSettings {
   /// Missing entries default to 'graph' so the existing behavior
   /// is preserved on upgrade.
   historyMode?: Record<UUID, 'graph' | 'list'>;
+  /// Per-repo subtab last opened on the Branches tab. Missing entries
+  /// open on 'local'.
+  branchesSubtab?: Record<UUID, BranchesSubtab>;
   /// Last parent directory the user chose for "Clone repo". Prefilled
   /// next time so they don't have to navigate to ~/code on every clone.
   /// Validated on use — if the directory no longer exists we fall back
@@ -925,6 +940,8 @@ export interface IPCInvokeMap {
     repoId: UUID;
     branch: string;
     createIfMissing: boolean;
+    /// Remote to track when creating the local branch. Default 'origin'.
+    remote?: string;
   }) => CheckoutOutcome;
   'repo:changes': (repoId: UUID) => RepoChanges;
   'repo:stageFiles': (args: { repoId: UUID; paths: string[] }) => { ok: boolean; error?: string };
@@ -1218,6 +1235,7 @@ export interface IPCInvokeMap {
     worksetId: UUID,
   ) => { branch: string; repoCount: number; total: number }[];
   'workset:listPRs': (worksetId: UUID) => RepoPRs[];
+  'repo:listPRs': (repoId: UUID) => RepoPRs;
   'workset:syncAndBranch': (args: {
     worksetId: UUID;
     branch: string;

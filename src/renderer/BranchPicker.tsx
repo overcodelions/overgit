@@ -154,7 +154,13 @@ export function BranchPicker({ repoId, anchorRef, initialMode, onClose }: Props)
     setBusy(true);
     setSwitchingTo(b.shortName);
     try {
-      const outcome = await checkout(repoId, target, false);
+      // Remote rows create a branch tracking *their* remote, not always origin.
+      const outcome = await checkout(
+        repoId,
+        target,
+        false,
+        b.kind === 'remote' ? b.name.split('/')[0] : undefined,
+      );
       if (outcome.result === 'error') {
         pushToast({ kind: 'error', message: outcome.message ?? 'Checkout failed' });
       } else if (outcome.result === 'dirty') {
