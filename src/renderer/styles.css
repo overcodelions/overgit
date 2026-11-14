@@ -74,6 +74,30 @@ body,
   box-shadow: inset 2px 0 0 var(--c-accent);
 }
 
+/* Accent tints for the Branches tab. Tailwind can't put an opacity
+   modifier on the var()-based accent (`border-accent/40` generates
+   nothing), so these mix it here. */
+.branch-row-current {
+  border-color: color-mix(in srgb, var(--c-accent) 40%, var(--c-card-border));
+  box-shadow: inset 3px 0 0 var(--c-accent);
+}
+.branch-row-clickable {
+  cursor: pointer;
+}
+.branch-row-clickable:hover {
+  border-color: color-mix(in srgb, var(--c-accent) 40%, var(--c-card-border));
+  background: color-mix(in srgb, var(--c-accent) 6%, var(--c-card-bg));
+}
+.accent-chip {
+  border-color: color-mix(in srgb, var(--c-accent) 40%, transparent);
+  background: color-mix(in srgb, var(--c-accent) 8%, transparent);
+  color: var(--c-accent);
+}
+.accent-count {
+  background: color-mix(in srgb, var(--c-accent) 25%, transparent);
+  color: var(--c-accent);
+}
+
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;

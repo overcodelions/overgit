@@ -21,6 +21,7 @@ import {
 } from './branchesTab';
 import type {
   BranchesSubtab,
+  BranchSummary,
   BranchTrack,
   BranchPruneCandidate,
   ChangedFile,
@@ -2800,6 +2801,31 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
     }
   };
 
+  const pushRepo = useStore((s) => s.pushRepo);
+  const pullRepo = useStore((s) => s.pullRepo);
+  const [syncing, setSyncing] = useState<'push' | 'pull' | null>(null);
+  const onSync = async (kind: 'push' | 'pull') => {
+    setSyncing(kind);
+    try {
+      if (kind === 'push') {
+        const res = await pushRepo(repoId);
+        if (!res.ok) pushToast({ kind: 'error', message: res.error ?? 'Push failed' });
+      } else {
+        const res = await pullRepo(repoId);
+        if (res.conflicts?.length) {
+          pushToast({
+            kind: 'warn',
+            message: 'Pull would conflict with local changes. Use Pull in the header to choose how to resolve it.',
+          });
+        } else if (!res.ok) {
+          pushToast({ kind: 'error', message: res.error ?? 'Pull failed' });
+        }
+      }
+    } finally {
+      setSyncing(null);
+    }
+  };
+
   const onSwitchRemote = async ({ branch: b, remote: remoteName, trackedBy }: RemoteRow) => {
     // A local branch already follows this ref — that's the one to switch to.
     if (trackedBy) return onSwitchBranch(trackedBy);
@@ -2929,6 +2955,48 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
     }
   };
 
+  // The checked-out branch is pinned above the newest-first list so it's
+  // never hunted for.
+  const currentLocal = filteredLocal.find((b) => b.isCurrent);
+  const otherLocal = filteredLocal.filter((b) => !b.isCurrent);
+  const renderLocalRow = (b: BranchSummary) => (
+                <BranchSwitchRow
+                  key={b.name}
+                  name={b.shortName}
+                  isCurrent={b.isCurrent}
+                  subject={b.subject}
+                  shortSha={b.shortSha}
+                  date={b.date}
+                  author={b.author}
+                  upstream={b.upstream}
+                  track={b.track}
+                  pr={prByBranch.get(b.shortName)}
+                  onFilterAuthor={() => setAuthorFilter(b.author)}
+                  syncing={syncing}
+                  onPush={() => void onSync('push')}
+                  onPull={() => void onSync('pull')}
+                  latest={!b.isCurrent && b.name === filteredLocal[0]?.name}
+                  ownedBy={ownership.get(b.shortName)}
+                  isMainCheckout={
+                    ownership.get(b.shortName)?.isMain ?? false
+                  }
+                  disabled={switching !== null || acting !== null}
+                  pending={switching === b.shortName}
+                  acting={acting === b.shortName}
+                  renaming={renaming === b.shortName}
+                  hasCurrentBranch={!!status?.branch}
+                  onSwitch={() => onSwitchBranch(b.shortName)}
+                  onMerge={() => onMergeIntoCurrent({ shortName: b.shortName, upstream: b.upstream })}
+                  onRebase={() => onRebaseOnto(b.shortName)}
+                  onStartRename={() => setRenaming(b.shortName)}
+                  onCancelRename={() => setRenaming(null)}
+                  onSubmitRename={async (next) => {
+                    const ok = await onRename(b.shortName, next);
+                    if (ok) setRenaming(null);
+                  }}
+                />
+  );
+
   const counts: Record<BranchesSubtab, number> = {
     local: filteredLocal.length,
     remote: remote.count,
@@ -3026,7 +3094,7 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
                 {label}
                 <span
                   className={`ml-1.5 text-[10px] font-mono px-1.5 rounded-full ${
-                    lit ? 'bg-accent/25 text-accent' : 'bg-surface-muted text-ink-muted'
+                    lit ? 'accent-count' : 'bg-surface-muted text-ink-muted'
                   }`}
                 >
                   {counts[id]}
@@ -3040,7 +3108,7 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
             (authorFilter ? (
               <button
                 onClick={() => setAuthorFilter(null)}
-                className="text-[11px] px-2 py-0.5 rounded border border-accent/40 bg-accent/[0.06] text-accent inline-flex items-center gap-1.5"
+                className="text-[11px] px-2 py-0.5 rounded border accent-chip inline-flex items-center gap-1.5"
                 title="Clear the author filter"
               >
                 <span
@@ -3068,7 +3136,7 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
                 onClick={() => setShowPrune((v) => !v)}
                 className={`text-[11px] px-2 py-0.5 rounded border ${
                   showPrune
-                    ? 'border-accent/40 bg-accent/[0.06] text-accent'
+                    ? 'accent-chip'
                     : 'border-card hover:bg-surface-elevated'
                 }`}
                 title="Find local branches that were merged into the default branch or whose upstream is gone"
@@ -3083,7 +3151,7 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
               aria-pressed={showTracked}
               className={`text-[11px] px-2 py-0.5 rounded border ${
                 showTracked
-                  ? 'border-accent/40 bg-accent/[0.06] text-accent'
+                  ? 'accent-chip'
                   : 'border-card text-ink-muted hover:bg-surface-elevated'
               }`}
               title="Remote branches you already have locally are hidden by default"
@@ -3129,42 +3197,17 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
           ) : filteredLocal.length === 0 ? (
             noMatch('local branches')
           ) : (
-            <ul className="flex flex-col gap-1">
-              {filteredLocal.map((b, i) => (
-                <BranchSwitchRow
-                  key={b.name}
-                  name={b.shortName}
-                  isCurrent={b.isCurrent}
-                  subject={b.subject}
-                  shortSha={b.shortSha}
-                  date={b.date}
-                  author={b.author}
-                  upstream={b.upstream}
-                  track={b.track}
-                  pr={prByBranch.get(b.shortName)}
-                  onFilterAuthor={() => setAuthorFilter(b.author)}
-                  latest={i === 0}
-                  ownedBy={ownership.get(b.shortName)}
-                  isMainCheckout={
-                    ownership.get(b.shortName)?.isMain ?? false
-                  }
-                  disabled={switching !== null || acting !== null}
-                  pending={switching === b.shortName}
-                  acting={acting === b.shortName}
-                  renaming={renaming === b.shortName}
-                  hasCurrentBranch={!!status?.branch}
-                  onSwitch={() => onSwitchBranch(b.shortName)}
-                  onMerge={() => onMergeIntoCurrent({ shortName: b.shortName, upstream: b.upstream })}
-                  onRebase={() => onRebaseOnto(b.shortName)}
-                  onStartRename={() => setRenaming(b.shortName)}
-                  onCancelRename={() => setRenaming(null)}
-                  onSubmitRename={async (next) => {
-                    const ok = await onRename(b.shortName, next);
-                    if (ok) setRenaming(null);
-                  }}
-                />
-              ))}
-            </ul>
+            <div className="flex flex-col gap-3">
+              {currentLocal && (
+                <section className="flex flex-col gap-1.5">
+                  <h3 className="text-[10px] uppercase tracking-wide text-ink-faint">Checked out</h3>
+                  <ul className="flex flex-col">{renderLocalRow(currentLocal)}</ul>
+                </section>
+              )}
+              {otherLocal.length > 0 && (
+                <ul className="flex flex-col gap-1">{otherLocal.map(renderLocalRow)}</ul>
+              )}
+            </div>
           )}
         </>
       )}
@@ -3254,7 +3297,13 @@ function BranchesTab({ repoId }: { repoId: UUID }): JSX.Element {
         ) : (
           <ul className="flex flex-col gap-1.5">
             {filteredLinked.map((w) => (
-              <WorktreeRow key={w.path} repoId={repoId} repoPath={repoPath} worktree={w} />
+              <WorktreeRow
+                key={w.path}
+                repoId={repoId}
+                repoPath={repoPath}
+                worktree={w}
+                tip={w.branch ? localBranches.find((b) => b.shortName === w.branch) : undefined}
+              />
             ))}
           </ul>
         ))}
@@ -3583,6 +3632,9 @@ function BranchSwitchRow({
   latest,
   pr,
   onFilterAuthor,
+  syncing,
+  onPush,
+  onPull,
   ownedBy,
   isMainCheckout,
   disabled,
@@ -3609,6 +3661,10 @@ function BranchSwitchRow({
   /// Open PR whose head is this branch.
   pr: PullRequest | undefined;
   onFilterAuthor: () => void;
+  /// Push/pull in flight for the checked-out branch.
+  syncing: 'push' | 'pull' | null;
+  onPush: () => void;
+  onPull: () => void;
   /// Newest tip in the list as shown.
   latest: boolean;
   ownedBy: Worktree | undefined;
@@ -3658,11 +3714,13 @@ function BranchSwitchRow({
       tabIndex={0}
       onKeyDown={(e) => onRowKeyDown(e, switchable ? onSwitch : undefined)}
       onClick={switchable ? switchOnRowClick(onSwitch) : undefined}
-      className={`flex items-center gap-3 px-3 py-1.5 rounded border ${
-        isCurrent ? 'sidebar-row-selected' : 'border-card bg-card'
+      className={`flex items-center gap-3 px-3 rounded border ${
+        isCurrent
+          ? 'py-2.5 bg-card branch-row-current'
+          : 'py-1.5 border-card bg-card'
       } ${switchable ? CLICKABLE_ROW : ''} ${ROW_FOCUS}`}
     >
-      <BranchIcon author={author} onPick={onFilterAuthor} />
+      <BranchIcon author={author} onPick={onFilterAuthor} current={isCurrent} />
       {renaming ? (
         <input
           ref={inputRef}
@@ -3678,7 +3736,9 @@ function BranchSwitchRow({
         />
       ) : (
         <span
-          className={`font-mono text-xs truncate flex-1 ${stale ? 'text-ink-muted' : ''}`}
+          className={`font-mono text-xs truncate flex-1 ${
+            isCurrent ? 'font-semibold text-ink' : stale ? 'text-ink-muted' : ''
+          }`}
           title={stale ? `${name} — no commits in 3+ months` : name}
         >
           {name}
@@ -3686,14 +3746,6 @@ function BranchSwitchRow({
       )}
       {!renaming && (
         <>
-          {isCurrent && (
-            <span
-              className="text-[9px] uppercase font-mono text-emerald-600 dark:text-emerald-400 whitespace-nowrap"
-              title="Checked out in the main repo"
-            >
-              current
-            </span>
-          )}
           <SyncBadge upstream={upstream} track={track} />
           {pr && <PrBadge pr={pr} />}
           {latest && <MostRecentTag />}
@@ -3758,6 +3810,39 @@ function BranchSwitchRow({
         </>
       ) : (
         <div className="flex items-center gap-1">
+          {isCurrent && !upstream && (
+            <Explain command="git push -u" plain={`Publish ${name} to the remote and track it.`}>
+              <button
+                onClick={onPush}
+                disabled={disabled || syncing !== null}
+                className="text-[11px] px-2 py-0.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+              >
+                {syncing === 'push' ? 'Publishing…' : 'Publish'}
+              </button>
+            </Explain>
+          )}
+          {isCurrent && upstream && track.behind > 0 && (
+            <Explain command="git pull" plain={`Bring ${track.behind} commit(s) from ${upstream} into ${name}.`}>
+              <button
+                onClick={onPull}
+                disabled={disabled || syncing !== null}
+                className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-surface-elevated disabled:opacity-50"
+              >
+                {syncing === 'pull' ? 'Pulling…' : `Pull ${track.behind}`}
+              </button>
+            </Explain>
+          )}
+          {isCurrent && upstream && track.ahead > 0 && (
+            <Explain command="git push" plain={`Send ${track.ahead} local commit(s) to ${upstream}.`}>
+              <button
+                onClick={onPush}
+                disabled={disabled || syncing !== null}
+                className="text-[11px] px-2 py-0.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50"
+              >
+                {syncing === 'push' ? 'Pushing…' : `Push ${track.ahead}`}
+              </button>
+            </Explain>
+          )}
           {showMergeRebase && (
             <>
               <Explain
@@ -3822,7 +3907,7 @@ function BranchSwitchRow({
   );
 }
 
-const CLICKABLE_ROW = 'cursor-pointer hover:border-accent/40 hover:bg-accent/[0.04]';
+const CLICKABLE_ROW = 'branch-row-clickable';
 const ROW_FOCUS = 'outline-none focus-visible:ring-1 focus-visible:ring-accent';
 
 /// ↑/↓ move between branch rows (across remote groups too); Enter
@@ -3898,23 +3983,33 @@ function switchOnRowClick(onSwitch: () => void) {
 
 /// Branch glyph tinted per author of the tip commit, so whose branches
 /// are whose reads at a glance down the list.
-function BranchIcon({ author, onPick }: { author: string; onPick?: () => void }): JSX.Element {
-  const label = author ? `Last commit by ${author}` : 'Branch';
+function BranchIcon({
+  author,
+  onPick,
+  current = false,
+}: {
+  author: string;
+  onPick?: () => void;
+  /// Checked-out branch: solid accent glyph instead of the author tint.
+  current?: boolean;
+}): JSX.Element {
+  const label = `${current ? 'Checked out · ' : ''}${author ? `Last commit by ${author}` : 'Branch'}`;
+  const dot = current ? 'var(--c-accent)' : 'none';
   const svg = (
       <svg
         width="12"
         height="12"
         viewBox="0 0 16 16"
         fill="none"
-        stroke={author ? authorColor(author) : 'currentColor'}
+        stroke={current ? 'var(--c-accent)' : author ? authorColor(author) : 'currentColor'}
         strokeWidth="1.6"
         strokeLinecap="round"
         role="img"
         aria-label={label}
       >
-        <circle cx="4.5" cy="3.5" r="1.75" />
-        <circle cx="4.5" cy="12.5" r="1.75" />
-        <circle cx="11.5" cy="5" r="1.75" />
+        <circle cx="4.5" cy="3.5" r="1.75" fill={dot} />
+        <circle cx="4.5" cy="12.5" r="1.75" fill={dot} />
+        <circle cx="11.5" cy="5" r="1.75" fill={dot} />
         <path d="M4.5 5.25v5.5M11.5 6.75c0 2.5-7 1.75-7 4" />
       </svg>
   );
@@ -4123,14 +4218,22 @@ function RemoteBranchRow({
   );
 }
 
+/// Home directory shortened to `~` for display.
+function tildePath(p: string): string {
+  return p.replace(/^(\/Users|\/home)\/[^/]+/, '~');
+}
+
 function WorktreeRow({
   repoId,
   repoPath,
   worktree: w,
+  tip,
 }: {
   repoId: UUID;
   repoPath: string | undefined;
   worktree: Worktree;
+  /// The local branch summary for `w.branch`, for its author and age.
+  tip?: BranchSummary;
 }): JSX.Element {
   const adopt = useStore((s) => s.adoptWorktreeBranch);
   const removeWt = useStore((s) => s.removeWorktree);
@@ -4200,14 +4303,20 @@ function WorktreeRow({
   };
 
   return (
-    <li className="flex flex-col gap-1 px-3 py-2 rounded border border-card bg-card">
-      <div className="flex items-center gap-2">
-        <span className="text-sm font-mono truncate flex-1" title={w.path}>
-          {w.path}
+    <li className="flex flex-col gap-0.5 px-3 py-1.5 rounded border border-card bg-card">
+      <div className="flex items-center gap-3">
+        <BranchIcon author={tip?.author ?? ''} />
+        <span
+          className={`font-mono text-xs truncate flex-1 min-w-0 ${
+            w.branch ? '' : 'text-amber-600 dark:text-amber-400'
+          }`}
+          title={w.branch ?? 'Detached HEAD'}
+        >
+          {w.branch ?? '(detached)'}
         </span>
         {w.isMain && (
           <span
-            className="text-[10px] uppercase tracking-wide text-accent"
+            className="text-[9px] uppercase font-mono text-accent"
             title="The original clone — owns the .git directory"
           >
             main
@@ -4215,7 +4324,7 @@ function WorktreeRow({
         )}
         {w.locked && (
           <span
-            className="text-[10px] uppercase tracking-wide text-amber-400"
+            className="text-[9px] uppercase font-mono text-amber-600 dark:text-amber-400"
             title="git worktree lock — protected from prune"
           >
             locked
@@ -4223,54 +4332,57 @@ function WorktreeRow({
         )}
         {w.prunable && (
           <span
-            className="text-[10px] uppercase tracking-wide text-red-400"
+            className="text-[9px] uppercase font-mono text-red-600 dark:text-red-400"
             title="missing on disk — run `git worktree prune` to clean up"
           >
             prunable
           </span>
         )}
+        {w.head && <span className="text-[11px] text-ink-faint font-mono">{w.head.slice(0, 7)}</span>}
+        {tip && <CommitAge date={tip.date} />}
+        <div className="flex items-center gap-1">
+          {canAdopt && mode === null && (
+            <button
+              onClick={() => {
+                setMode('adopt');
+                setForceRemove(false);
+                setError(null);
+              }}
+              title={`Remove the linked worktree at ${w.path} and check out ${w.branch} in the main repo`}
+              className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-surface-elevated"
+            >
+              Switch main repo here
+            </button>
+          )}
+          {!w.isMain && mode === null && (
+            <button
+              onClick={() => {
+                setMode('remove');
+                setForceRemove(false);
+                setError(null);
+              }}
+              title={`git worktree remove ${w.path}`}
+              className="text-[11px] px-2 py-0.5 rounded border border-card text-red-400 hover:bg-red-500/10"
+            >
+              Remove
+            </button>
+          )}
+        </div>
+      </div>
+      <div className="group flex items-center gap-2 pl-6 min-w-0">
+        <span
+          className="text-[10px] font-mono text-ink-faint truncate"
+          title={repoPath && w.path !== repoPath ? `${w.path}\nlinked from ${repoPath}` : w.path}
+        >
+          {tildePath(w.path)}
+        </span>
         <button
           onClick={() => void navigator.clipboard.writeText(w.path)}
           title="Copy path"
-          className="text-[11px] text-ink-faint hover:text-ink px-2 py-0.5 rounded hover:bg-surface-elevated"
+          className="text-[10px] text-ink-faint hover:text-ink px-1.5 rounded hover:bg-surface-elevated opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
         >
           copy
         </button>
-        {canAdopt && mode === null && (
-          <button
-            onClick={() => {
-              setMode('adopt');
-              setForceRemove(false);
-              setError(null);
-            }}
-            title={`Remove the linked worktree at ${w.path} and check out ${w.branch} in the main repo`}
-            className="text-[11px] px-2 py-0.5 rounded border border-card hover:bg-surface-elevated"
-          >
-            Switch main repo here
-          </button>
-        )}
-        {!w.isMain && mode === null && (
-          <button
-            onClick={() => {
-              setMode('remove');
-              setForceRemove(false);
-              setError(null);
-            }}
-            title={`git worktree remove ${w.path}`}
-            className="text-[11px] px-2 py-0.5 rounded border border-card text-red-400 hover:bg-red-500/10"
-          >
-            Remove
-          </button>
-        )}
-      </div>
-      <div className="flex items-center gap-3 text-[11px] text-ink-faint font-mono">
-        <span className={w.branch ? 'text-ink-muted' : 'text-amber-400'}>
-          {w.branch ?? '(detached)'}
-        </span>
-        {w.head && <span>{w.head.slice(0, 10)}</span>}
-        {repoPath && w.path !== repoPath && (
-          <span className="text-ink-faint">linked from {repoPath}</span>
-        )}
       </div>
       {mode === 'adopt' && canAdopt && (
         <div className="mt-1 p-3 rounded border border-amber-700/40 bg-amber-500/[0.04] flex flex-col gap-2 text-[11px]">

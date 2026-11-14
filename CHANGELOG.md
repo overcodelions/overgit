@@ -21,6 +21,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Click anywhere on a branch row to switch to it. ↑/↓ move between rows and
   Enter switches.
 - A Fetch button on the Branches tab.
+- The checked-out branch is pinned at the top of the Local list under
+  "Checked out", with Push N / Pull N (or Publish) buttons when it differs
+  from its upstream.
+- Worktree rows lead with the branch name, in the same type as the branch
+  lists, with its age; the path sits underneath, shortened to `~`.
 
 ### Fixed
 
