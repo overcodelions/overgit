@@ -13,11 +13,11 @@ describe('isStale', () => {
 
 describe('authorColor', () => {
   it('gives the same author the same color regardless of case or padding', () => {
-    expect(authorColor('Ada Lovelace')).toBe(authorColor(' ada lovelace '));
+    expect(authorColor('Acme Dev One')).toBe(authorColor(' acme dev one '));
   });
 
   it('spreads different authors across the palette', () => {
-    const colors = new Set(['Ada', 'Grace', 'Linus', 'Margaret', 'Ken', 'Barbara'].map(authorColor));
+    const colors = new Set(['acme-dev-1', 'acme-dev-2', 'acme-dev-3', 'acme-dev-4', 'acme-dev-5', 'acme-dev-6'].map(authorColor));
     expect(colors.size).toBeGreaterThan(2);
   });
 });
@@ -81,11 +81,11 @@ describe('remoteBranchView', () => {
 
   it('keeps only one author when asked, ignoring case', () => {
     const view = remoteBranchView(
-      [branch('origin/a', 'remote', { author: 'Ada' }), branch('origin/b', 'remote', { author: 'Grace' })],
+      [branch('origin/a', 'remote', { author: 'Acme-Dev-1' }), branch('origin/b', 'remote', { author: 'acme-dev-2' })],
       '',
       false,
       false,
-      'ada',
+      'acme-dev-1',
     );
     expect(view.groups.flatMap((g) => g.rows.map((r) => r.branch.name))).toEqual(['origin/a']);
   });
