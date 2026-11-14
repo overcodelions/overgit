@@ -1505,11 +1505,15 @@ export async function worksetListPRs(
   // 20-repo workset doesn't fire 20 simultaneous network/auth probes.
   // Skip repos with no GitHub remote entirely; gh would just return
   // "not a GitHub repository" after a network round-trip.
-  return pool(members, 3, async (r): Promise<RepoPRs> => {
-    if (!(await hasGitHubRemote(r.path))) {
-      return { repoId: r.id, prs: null };
-    }
-    const result = await listOpenPRs(r.path);
-    return { repoId: r.id, prs: result.prs, error: result.error };
-  });
+  return pool(members, 3, (r) => repoListPRs(r));
+}
+
+/// Open PRs for one repo, for the Branches tab. Skips `gh` when the
+/// repo has no GitHub remote.
+export async function repoListPRs(r: Repo): Promise<RepoPRs> {
+  if (!(await hasGitHubRemote(r.path))) {
+    return { repoId: r.id, prs: null };
+  }
+  const result = await listOpenPRs(r.path);
+  return { repoId: r.id, prs: result.prs, error: result.error };
 }
