@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-11-15
+
 ### Added
 
 - The Branches tab lists remote branches too, under Local / Remote / Worktrees
@@ -35,6 +37,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `origin/HEAD` no longer shows up as a branch named "origin/".
 - Switching to a branch another worktree holds explains why instead of
   failing silently.
+- When the branch picker can't switch because another worktree has the branch
+  checked out, it offers to detach that worktree and retry. Detaching is
+  non-destructive, and a worktree whose folder is already gone is pruned.
+  This also works with the newer git (2.42+) error wording.
+- Pull requests and CI status show up for repos cloned over HTTPS. The remote
+  URL used to be misread, so only SSH clones got them.
+- Your saved theme is applied at launch, and "system" follows OS changes
+  while the app is open.
+- The landing caption reads "checked just now" instead of "as of now ago".
+- The branch picker no longer lists a bare "origin" entry.
 
 ## [0.4.5] - 2026-10-29
 
@@ -297,7 +309,8 @@ Initial public release. Building in the open from here.
 - Per-lane colored branch graph with ref labels.
 - Resizable sidebar, light / dark / system theme, keyboard shortcuts.
 
-[Unreleased]: https://github.com/overcodelions/overgit/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/overcodelions/overgit/compare/v0.4.6...HEAD
+[0.4.6]: https://github.com/overcodelions/overgit/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/overcodelions/overgit/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/overcodelions/overgit/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/overcodelions/overgit/compare/v0.4.2...v0.4.3

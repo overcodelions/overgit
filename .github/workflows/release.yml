@@ -115,6 +115,14 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Only the changelog is needed, to copy this version's section into
+      # the release notes.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          sparse-checkout: CHANGELOG.md
+          sparse-checkout-cone-mode: false
+
       - name: Rename, upload, and write the download table
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -178,5 +186,20 @@ jobs:
           The `latest*.yml` files in the asset list are auto-updater metadata,
           not downloads.
           EOF
+          # Lead with this version's CHANGELOG section ("## [0.4.6] - ..."
+          # up to the next "## ["). A missing section warns, not fails: the
+          # builds are already up by now.
+          VERSION="${TAG#v}"
+          awk -v v="$VERSION" '
+            index($0, "## [" v "]") == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > changes.md
+          if grep -q '[^[:space:]]' changes.md; then
+            { echo "## What's changed"; cat changes.md; echo; cat notes.md; } > final.md
+            mv final.md notes.md
+          else
+            echo "::warning::No CHANGELOG.md section for $VERSION; release notes have downloads only."
+          fi
           cat notes.md
           gh release edit "$TAG" --repo "$REPO" --notes-file notes.md

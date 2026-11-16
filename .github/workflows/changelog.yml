@@ -1,0 +1,44 @@
+name: Changelog
+
+# Separate from CI so adding or removing the skip-changelog label re-runs
+# only this check, not the whole build matrix.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: changelog-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changelog:
+    name: CHANGELOG updated
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip-changelog') }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require a CHANGELOG.md entry when src/ changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          changed=$(git diff --name-only "$BASE_SHA"...HEAD)
+          if ! grep -q '^src/' <<<"$changed"; then
+            echo "No changes under src/; nothing to log."
+            exit 0
+          fi
+          if grep -qx 'CHANGELOG.md' <<<"$changed"; then
+            echo "CHANGELOG.md updated."
+            exit 0
+          fi
+          echo "::error file=CHANGELOG.md::This PR changes src/ but not CHANGELOG.md. Add a line under ## [Unreleased], or add the skip-changelog label if nothing user-visible changed."
+          exit 1

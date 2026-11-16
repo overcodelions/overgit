@@ -15,6 +15,7 @@
 - [ ] `npm run typecheck` and `npm run build` pass
 - [ ] `npm test` passes
 - [ ] One logical change per PR
+- [ ] User-visible changes are noted under `## [Unreleased]` in `CHANGELOG.md` (or the PR has the `skip-changelog` label)
 - [ ] If this touches an IPC channel, it's wired through `IPCInvokeMap` in `src/shared/types.ts`
 - [ ] If this touches a security-sensitive area (child process, path resolution, Electron `webPreferences` / CSP / navigation), it's called out below
 
