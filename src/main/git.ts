@@ -8,8 +8,11 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { validateRebaseSteps } from '../shared/rebase';
 import {
   BlameLine,
+  RebasePlanCommit,
+  RebaseStep,
   ChangedFile,
   CheckoutOutcome,
   BranchPruneCandidate,
@@ -4569,4 +4572,178 @@ export async function lfsStatus(repoPath: string): Promise<LfsStatus> {
   } catch {
     return { enabled: false, patternCount: 0 };
   }
+}
+
+// ---------------------------------------------------------------------
+// AI commit explain
+// ---------------------------------------------------------------------
+
+const SHOW_FOR_LLM_BYTE_CAP = 200_000;
+
+/// `git show` for one commit, sized for an LLM prompt. Falls back to
+/// the message plus `--stat` when the full patch is over the cap.
+export async function showCommitForLlm(
+  repoPath: string,
+  sha: string,
+): Promise<{ ok: boolean; text: string; error?: string }> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, text: '', error: 'Not a git repo' };
+  if (!/^[0-9a-f]{4,64}$/i.test(sha)) return { ok: false, text: '', error: 'Invalid commit' };
+  const full = await run(repoPath, ['show', '--no-color', '--format=fuller', '--stat', '--patch', sha]);
+  if (!full.ok) {
+    return { ok: false, text: '', error: full.stderr.trim() || `git show exited ${full.code}` };
+  }
+  if (Buffer.byteLength(full.stdout, 'utf8') <= SHOW_FOR_LLM_BYTE_CAP) {
+    return { ok: true, text: full.stdout };
+  }
+  const stat = await run(repoPath, ['show', '--no-color', '--format=fuller', '--stat', sha]);
+  if (!stat.ok) {
+    return { ok: false, text: '', error: stat.stderr.trim() || `git show exited ${stat.code}` };
+  }
+  return {
+    ok: true,
+    text: stat.stdout + '\n(patch omitted: too large to send; explain from the message and file list)\n',
+  };
+}
+
+// ---------------------------------------------------------------------
+// Interactive rebase
+// ---------------------------------------------------------------------
+
+/// Commits that `git rebase -i <base>` would list, oldest first.
+export async function interactiveRebasePlan(
+  repoPath: string,
+  base: string,
+): Promise<
+  | { ok: true; baseSha: string; branch: string | null; commits: RebasePlanCommit[] }
+  | { ok: false; error: string }
+> {
+  if (!looksLikeRepo(repoPath)) return { ok: false, error: 'Not a git repo' };
+  if (!isSafeRefArg(base)) return { ok: false, error: `Refusing to rebase onto "${base}"` };
+  const baseRes = await run(repoPath, ['rev-parse', '--verify', '--quiet', `${base}^{commit}`]);
+  if (!baseRes.ok) return { ok: false, error: `Unknown commit: ${base}` };
+  const baseSha = baseRes.stdout.trim();
+  const anc = await run(repoPath, ['merge-base', '--is-ancestor', baseSha, 'HEAD']);
+  if (!anc.ok) {
+    return { ok: false, error: 'That commit is not in the current branch’s history.' };
+  }
+  const merges = await run(repoPath, ['rev-list', '--count', '--merges', `${baseSha}..HEAD`]);
+  if (merges.ok && Number(merges.stdout.trim()) > 0) {
+    return {
+      ok: false,
+      error: 'The range includes merge commits. Interactive rebase here only handles linear history.',
+    };
+  }
+  const branchRes = await run(repoPath, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+  const branch = branchRes.ok ? branchRes.stdout.trim() || null : null;
+
+  const log = await run(repoPath, [
+    'log',
+    '--reverse',
+    '--no-color',
+    '--format=%H%x1f%h%x1f%an%x1f%aI%x1f%B%x1e',
+    `${baseSha}..HEAD`,
+  ]);
+  if (!log.ok) return { ok: false, error: log.stderr.trim() || 'git log failed' };
+
+  let pushedSet = new Set<string>();
+  const up = await run(repoPath, ['rev-list', `${baseSha}..@{upstream}`]);
+  if (up.ok) pushedSet = new Set(up.stdout.split('\n').map((s) => s.trim()).filter(Boolean));
+
+  const commits: RebasePlanCommit[] = log.stdout
+    .split('\x1e')
+    .map((rec) => rec.replace(/^\n+/, ''))
+    .filter((rec) => rec.trim())
+    .map((rec) => {
+      const [sha, shortSha, author, date, message = ''] = rec.split('\x1f');
+      const msg = message.replace(/\s+$/, '');
+      return {
+        sha,
+        shortSha,
+        author,
+        date,
+        message: msg,
+        subject: msg.split('\n')[0] ?? '',
+        pushed: pushedSet.has(sha),
+      };
+    });
+  return { ok: true, baseSha, branch, commits };
+}
+
+/// Quote a path for the POSIX shell git runs editors and `exec` lines
+/// through (Git for Windows ships sh too, and prefers forward slashes).
+function shQuote(p: string): string {
+  const s = process.platform === 'win32' ? p.replace(/\\/g, '/') : p;
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/// Build the rebase todo. Rewords become `pick` + an `exec` that
+/// amends the message from a file, so git never needs an editor.
+export function buildRebaseTodo(
+  steps: RebaseStep[],
+  messageFile: (index: number) => string,
+): string {
+  const lines: string[] = [];
+  steps.forEach((s, i) => {
+    if (s.action === 'reword') {
+      lines.push(`pick ${s.sha}`);
+      lines.push(
+        `exec git commit --amend --allow-empty --no-verify --cleanup=strip -F ${shQuote(messageFile(i))}`,
+      );
+    } else {
+      lines.push(`${s.action} ${s.sha}`);
+    }
+  });
+  return lines.join('\n') + '\n';
+}
+
+/// Run `git rebase -i <base>` with a prepared todo. Returns
+/// `stopped: true` when git paused (usually a conflict); the existing
+/// continue/abort banner takes it from there.
+export async function interactiveRebase(
+  repoPath: string,
+  base: string,
+  steps: RebaseStep[],
+): Promise<{ ok: true; stopped: boolean; message?: string } | { ok: false; error: string }> {
+  const plan = await interactiveRebasePlan(repoPath, base);
+  if (!plan.ok) return plan;
+  const invalid = validateRebaseSteps(plan.commits.map((c) => c.sha), steps);
+  if (invalid) return { ok: false, error: invalid };
+  if (detectInProgress(repoPath)) {
+    return { ok: false, error: 'Another merge, rebase or cherry-pick is in progress. Finish or abort it first.' };
+  }
+  const dirty = await run(repoPath, ['status', '--porcelain', '--untracked-files=no']);
+  if (!dirty.ok) return { ok: false, error: dirty.stderr.trim() || 'git status failed' };
+  if (dirty.stdout.trim()) {
+    return { ok: false, error: 'You have uncommitted changes. Commit or stash them first.' };
+  }
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'overgit-rebase-'));
+  const messageFile = (i: number) => path.join(dir, `message-${i}.txt`);
+  steps.forEach((s, i) => {
+    if (s.action === 'reword') fs.writeFileSync(messageFile(i), s.message!.trim() + '\n');
+  });
+  const todoPath = path.join(dir, 'todo');
+  fs.writeFileSync(todoPath, buildRebaseTodo(steps, messageFile));
+
+  const res = await run(
+    repoPath,
+    ['rebase', '-i', '--no-autosquash', plan.baseSha],
+    {
+      // git runs `$GIT_SEQUENCE_EDITOR <todo>`: copying our file over
+      // its todo is the whole "edit".
+      GIT_SEQUENCE_EDITOR: `cp ${shQuote(todoPath)}`,
+      // Squash would otherwise open an editor for the combined message;
+      // accept git's default (both messages, comments stripped).
+      GIT_EDITOR: 'true',
+    },
+  );
+  const stopped = detectInProgress(repoPath) === 'rebase';
+  // Reword `exec` lines still to run read the message files, so keep
+  // them while the rebase is paused.
+  if (!stopped) fs.rmSync(dir, { recursive: true, force: true });
+  if (res.ok && !stopped) return { ok: true, stopped: false };
+  if (stopped) {
+    return { ok: true, stopped: true, message: (res.stderr || res.stdout).trim() };
+  }
+  return { ok: false, error: res.stderr.trim() || `git rebase exited ${res.code}` };
 }

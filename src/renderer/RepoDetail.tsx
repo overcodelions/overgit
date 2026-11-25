@@ -4,6 +4,7 @@ import {
   clearQueuedRepoTab,
   peekQueuedCommit,
   peekQueuedRepoTab,
+  useLlmTool,
   useStore,
 } from './store';
 import { BranchPicker, relativeTime } from './BranchPicker';
@@ -717,6 +718,15 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
     if (!res.ok) pushToast({ kind: 'error', message: res.error ?? 'Stash failed' });
   };
 
+  const llmTool = useLlmTool();
+  const stashSuggest: BulkAction['suggestMessage'] = llmTool
+    ? {
+        tool: llmTool,
+        run: (paths) =>
+          window.overgit.invoke('cli:suggestStashMessage', { repoId, tool: llmTool, paths }),
+      }
+    : undefined;
+
   // "View" handler shared by both groups: switch to the Files tab and
   // open the absolute path. ChangedFile.path is repo-relative, so we
   // join it onto the repo's working tree root before opening.
@@ -1169,6 +1179,7 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
                 glyph: ICON_STASH,
                 kind: 'with-message',
                 messagePlaceholder: 'Stash message (optional)…',
+                suggestMessage: stashSuggest,
                 onAction: (paths, message) => onStash(paths, message),
               },
             ]}
@@ -1200,6 +1211,7 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
                   glyph: ICON_STASH,
                   kind: 'with-message',
                   messagePlaceholder: 'Stash message (optional)…',
+                  suggestMessage: stashSuggest,
                   onAction: (paths, message) => onStash(paths, message),
                 },
               ]}
@@ -1230,6 +1242,7 @@ function ChangesTab({ repoId }: { repoId: UUID }): JSX.Element {
                   glyph: ICON_STASH,
                   kind: 'with-message',
                   messagePlaceholder: 'Stash message (optional)…',
+                  suggestMessage: stashSuggest,
                   onAction: (paths, message) => onStash(paths, message),
                 },
                 {
@@ -1643,6 +1656,12 @@ interface BulkAction {
   /// Placeholder shown in the inline message input. Ignored unless
   /// `kind: 'with-message'`.
   messagePlaceholder?: string;
+  /// Optional AI drafting for the inline message. Shown as a ✨ button
+  /// next to the input; resolves to the text to drop in, or an error.
+  suggestMessage?: {
+    tool: LlmTool;
+    run: (paths: string[]) => Promise<{ ok: true; message: string } | { ok: false; error: string }>;
+  };
   onAction: (paths: string[], message?: string) => void;
 }
 
@@ -1979,6 +1998,20 @@ function FileGroup({
   // / Cancel pair instead of the action buttons.
   const [pending, setPending] = useState<BulkAction | null>(null);
   const [pendingMsg, setPendingMsg] = useState('');
+  const [suggesting, setSuggesting] = useState(false);
+  const [suggestError, setSuggestError] = useState<string | null>(null);
+  const runPendingSuggest = async () => {
+    if (!pending?.suggestMessage || suggesting) return;
+    setSuggesting(true);
+    setSuggestError(null);
+    try {
+      const res = await pending.suggestMessage.run(checkedPaths);
+      if (res.ok) setPendingMsg(res.message);
+      else setSuggestError(res.error);
+    } finally {
+      setSuggesting(false);
+    }
+  };
   // Selection changes (e.g. apply/stage drained the group) should
   // dismiss the pending input — otherwise the bar shows an input for
   // an action whose target paths just disappeared.
@@ -2042,9 +2075,28 @@ function FileGroup({
                     setPendingMsg('');
                   }
                 }}
-                placeholder={pending.messagePlaceholder ?? 'Optional message…'}
-                className="field flex-1 min-w-0 px-2 py-1 text-[11px]"
+                placeholder={
+                  suggesting
+                    ? `Drafting with ${pending.suggestMessage?.tool}…`
+                    : (suggestError ?? pending.messagePlaceholder ?? 'Optional message…')
+                }
+                title={suggestError ?? undefined}
+                disabled={suggesting}
+                className={`field flex-1 min-w-0 px-2 py-1 text-[11px] ${
+                  suggestError ? 'placeholder:text-red-400' : ''
+                }`}
               />
+              {pending.suggestMessage && (
+                <button
+                  onClick={() => void runPendingSuggest()}
+                  disabled={suggesting}
+                  className="text-[11px] w-7 h-7 rounded border border-card hover:bg-card disabled:opacity-50 flex items-center justify-center flex-shrink-0"
+                  title={`Draft a stash message with ${pending.suggestMessage.tool}`}
+                  aria-label="Suggest message"
+                >
+                  {suggesting ? <Spinner size={10} /> : '✨'}
+                </button>
+              )}
               <button
                 onClick={() => {
                   pending.onAction(checkedPaths, pendingMsg.trim() || undefined);
@@ -2084,6 +2136,7 @@ function FileGroup({
                       if (a.kind === 'with-message') {
                         setPending(a);
                         setPendingMsg('');
+                        setSuggestError(null);
                       } else {
                         a.onAction(checkedPaths);
                       }
@@ -4626,6 +4679,7 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
   const openRepoFile = useStore((s) => s.openRepoFile);
   const pushToast = useStore((s) => s.pushToast);
   const requestConfirm = useStore((s) => s.requestConfirm);
+  const setSheet = useStore((s) => s.setSheet);
 
   // Shared "Open in editor" handler for every diff rendered in this
   // tab. Working-tree diff and per-commit detail use the same path —
@@ -5233,6 +5287,7 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
           </div>
         ) : selectedCommit ? (
           <CommitDetail
+            repoId={repoId}
             commit={selectedCommit}
             files={diffEntry?.files ?? null}
             onOpenFile={openFile}
@@ -5286,6 +5341,11 @@ function HistoryTab({ repoId }: { repoId: UUID }): JSX.Element {
               await useStore.getState().refreshRepoStatus(repoId);
             }
           }}
+          onInteractiveRebase={
+            menu.sha === headSha
+              ? null
+              : () => setSheet({ kind: 'interactiveRebase', repoId, base: menu.sha })
+          }
           onUndo={async () => {
             const res = await undoLastCommit(repoId);
             if (!res.ok) {
@@ -5316,6 +5376,7 @@ function CommitContextMenu({
   onBranchFromHere,
   onCheckout,
   onUndo,
+  onInteractiveRebase,
 }: {
   x: number;
   y: number;
@@ -5327,6 +5388,8 @@ function CommitContextMenu({
   onBranchFromHere: (name: string) => void | Promise<void>;
   onCheckout: () => void;
   onUndo: () => void | Promise<void>;
+  /// Null when this commit can't be a rebase base (e.g. HEAD itself).
+  onInteractiveRebase: (() => void) | null;
 }): JSX.Element {
   // Two modes: 'list' shows the menu, 'branch' shows an inline branch-
   // name input. We don't drop into window.prompt because Electron
@@ -5404,6 +5467,18 @@ function CommitContextMenu({
             }}
             tone="warn"
           />
+          {onInteractiveRebase && (
+            <>
+              <div className="my-1 border-t border-card" />
+              <CtxItem
+                label="Interactive rebase commits after this…"
+                onClick={() => {
+                  onInteractiveRebase();
+                  onClose();
+                }}
+              />
+            </>
+          )}
           {canUndo && (
             <>
               <div className="my-1 border-t border-card" />
@@ -5700,10 +5775,12 @@ function RefBadges({
 /// are derived client-side from the FileDiff body so we don't need a
 /// follow-up `git show --numstat` round-trip.
 function CommitDetail({
+  repoId,
   commit,
   files,
   onOpenFile,
 }: {
+  repoId: UUID;
   commit: GraphCommit;
   files: FileDiff[] | null;
   /// Forwarded to DiffView so each per-file block can render an
@@ -5727,6 +5804,26 @@ function CommitDetail({
     });
     return { totalAdds, totalDels, perFile };
   }, [files]);
+
+  const llmTool = useLlmTool();
+  // Explanations are cached per commit for the life of this pane, so
+  // flipping between commits doesn't re-run the CLI.
+  const [explanations, setExplanations] = useState<
+    Record<string, { state: 'running' | 'done' | 'error'; text: string; tool: LlmTool }>
+  >({});
+  const explanation = explanations[commit.sha];
+  const runExplain = async () => {
+    if (!llmTool) return;
+    const sha = commit.sha;
+    setExplanations((m) => ({ ...m, [sha]: { state: 'running', text: '', tool: llmTool } }));
+    const res = await window.overgit.invoke('cli:explainCommit', { repoId, sha, tool: llmTool });
+    setExplanations((m) => ({
+      ...m,
+      [sha]: res.ok
+        ? { state: 'done', text: res.output, tool: res.tool }
+        : { state: 'error', text: res.error ?? 'Explain failed', tool: res.tool },
+    }));
+  };
 
   return (
     <div className="h-full flex flex-col min-h-0">
@@ -5754,14 +5851,62 @@ function CommitDetail({
           {commit.parents.length > 1 && (
             <span title="Merge commit">merge of {commit.parents.length}</span>
           )}
-          <button
-            onClick={() => navigator.clipboard.writeText(commit.sha)}
-            className="ml-auto text-[10px] text-ink-faint hover:text-ink underline-offset-2 hover:underline"
-            title="Copy full SHA"
-          >
-            Copy SHA
-          </button>
+          <span className="ml-auto flex items-center gap-3">
+            {llmTool && (
+              <button
+                onClick={() => void runExplain()}
+                disabled={explanation?.state === 'running'}
+                className="font-sans text-[10px] px-2 py-0.5 rounded border border-card text-ink-muted hover:text-ink hover:bg-card disabled:opacity-50 flex items-center gap-1"
+                title={`Explain this commit with ${llmTool}`}
+              >
+                <span>✨</span>
+                <span>{explanation?.state === 'done' ? 'Explain again' : 'Explain'}</span>
+              </button>
+            )}
+            <button
+              onClick={() => navigator.clipboard.writeText(commit.sha)}
+              className="text-[10px] text-ink-faint hover:text-ink underline-offset-2 hover:underline"
+              title="Copy full SHA"
+            >
+              Copy SHA
+            </button>
+          </span>
         </div>
+        {explanation && (
+          <div
+            className={`mt-3 rounded border px-3 py-2 text-[12px] leading-relaxed max-h-[240px] overflow-y-auto ${
+              explanation.state === 'error'
+                ? 'border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-200'
+                : 'border-card bg-card/40 text-ink-muted'
+            }`}
+          >
+            <div className="flex items-center justify-between mb-1 text-[10px] uppercase tracking-wide text-ink-faint">
+              <span>Explained by {explanation.tool}</span>
+              {explanation.state !== 'running' && (
+                <button
+                  onClick={() =>
+                    setExplanations((m) => {
+                      const next = { ...m };
+                      delete next[commit.sha];
+                      return next;
+                    })
+                  }
+                  className="normal-case tracking-normal hover:text-ink"
+                  aria-label="Dismiss explanation"
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+            {explanation.state === 'running' ? (
+              <div className="flex items-center gap-2 text-ink-faint">
+                <Spinner /> Reading the commit…
+              </div>
+            ) : (
+              <pre className="whitespace-pre-wrap font-sans">{explanation.text}</pre>
+            )}
+          </div>
+        )}
       </header>
 
       {stats && (

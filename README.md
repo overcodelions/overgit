@@ -94,8 +94,9 @@ File contents (`git grep`) or commit messages (or a SHA) across a repo, workset 
 - **Files.** A CodeMirror editor with syntax highlighting for 30+ languages, loaded on first use and sandboxed to registered repos.
 - **Branch picker** (⌘B). Searchable popover with local and remote branches, ↑↓/Enter, inline create-branch with optional sync-and-pull, and per-branch cherry-pick (commit-list multi-select). If another worktree holds the branch you want, it offers to detach that worktree and switch.
 - **Commit identity.** The commit box always shows who you'll commit as and where that comes from. Set a per-repo override or a global default so a work repo never gets your personal email.
+- **Interactive rebase.** Right-click a commit in History to pick, reword, squash, fix up, drop or reorder everything after it, with pushed commits flagged before you rewrite them.
 - **Also:** worktrees, tags, remotes, submodules & LFS status, blame and file history, and guided recovery when a pull is blocked by local changes.
-- **AI review, suggest and resolve.** Detects `claude` / `codex` / `gemini`. Pipes diffs into the chosen CLI in non-interactive mode (90s cap). Suggest drafts a conventional-commit message from the staged diff and drops it into the commit input. In a merge conflict, it can draft a resolution for you to review.
+- **AI review, suggest and resolve.** Detects `claude` / `codex` / `gemini`. Pipes diffs into the chosen CLI in non-interactive mode (90s cap). Suggest drafts a conventional-commit message from the staged diff and drops it into the commit input. In a merge conflict, it can draft a resolution for you to review. It can also explain a commit in History, label a stash, and draft a workset's PR title and description.
 
 ### Command palette
 

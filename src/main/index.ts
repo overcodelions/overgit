@@ -79,6 +79,9 @@ import {
   rawDiff,
   readGitConfigIdentity,
   rebaseOnto,
+  interactiveRebase,
+  interactiveRebasePlan,
+  showCommitForLlm,
   resetToUpstream,
   setRemoteUrl,
   stageFiles,
@@ -93,6 +96,7 @@ import {
 import { listFilesUnder, listRepoFiles, readFileUnderRoot, writeFileUnderRoot } from './fs';
 import {
   aggregateWorksetDirtyDiff,
+  aggregateWorksetBranchDiff,
   worksetActivity,
   worksetBranchSuggestions,
   worksetCheckout,
@@ -115,6 +119,9 @@ import {
 } from './workset';
 import {
   detectCliPresence,
+  explainCommit,
+  suggestPRDescription,
+  suggestStashMessage,
   resolveConflictWithLlm,
   reviewDiffWithLlm,
   suggestBackupBranchName,
@@ -128,6 +135,8 @@ import { initAutoUpdater, quitAndInstall, refreshUpdateChannel } from './updater
 import {
   ForgeKind,
   Identity,
+  LlmTool,
+  RebaseStep,
   Repo,
   RepoSearchMode,
   RepoSearchScope,
@@ -821,6 +830,24 @@ function registerIpc(): void {
     if (!repo) return { ok: false, error: 'Unknown repo' };
     return rebaseOnto(repo.path, args.onto);
   });
+
+  ipcMain.handle(
+    'repo:interactiveRebasePlan',
+    async (_e, args: { repoId: string; base: string }) => {
+      const repo = repoFromArg(args);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return interactiveRebasePlan(repo.path, args.base);
+    },
+  );
+
+  ipcMain.handle(
+    'repo:interactiveRebase',
+    async (_e, args: { repoId: string; base: string; steps: RebaseStep[] }) => {
+      const repo = repoFromArg(args);
+      if (!repo) return { ok: false, error: 'Unknown repo' };
+      return interactiveRebase(repo.path, args.base, args.steps);
+    },
+  );
 
   ipcMain.handle('repo:abortRebase', async (_e, repoId: string) => {
     const repo = repoFromArg(repoId);
@@ -1535,6 +1562,50 @@ function registerIpc(): void {
         return { ok: false, error: empty, tool: args.tool };
       }
       return suggestCommitMessage(args.tool, diff.text);
+    },
+  );
+
+  ipcMain.handle(
+    'cli:suggestStashMessage',
+    async (_e, args: { repoId: string; tool: LlmTool; paths?: string[] }) => {
+      const repo = repoFromArg(args);
+      if (!repo) return { ok: false, error: 'Unknown repo', tool: args.tool };
+      const diff = await rawDiff(repo.path, 'working', args.paths);
+      if (!diff.ok) {
+        return { ok: false, error: diff.error ?? 'Could not read diff', tool: args.tool };
+      }
+      return suggestStashMessage(args.tool, diff.text);
+    },
+  );
+
+  ipcMain.handle(
+    'cli:explainCommit',
+    async (_e, args: { repoId: string; sha: string; tool: LlmTool }) => {
+      const repo = repoFromArg(args);
+      if (!repo) return { ok: false, output: '', error: 'Unknown repo', tool: args.tool };
+      const show = await showCommitForLlm(repo.path, args.sha);
+      if (!show.ok) {
+        return { ok: false, output: '', error: show.error ?? 'Could not read commit', tool: args.tool };
+      }
+      return explainCommit(args.tool, show.text);
+    },
+  );
+
+  ipcMain.handle(
+    'workset:suggestPRDescription',
+    async (_e, args: { worksetId: string; tool: LlmTool }) => {
+      const { worksets, repos } = Store.load();
+      const aggregate = await aggregateWorksetBranchDiff(args.worksetId, worksets, repos);
+      if (!aggregate.text.trim()) {
+        return {
+          ok: false as const,
+          error: 'No commits on a feature branch to describe.',
+          tool: args.tool,
+          truncated: aggregate.truncated,
+        };
+      }
+      const result = await suggestPRDescription(args.tool, aggregate.text);
+      return { ...result, truncated: aggregate.truncated };
     },
   );
 

@@ -232,6 +232,110 @@ export async function suggestBackupBranchName(
   return { ok: true, name, summary, tool };
 }
 
+const STASH_MESSAGE_PROMPT = `You are labelling a git stash entry for the diff below.
+
+Output ONLY one line, under 60 characters: a short, lowercase description of the work in progress (e.g. "wip: retry backoff in payment client"). No quotes, no markdown, no preamble.`;
+
+/// Draft a one-line stash label from the diff of the files being
+/// stashed. Single line, quotes stripped — it lands in an input box.
+export async function suggestStashMessage(
+  tool: LlmTool,
+  diff: string,
+): Promise<
+  | { ok: true; message: string; tool: LlmTool }
+  | { ok: false; error: string; tool: LlmTool }
+> {
+  if (!diff.trim()) {
+    return { ok: false, error: 'No changes to summarize.', tool };
+  }
+  const result = await runOneShot(tool, STASH_MESSAGE_PROMPT + '\n\n' + diff);
+  if (!result.ok) {
+    return { ok: false, error: result.error ?? 'CLI failed', tool };
+  }
+  const line = stripFences(result.output)
+    .split('\n')
+    .map((l) => l.trim())
+    .find(Boolean)
+    ?.replace(/^["'`]+|["'`]+$/g, '');
+  if (!line) {
+    return { ok: false, error: 'CLI returned an empty message.', tool };
+  }
+  return { ok: true, message: line, tool };
+}
+
+const EXPLAIN_COMMIT_PROMPT = `You are explaining a git commit to a developer who is reading the history.
+
+Below is the output of \`git show\` for one commit. Respond in plain text with:
+
+1. What — two or three sentences on what this commit changes.
+2. Why — the likely motivation, inferred from the message and code. Say so if it is unclear.
+3. Notable details — short bullet points for anything a reviewer should know (behaviour changes, risky spots, follow-ups). Skip if nothing notable.
+
+Be concise. No preamble, no markdown headings beyond the three labels above, no fences.`;
+
+/// Explain a single commit from its `git show` output.
+export async function explainCommit(
+  tool: LlmTool,
+  show: string,
+): Promise<{ ok: boolean; output: string; error?: string; tool: LlmTool }> {
+  if (!show.trim()) {
+    return { ok: false, output: '', error: 'Commit is empty.', tool };
+  }
+  const result = await runOneShot(tool, EXPLAIN_COMMIT_PROMPT + '\n\n' + show);
+  return { ...result, output: stripFences(result.output).trim(), tool };
+}
+
+const PR_DESCRIPTION_PROMPT = `You are writing a pull request title and description.
+
+Below are the commits on the feature branch and the diff against the base branch. The change may span several repositories, each under a "=== <repo> ===" header; if so, write one shared description covering all of them.
+
+Output format, exactly:
+- line 1: the PR title, under 72 characters, no trailing period, no prefix like "Title:"
+- line 2: blank
+- line 3 onward: the description in GitHub markdown with a short "## Summary" (2–4 sentences) and a "## Changes" bullet list. Add a "## Testing" section only if the diff shows tests.
+
+No preamble, no closing remarks, no fences around the whole answer.`;
+
+/// Draft a PR title + markdown body from branch commits and diff.
+export async function suggestPRDescription(
+  tool: LlmTool,
+  context: string,
+): Promise<
+  | { ok: true; title: string; body: string; tool: LlmTool }
+  | { ok: false; error: string; tool: LlmTool }
+> {
+  if (!context.trim()) {
+    return { ok: false, error: 'No branch changes to describe.', tool };
+  }
+  const result = await runOneShot(tool, PR_DESCRIPTION_PROMPT + '\n\n' + context);
+  if (!result.ok) {
+    return { ok: false, error: result.error ?? 'CLI failed', tool };
+  }
+  const parsed = parsePRDescription(stripFences(result.output));
+  if (!parsed) {
+    return { ok: false, error: 'CLI returned an empty description.', tool };
+  }
+  return { ok: true, ...parsed, tool };
+}
+
+/// Split an LLM answer into title (first non-empty line, with any
+/// "Title:" / "# " prefix removed) and body (the rest, trimmed).
+export function parsePRDescription(raw: string): { title: string; body: string } | null {
+  const lines = raw.replace(/\r\n/g, '\n').split('\n');
+  const first = lines.findIndex((l) => l.trim());
+  if (first < 0) return null;
+  const title = lines[first]
+    .trim()
+    .replace(/^#+\s*/, '')
+    .replace(/^\*\*?title:?\*\*?:?\s*/i, '')
+    .replace(/^title:\s*/i, '')
+    .replace(/^["'`]+|["'`]+$/g, '')
+    .trim();
+  if (!title) return null;
+  const body = lines.slice(first + 1).join('\n').trim();
+  return { title, body };
+}
+
 function stripFences(s: string): string {
   // Tolerate ```text\n…\n``` or ```\n…\n``` wrappers some CLIs emit.
   const m = s.match(/^```[a-zA-Z]*\n([\s\S]*?)\n```\s*$/);

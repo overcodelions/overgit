@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { summarizeChecks } from './cli';
+import { parsePRDescription, summarizeChecks } from './cli';
 
 describe('summarizeChecks', () => {
   it('reports none when there are no checks', () => {
@@ -42,5 +42,23 @@ describe('summarizeChecks', () => {
     ]);
     expect(s).toMatchObject({ state: 'failure', passed: 1, pending: 1, failed: 1 });
     expect(s.failing).toEqual(['codecov']);
+  });
+});
+
+describe('parsePRDescription', () => {
+  it('splits the title from the body', () => {
+    expect(parsePRDescription('Add rate limiting\n\n## Summary\nThing.')).toEqual({
+      title: 'Add rate limiting',
+      body: '## Summary\nThing.',
+    });
+  });
+
+  it('strips heading and "Title:" prefixes and quotes', () => {
+    expect(parsePRDescription('\n# Title: "Fix it"\n\nbody')?.title).toBe('Fix it');
+    expect(parsePRDescription('**Title:** Fix it\nbody')?.title).toBe('Fix it');
+  });
+
+  it('returns null for empty output', () => {
+    expect(parsePRDescription('  \n\n')).toBeNull();
   });
 });

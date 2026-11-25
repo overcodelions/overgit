@@ -1,5 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
-import { openRepoCommit, openRepoTab, useStore } from './store';
+import { openRepoCommit, openRepoTab, useLlmTool, useStore } from './store';
+import { isNoopRebase, validateRebaseSteps } from '@shared/rebase';
 import { Spinner } from './Spinner';
 import { applyTheme } from './theme';
 import { AppMark, KeyCombo } from './onboarding/helpChrome';
@@ -7,6 +8,9 @@ import { BasicsSheet, SetupSheet, ShortcutsSheet } from './onboarding/HelpSheets
 import { SHORTCUT_GROUPS, shortcutText } from './onboarding/shortcuts';
 import type {
   AbandonLocalPreview,
+  RebaseAction,
+  RebasePlanCommit,
+  RebaseStep,
   AppSettings,
   BlameLine,
   CommitAllOutcome,
@@ -84,6 +88,8 @@ export function SheetHost(): JSX.Element | null {
                     ? 'w-[1100px] max-w-[96vw] h-[85vh]'
                   : sheet.kind === 'abandonLocal'
                     ? 'w-[720px] max-w-[92vw] max-h-[85vh]'
+                  : sheet.kind === 'interactiveRebase'
+                    ? 'w-[860px] max-w-[94vw] h-[80vh]'
                   : sheet.kind === 'fileHistory' || sheet.kind === 'searchRepos'
                     ? 'w-[860px] max-w-[94vw] h-[82vh]'
                     : sheet.kind === 'manageRepo'
@@ -163,6 +169,9 @@ export function SheetHost(): JSX.Element | null {
           <ResolveConflictSheet repoId={sheet.repoId} path={sheet.path} />
         )}
         {sheet.kind === 'landingPreview' && <LandingPreviewSheet {...sheet} />}
+        {sheet.kind === 'interactiveRebase' && (
+          <InteractiveRebaseSheet repoId={sheet.repoId} base={sheet.base} />
+        )}
         {sheet.kind === 'abandonLocal' && (
           <AbandonLocalSheet repoId={sheet.repoId} />
         )}
@@ -6798,6 +6807,45 @@ function WorksetOpenPRsSheet({ worksetId }: { worksetId: UUID }): JSX.Element {
   const [crossLink, setCrossLink] = useState(true);
   const [busy, setBusy] = useState(false);
   const [outcomes, setOutcomes] = useState<WorksetOpenPROutcome[] | null>(null);
+  const llmTool = useLlmTool();
+  const requestConfirm = useStore((s) => s.requestConfirm);
+  const [drafting, setDrafting] = useState(false);
+  const [draftNote, setDraftNote] = useState<{ tone: 'error' | 'info'; text: string } | null>(null);
+
+  const onDraft = async () => {
+    if (!llmTool) return;
+    if ((title.trim() && title !== ws?.name) || body.trim()) {
+      const ok = await requestConfirm({
+        title: 'Replace title and body?',
+        body: 'The drafted title and body will replace what you have typed.',
+        confirmLabel: 'Replace',
+      });
+      if (!ok) return;
+    }
+    setDrafting(true);
+    setDraftNote(null);
+    try {
+      const res = await window.overgit.invoke('workset:suggestPRDescription', {
+        worksetId,
+        tool: llmTool,
+      });
+      if (!res.ok) {
+        setDraftNote({ tone: 'error', text: res.error });
+        return;
+      }
+      setTitle(res.title);
+      setTitleEdited(true);
+      setBody(res.body);
+      if (res.truncated.length > 0) {
+        setDraftNote({
+          tone: 'info',
+          text: `Large diffs in ${res.truncated.map((t) => t.repoName).join(', ')} were summarized by file list only.`,
+        });
+      }
+    } finally {
+      setDrafting(false);
+    }
+  };
 
   const reposById = useMemo(() => new Map(repos.map((r) => [r.id, r])), [repos]);
 
@@ -6877,6 +6925,28 @@ function WorksetOpenPRsSheet({ worksetId }: { worksetId: UUID }): JSX.Element {
             still work via the browser.
           </div>
         )}
+        {llmTool && (
+          <div className="flex items-center justify-between gap-3 -mb-2">
+            <span
+              className={`text-[11px] ${
+                draftNote?.tone === 'error' ? 'text-red-400' : 'text-ink-faint'
+              }`}
+            >
+              {drafting
+                ? `Drafting from the branch commits and diffs with ${llmTool}…`
+                : (draftNote?.text ?? '')}
+            </span>
+            <button
+              onClick={() => void onDraft()}
+              disabled={busy || drafting || candidates.length === 0}
+              className="text-[11px] px-2 py-1 rounded border border-card hover:bg-card disabled:opacity-50 flex items-center gap-1 flex-shrink-0"
+              title={`Draft the title and body with ${llmTool}`}
+            >
+              {drafting ? <Spinner /> : <span>✨</span>}
+              <span>Draft with {llmTool}</span>
+            </button>
+          </div>
+        )}
         <label className="flex flex-col gap-1">
           <span className="text-[10px] uppercase tracking-wide text-ink-faint">Title</span>
           <input
@@ -6902,8 +6972,8 @@ function WorksetOpenPRsSheet({ worksetId }: { worksetId: UUID }): JSX.Element {
             value={body}
             onChange={(e) => setBody(e.target.value)}
             placeholder="Shared PR body — markdown allowed"
-            disabled={busy}
-            rows={5}
+            disabled={busy || drafting}
+            rows={8}
             className="field px-2 py-1.5 text-sm resize-none"
           />
         </label>
@@ -9085,5 +9155,337 @@ function ConflictHunkBlock({
         </>
       )}
     </div>
+  );
+}
+
+const REBASE_ACTIONS: { action: RebaseAction; label: string; key: string; hint: string }[] = [
+  { action: 'pick', label: 'Pick', key: 'p', hint: 'Keep the commit as it is' },
+  { action: 'reword', label: 'Reword', key: 'r', hint: 'Keep the commit, change its message' },
+  { action: 'squash', label: 'Squash', key: 's', hint: 'Fold into the commit above, keeping both messages' },
+  { action: 'fixup', label: 'Fixup', key: 'f', hint: 'Fold into the commit above, discarding this message' },
+  { action: 'drop', label: 'Drop', key: 'd', hint: 'Remove the commit' },
+];
+
+type RebasePlan =
+  | { ok: true; baseSha: string; branch: string | null; commits: RebasePlanCommit[] }
+  | { ok: false; error: string };
+
+/// `git rebase -i` as a list: one row per commit after `base`, oldest
+/// first (replay order). Reorder by dragging or Alt+↑/↓, set actions
+/// with the menu or p/r/s/f/d, and edit reword messages inline.
+function InteractiveRebaseSheet({ repoId, base }: { repoId: UUID; base: string }): JSX.Element {
+  const setSheet = useStore((s) => s.setSheet);
+  const pushToast = useStore((s) => s.pushToast);
+  const requestConfirm = useStore((s) => s.requestConfirm);
+  const interactiveRebase = useStore((s) => s.interactiveRebase);
+
+  const [plan, setPlan] = useState<RebasePlan | null>(null);
+  const [steps, setSteps] = useState<RebaseStep[]>([]);
+  const [selected, setSelected] = useState(0);
+  const [dragFrom, setDragFrom] = useState<number | null>(null);
+  const [dragOver, setDragOver] = useState<number | null>(null);
+  const [running, setRunning] = useState(false);
+  const [runError, setRunError] = useState<string | null>(null);
+  const listRef = useRef<HTMLUListElement | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void window.overgit.invoke('repo:interactiveRebasePlan', { repoId, base }).then((res) => {
+      if (cancelled) return;
+      setPlan(res);
+      if (res.ok) {
+        setSteps(res.commits.map((c) => ({ sha: c.sha, action: 'pick', message: c.message })));
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [repoId, base]);
+
+  const commitsBySha = useMemo(
+    () => new Map(plan?.ok ? plan.commits.map((c) => [c.sha, c]) : []),
+    [plan],
+  );
+  const planned = useMemo(() => (plan?.ok ? plan.commits.map((c) => c.sha) : []), [plan]);
+  const invalid = plan?.ok ? validateRebaseSteps(planned, steps) : null;
+  const noop = plan?.ok ? isNoopRebase(planned, steps) : true;
+  const pushedCount = plan?.ok ? plan.commits.filter((c) => c.pushed).length : 0;
+  const resultCount = steps.filter(
+    (s) => s.action === 'pick' || s.action === 'reword',
+  ).length;
+
+  const setAction = (i: number, action: RebaseAction) =>
+    setSteps((prev) => prev.map((s, j) => (j === i ? { ...s, action } : s)));
+  const setMessage = (i: number, message: string) =>
+    setSteps((prev) => prev.map((s, j) => (j === i ? { ...s, message } : s)));
+  const move = (from: number, to: number) => {
+    if (to < 0 || to >= steps.length || from === to) return;
+    setSteps((prev) => {
+      const next = [...prev];
+      const [item] = next.splice(from, 1);
+      next.splice(to, 0, item);
+      return next;
+    });
+    setSelected(to);
+  };
+  const reset = () => {
+    if (!plan?.ok) return;
+    setSteps(plan.commits.map((c) => ({ sha: c.sha, action: 'pick', message: c.message })));
+    setRunError(null);
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    const target = e.target as HTMLElement;
+    if (target.tagName === 'TEXTAREA' || target.tagName === 'INPUT' || target.tagName === 'SELECT') return;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const delta = e.key === 'ArrowDown' ? 1 : -1;
+      if (e.altKey) move(selected, selected + delta);
+      else setSelected((i) => Math.max(0, Math.min(steps.length - 1, i + delta)));
+      return;
+    }
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const hit = REBASE_ACTIONS.find((a) => a.key === e.key.toLowerCase());
+    if (hit && steps[selected]) {
+      e.preventDefault();
+      setAction(selected, hit.action);
+    }
+  };
+
+  const onStart = async () => {
+    if (!plan?.ok || invalid || noop) return;
+    if (pushedCount > 0) {
+      const ok = await requestConfirm({
+        title: 'Rewrite pushed commits?',
+        body: `${pushedCount} of these commits ${pushedCount === 1 ? 'is' : 'are'} already on the remote. After the rebase you will need to force push, and anyone else on this branch will have to reset to it.`,
+        confirmLabel: 'Rebase anyway',
+        destructive: true,
+      });
+      if (!ok) return;
+    }
+    setRunning(true);
+    setRunError(null);
+    try {
+      const res = await interactiveRebase(repoId, base, steps);
+      if (!res.ok) {
+        setRunError(res.error);
+        return;
+      }
+      setSheet(null);
+      if (res.stopped) {
+        window.dispatchEvent(new CustomEvent('overgit:setRepoTab', { detail: 'changes' }));
+        pushToast({
+          kind: 'warn',
+          message: 'Rebase paused on a conflict. Resolve it in Changes, then Continue (or Abort).',
+        });
+      } else {
+        pushToast({
+          kind: 'success',
+          message: `Rebase done: ${resultCount} ${resultCount === 1 ? 'commit' : 'commits'} on ${plan.branch ?? 'HEAD'}.`,
+        });
+      }
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const baseShort = plan?.ok ? plan.baseSha.slice(0, 7) : base.slice(0, 7);
+
+  return (
+    <>
+      <SheetHeader
+        title={`Interactive rebase · ${plan?.ok ? (plan.branch ?? 'detached HEAD') : ''}`}
+        onClose={() => setSheet(null)}
+      />
+      {!plan ? (
+        <div className="flex-1 flex items-center justify-center gap-2 text-sm text-ink-faint">
+          <Spinner /> Reading commits…
+        </div>
+      ) : !plan.ok ? (
+        <div className="p-5 text-sm text-red-400">{plan.error}</div>
+      ) : (
+        <>
+          <div className="px-5 pt-3 pb-2 text-[11px] text-ink-faint flex flex-col gap-1 border-b border-card">
+            <span>
+              {plan.commits.length} {plan.commits.length === 1 ? 'commit' : 'commits'} after{' '}
+              <span className="font-mono">{baseShort}</span>, oldest first. Git replays them top to
+              bottom; squash and fixup fold a commit into the one above it.
+            </span>
+            <span>
+              Keys: <span className="font-mono">↑↓</span> select ·{' '}
+              <span className="font-mono">Alt ↑↓</span> move ·{' '}
+              {REBASE_ACTIONS.map((a) => (
+                <span key={a.action} title={a.hint}>
+                  <span className="font-mono">{a.key}</span> {a.label.toLowerCase()}
+                  {a.action !== 'drop' ? ' · ' : ''}
+                </span>
+              ))}
+            </span>
+          </div>
+          <ul
+            ref={listRef}
+            tabIndex={0}
+            onKeyDown={onKeyDown}
+            className="flex-1 min-h-0 overflow-y-auto py-1 outline-none"
+          >
+            {steps.map((step, i) => {
+              const c = commitsBySha.get(step.sha);
+              if (!c) return null;
+              const folded = step.action === 'squash' || step.action === 'fixup';
+              const dropped = step.action === 'drop';
+              const isSel = i === selected;
+              return (
+                <li
+                  key={step.sha}
+                  draggable={!running}
+                  onDragStart={(e) => {
+                    setDragFrom(i);
+                    e.dataTransfer.effectAllowed = 'move';
+                  }}
+                  onDragOver={(e) => {
+                    if (dragFrom === null) return;
+                    e.preventDefault();
+                    setDragOver(i);
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    if (dragFrom !== null) move(dragFrom, i);
+                    setDragFrom(null);
+                    setDragOver(null);
+                  }}
+                  onDragEnd={() => {
+                    setDragFrom(null);
+                    setDragOver(null);
+                  }}
+                  onMouseDown={() => setSelected(i)}
+                  className={`px-3 border-t-2 ${
+                    dragOver === i && dragFrom !== null && dragFrom !== i
+                      ? 'border-accent'
+                      : 'border-transparent'
+                  } ${isSel ? 'bg-accent/10' : 'hover:bg-card/60'} ${dragFrom === i ? 'opacity-40' : ''}`}
+                >
+                  <div className="flex items-center gap-2 py-1.5 text-[12px]">
+                    <span
+                      className="cursor-grab text-ink-faint select-none px-0.5"
+                      title="Drag to reorder"
+                      aria-hidden
+                    >
+                      ⋮⋮
+                    </span>
+                    <select
+                      value={step.action}
+                      onChange={(e) => setAction(i, e.target.value as RebaseAction)}
+                      disabled={running}
+                      className={`field text-[11px] px-1.5 py-0.5 w-[84px] ${
+                        dropped
+                          ? 'text-red-400'
+                          : folded
+                            ? 'text-amber-500'
+                            : step.action === 'reword'
+                              ? 'text-sky-400'
+                              : ''
+                      }`}
+                      title={REBASE_ACTIONS.find((a) => a.action === step.action)?.hint}
+                    >
+                      {REBASE_ACTIONS.map((a) => (
+                        <option key={a.action} value={a.action}>
+                          {a.label}
+                        </option>
+                      ))}
+                    </select>
+                    <span className="font-mono text-[11px] text-ink-faint">{c.shortSha}</span>
+                    <span
+                      className={`flex-1 min-w-0 truncate ${folded ? 'pl-3 text-ink-muted' : ''} ${
+                        dropped ? 'line-through text-ink-faint' : ''
+                      }`}
+                      title={c.message}
+                    >
+                      {folded && <span className="text-ink-faint mr-1">↳</span>}
+                      {step.action === 'reword'
+                        ? (step.message?.split('\n')[0] || c.subject)
+                        : c.subject}
+                    </span>
+                    {c.pushed && (
+                      <span
+                        className="text-[9px] uppercase tracking-wide px-1 rounded bg-amber-500/15 text-amber-500"
+                        title="Already on the remote"
+                      >
+                        pushed
+                      </span>
+                    )}
+                    <span className="text-[10px] text-ink-faint whitespace-nowrap">{c.author}</span>
+                    <span className="flex flex-col leading-none">
+                      <button
+                        onClick={() => move(i, i - 1)}
+                        disabled={running || i === 0}
+                        className="text-[9px] px-1 text-ink-faint hover:text-ink disabled:opacity-30"
+                        aria-label="Move up"
+                      >
+                        ▲
+                      </button>
+                      <button
+                        onClick={() => move(i, i + 1)}
+                        disabled={running || i === steps.length - 1}
+                        className="text-[9px] px-1 text-ink-faint hover:text-ink disabled:opacity-30"
+                        aria-label="Move down"
+                      >
+                        ▼
+                      </button>
+                    </span>
+                  </div>
+                  {step.action === 'reword' && (
+                    <textarea
+                      value={step.message ?? ''}
+                      onChange={(e) => setMessage(i, e.target.value)}
+                      disabled={running}
+                      rows={Math.min(8, Math.max(2, (step.message ?? '').split('\n').length))}
+                      className="field w-full mb-2 ml-[22px] max-w-[calc(100%-22px)] px-2 py-1 text-[12px] font-mono resize-y"
+                      aria-label={`New message for ${c.shortSha}`}
+                    />
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+          <div className="px-5 py-3 border-t border-card flex items-center gap-3">
+            <div className="flex-1 min-w-0 text-[11px]">
+              {runError ? (
+                <span className="text-red-400 whitespace-pre-wrap">{runError}</span>
+              ) : invalid ? (
+                <span className="text-amber-500">{invalid}</span>
+              ) : noop ? (
+                <span className="text-ink-faint">No changes yet.</span>
+              ) : (
+                <span className="text-ink-muted">
+                  {plan.commits.length} → {resultCount} {resultCount === 1 ? 'commit' : 'commits'}
+                  {pushedCount > 0 && (
+                    <span className="text-amber-500">
+                      {' '}
+                      · rewrites {pushedCount} pushed {pushedCount === 1 ? 'commit' : 'commits'} (force
+                      push needed)
+                    </span>
+                  )}
+                </span>
+              )}
+            </div>
+            <button
+              onClick={reset}
+              disabled={running || noop}
+              className="text-[12px] px-3 py-1.5 rounded text-ink-muted hover:bg-card hover:text-ink disabled:opacity-50"
+            >
+              Reset
+            </button>
+            <button
+              onClick={() => void onStart()}
+              disabled={running || !!invalid || noop}
+              className="text-[12px] px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-strong disabled:opacity-50 flex items-center gap-1.5"
+            >
+              {running && <Spinner />}
+              Start rebase
+            </button>
+          </div>
+        </>
+      )}
+    </>
   );
 }

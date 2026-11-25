@@ -7,6 +7,8 @@
 import { create } from 'zustand';
 import type {
   AppSettings,
+  LlmTool,
+  RebaseStep,
   BranchPruneCandidate,
   BranchSummary,
   BranchesSubtab,
@@ -70,7 +72,9 @@ export type Sheet =
   | { kind: 'cloneRepo' }
   | { kind: 'resolveConflict'; repoId: UUID; path: string }
   | { kind: 'landingPreview'; repoId: UUID; treeOid: string; path: string; oursLabel: string; theirsLabel: string }
-  | { kind: 'abandonLocal'; repoId: UUID };
+  | { kind: 'abandonLocal'; repoId: UUID }
+  /// Rebase -i of the commits after `base` on the current branch.
+  | { kind: 'interactiveRebase'; repoId: UUID; base: string };
 
 interface OpenFile {
   repoId: UUID;
@@ -429,6 +433,11 @@ interface UiState {
   readMergeMsg: (id: UUID) => Promise<{ ok: boolean; message: string | null; error?: string }>;
   commitMerge: (id: UUID, message: string | null) => Promise<{ ok: boolean; error?: string }>;
   rebaseOnto: (id: UUID, onto: string) => Promise<{ ok: boolean; error?: string }>;
+  interactiveRebase: (
+    id: UUID,
+    base: string,
+    steps: RebaseStep[],
+  ) => Promise<{ ok: true; stopped: boolean; message?: string } | { ok: false; error: string }>;
   abortRebase: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
   continueRebase: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
   abortCherryPick: (id: UUID) => Promise<{ ok: boolean; error?: string }>;
@@ -646,6 +655,16 @@ export function clearQueuedCommit(deferred = false): void {
   };
   if (deferred) window.setTimeout(clear, 0);
   else clear();
+}
+
+/// The LLM CLI the AI actions use: the first installed of claude,
+/// codex, gemini. Null when none is installed.
+export function useLlmTool(): LlmTool | null {
+  const cli = useStore((s) => s.cliPresence);
+  if (cli?.claude) return 'claude';
+  if (cli?.codex) return 'codex';
+  if (cli?.gemini) return 'gemini';
+  return null;
 }
 
 export const useStore = create<UiState>((set, get) => ({
@@ -2091,6 +2110,18 @@ export const useStore = create<UiState>((set, get) => ({
 
   rebaseOnto: async (id, onto) => {
     const res = await window.overgit.invoke('repo:rebase', { repoId: id, onto });
+    await Promise.all([
+      get().refreshRepoStatus(id),
+      get().refreshRepoChanges(id),
+      get().refreshRepoGraph(id),
+      get().refreshRepoHeadCommit(id, true),
+    ]);
+    invalidateLanding();
+    return res;
+  },
+
+  interactiveRebase: async (id, base, steps) => {
+    const res = await window.overgit.invoke('repo:interactiveRebase', { repoId: id, base, steps });
     await Promise.all([
       get().refreshRepoStatus(id),
       get().refreshRepoChanges(id),
