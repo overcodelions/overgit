@@ -6,6 +6,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Interactive rebase. Right-click a commit in History and choose
+  "Interactive rebase commits after this…" to pick, reword, squash, fix up,
+  drop or reorder the commits after it (drag, Alt+↑/↓, or p/r/s/f/d). Reword
+  messages are edited inline. Commits already on the remote are marked, and
+  rewriting them asks first. A conflict pauses the rebase in Changes with the
+  usual Continue / Abort.
+- Explain on a commit in History asks your LLM CLI what the commit changes
+  and why.
+- ✨ next to the stash message drafts one from the selected files' diff.
+- Draft with claude (or codex / gemini) in the workset's Open PRs sheet
+  writes the shared PR title and description from each repo's branch commits
+  and diff.
+
 ## [0.4.6] - 2026-11-15
 
 ### Added

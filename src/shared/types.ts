@@ -621,6 +621,27 @@ export interface GraphCommit {
   parentLanes: number[];
 }
 
+export type RebaseAction = 'pick' | 'reword' | 'squash' | 'fixup' | 'drop';
+
+export interface RebasePlanCommit {
+  sha: string;
+  shortSha: string;
+  subject: string;
+  /// Full message (subject + body), used to prefill reword.
+  message: string;
+  author: string;
+  date: string;
+  /// Already on the branch's upstream; rewriting it needs a force push.
+  pushed: boolean;
+}
+
+export interface RebaseStep {
+  sha: string;
+  action: RebaseAction;
+  /// New message for `reword`. Ignored for other actions.
+  message?: string;
+}
+
 export interface PullRequest {
   number: number;
   title: string;
@@ -1112,6 +1133,15 @@ export interface IPCInvokeMap {
   /// renderer surfaces them via the in-progress + conflicts fields on
   /// repo:status, and the user resolves + calls continueRebase.
   'repo:rebase': (args: { repoId: UUID; onto: string }) => { ok: boolean; error?: string };
+  /// Commits `git rebase -i <base>` would replay, oldest first.
+  'repo:interactiveRebasePlan': (args: { repoId: UUID; base: string }) =>
+    | { ok: true; baseSha: string; branch: string | null; commits: RebasePlanCommit[] }
+    | { ok: false; error: string };
+  /// Run an interactive rebase with the given steps (in replay order).
+  /// `stopped` means git paused, usually on a conflict.
+  'repo:interactiveRebase': (args: { repoId: UUID; base: string; steps: RebaseStep[] }) =>
+    | { ok: true; stopped: boolean; message?: string }
+    | { ok: false; error: string };
   'repo:abortRebase': (repoId: UUID) => { ok: boolean; error?: string };
   'repo:continueRebase': (repoId: UUID) => { ok: boolean; error?: string };
   'repo:abortCherryPick': (repoId: UUID) => { ok: boolean; error?: string };
@@ -1423,6 +1453,16 @@ export interface IPCInvokeMap {
     paths?: string[];
   }) => { ok: true; message: string; tool: LlmTool } | { ok: false; error: string; tool: LlmTool };
 
+  /// Draft a one-line stash label from the diff of `paths` vs HEAD
+  /// (or the whole working tree when no paths are given).
+  'cli:suggestStashMessage': (args: {
+    repoId: UUID;
+    tool: LlmTool;
+    paths?: string[];
+  }) => { ok: true; message: string; tool: LlmTool } | { ok: false; error: string; tool: LlmTool };
+  /// Explain one commit from its `git show` output.
+  'cli:explainCommit': (args: { repoId: UUID; sha: string; tool: LlmTool }) => ReviewResult;
+
   /// Ask an LLM CLI to resolve a single conflict file end-to-end.
   /// Returns the *proposed* resolved file content — the renderer must
   /// preview the diff and require explicit Accept before writing.
@@ -1446,6 +1486,14 @@ export interface IPCInvokeMap {
     worksetId: UUID;
     tool: LlmTool;
   }) => ReviewResult & { truncated: WorksetDiffTruncation[] };
+  /// Draft a shared PR title and markdown body from every feature-branch
+  /// member's commits and diff against its default branch.
+  'workset:suggestPRDescription': (args: {
+    worksetId: UUID;
+    tool: LlmTool;
+  }) =>
+    | { ok: true; title: string; body: string; tool: LlmTool; truncated: WorksetDiffTruncation[] }
+    | { ok: false; error: string; tool: LlmTool; truncated: WorksetDiffTruncation[] };
   /// Same shape as `workset:reviewChanges` but drafts a single shared
   /// commit message from the aggregated diff.
   'workset:suggestCommitMessage': (args: {

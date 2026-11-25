@@ -1517,3 +1517,55 @@ export async function repoListPRs(r: Repo): Promise<RepoPRs> {
   const result = await listOpenPRs(r.path);
   return { repoId: r.id, prs: result.prs, error: result.error };
 }
+
+/// Commits and diff each feature-branch member has over its default
+/// branch, as one prompt-sized blob for drafting a PR description.
+/// Same byte cap and `--stat` fallback as the dirty-diff aggregate.
+export async function aggregateWorksetBranchDiff(
+  worksetId: UUID,
+  worksets: Workset[],
+  repos: Repo[],
+): Promise<{ text: string; truncated: WorksetDiffTruncation[] }> {
+  const ws = worksets.find((w) => w.id === worksetId);
+  if (!ws) return { text: '', truncated: [] };
+  const members = reposFor(ws, repos);
+
+  const prepared = await Promise.all(
+    members.map(async (repo) => {
+      const st = await gitStatus(repo.id, repo.path, repo.defaultBranch);
+      if (!st.branch || !repo.defaultBranch || st.branch === repo.defaultBranch) return null;
+      const base = await resolveDefaultRef(repo.path, repo.defaultBranch);
+      if (!base) return null;
+      const [log, diff] = await Promise.all([
+        run(repo.path, ['log', '--no-merges', '--no-color', '--format=- %s%n%w(0,2,2)%b', `${base}..HEAD`]),
+        run(repo.path, ['diff', '--no-color', `${base}...HEAD`]),
+      ]);
+      if (!log.ok || !log.stdout.trim()) return null;
+      return { repo, base, branch: st.branch, log: log.stdout.trim(), diff: diff.ok ? diff.stdout : '' };
+    }),
+  );
+
+  const parts: string[] = [];
+  const truncated: WorksetDiffTruncation[] = [];
+  let used = 0;
+  for (const p of prepared) {
+    if (!p) continue;
+    const header =
+      `=== ${p.repo.name} (${p.branch} → ${p.base}) ===\n` + `Commits:\n${p.log}\n\nDiff:\n`;
+    const headerCost = Buffer.byteLength(header, 'utf8');
+    const diffCost = Buffer.byteLength(p.diff, 'utf8');
+    if (used + headerCost + diffCost <= WORKSET_DIFF_BYTE_CAP) {
+      parts.push(header + p.diff);
+      used += headerCost + diffCost;
+      continue;
+    }
+    const stat = await run(p.repo.path, ['diff', '--stat', '--no-color', `${p.base}...HEAD`]);
+    const summary =
+      `(diff truncated — ${diffCost.toLocaleString()} bytes; showing --stat instead)\n` +
+      (stat.ok ? stat.stdout : '(could not read --stat)\n');
+    parts.push(header + summary);
+    used += headerCost + Buffer.byteLength(summary, 'utf8');
+    truncated.push({ repoId: p.repo.id, repoName: p.repo.name, originalBytes: diffCost });
+  }
+  return { text: parts.join('\n'), truncated };
+}
